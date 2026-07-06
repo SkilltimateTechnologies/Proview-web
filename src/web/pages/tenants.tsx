@@ -101,7 +101,7 @@ function TenantForm({ tenant, onClose }: { tenant?: Tenant; onClose: () => void 
 
       <div className="grid sm:grid-cols-2 gap-4">
         <Field label="Name"><input className="input" value={name} onChange={(e) => setName(e.target.value)} /></Field>
-        <Field label="Short code"><input className="input" maxLength={3} value={shortName} onChange={(e) => setShortName(e.target.value.toUpperCase())} /></Field>
+        <Field label="Short code"><input className="input" maxLength={8} value={shortName} onChange={(e) => setShortName(e.target.value.toUpperCase())} /></Field>
       </div>
       <div className="mt-4">
         <div className="mono-label mb-2">Primary color</div>

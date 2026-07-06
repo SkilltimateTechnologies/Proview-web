@@ -43,7 +43,7 @@ export default function Branding() {
 
         <div className="grid sm:grid-cols-2 gap-4">
           <Field label="College name"><input className="input" value={name} onChange={(e) => setName(e.target.value)} /></Field>
-          <Field label="Short code"><input className="input" value={shortName} maxLength={3} onChange={(e) => setShortName(e.target.value.toUpperCase())} /></Field>
+          <Field label="Short code"><input className="input" value={shortName} maxLength={8} onChange={(e) => setShortName(e.target.value.toUpperCase())} /></Field>
         </div>
 
         <div>
