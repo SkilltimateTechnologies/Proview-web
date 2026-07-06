@@ -48,7 +48,7 @@ function CollegeBadge({ me }: { me: Me | null }) {
   return (
     <div className="flex flex-col gap-1.5 min-w-0">
       <img src="/skilltimate-logo.png" alt="Skilltimate" className="h-8 w-auto max-w-[170px] object-contain object-left" />
-      <div className="font-semibold text-[14px] leading-tight text-[var(--color-ink)] truncate">{me?.tenant?.name ?? "Proview"}</div>
+      <div className="font-semibold text-[12px] leading-snug text-[var(--color-ink)] line-clamp-2">{me?.tenant?.name ?? "Proview"}</div>
     </div>
   );
 }
@@ -95,7 +95,7 @@ function WorkspaceSwitcher({ me }: { me: Me | null }) {
       >
         <div className="flex flex-col gap-1.5 min-w-0 flex-1">
           <img src="/skilltimate-logo.png" alt="Skilltimate" className="h-8 w-auto max-w-[160px] object-contain object-left" />
-          <div className="font-semibold text-[14px] leading-tight text-[var(--color-ink)] truncate">{active?.name ?? "Select college"}</div>
+          <div className="font-semibold text-[12px] leading-snug text-[var(--color-ink)] line-clamp-2">{active?.name ?? "Select college"}</div>
         </div>
         <span className="shrink-0 h-6 w-6 rounded-md flex items-center justify-center text-[var(--color-muted)] group-hover:bg-white group-hover:text-[var(--brand)] transition" title="Switch college">
           <ArrowLeftRight size={14} />

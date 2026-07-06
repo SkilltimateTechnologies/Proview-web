@@ -13,7 +13,7 @@
   display: flex; align-items: center; justify-content: center; font-weight: 800; font-family: var(--font-serif); font-size: 18px;
 }
 .side .brand-college-logo { max-height: 44px; max-width: 170px; width: auto; object-fit: contain; display: block; }
-.side .brand-name { font-weight: 700; color: var(--color-ink); font-size: 15px; }
+.side .brand-name { font-weight: 700; color: var(--color-ink); font-size: 12px; line-height: 1.25; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .side .brand-sub { font-family: var(--font-mono); font-size: 10px; color: var(--color-muted); text-transform: uppercase; letter-spacing: .08em; }
 .side .snav {
   display: flex; align-items: center; gap: 11px; padding: 10px 12px; border-radius: 10px;
