@@ -29,6 +29,29 @@ const app = new Hono<{ Variables: Vars }>()
   .use("*", authMiddleware)
   .get("/health", (c) => c.json({ status: "ok" }, 200))
 
+  // ---- TEMP diagnostic: verify DB connectivity + env presence ----
+  .get("/__diag", async (c) => {
+    const env = {
+      DATABASE_URL: process.env.DATABASE_URL
+        ? `${process.env.DATABASE_URL.slice(0, 14)}… (len ${process.env.DATABASE_URL.length})`
+        : "MISSING",
+      DATABASE_AUTH_TOKEN: process.env.DATABASE_AUTH_TOKEN
+        ? `set (len ${process.env.DATABASE_AUTH_TOKEN.length})`
+        : "MISSING",
+      BETTER_AUTH_SECRET: process.env.BETTER_AUTH_SECRET ? "set" : "MISSING",
+      WEBSITE_URL: process.env.WEBSITE_URL ?? "MISSING",
+    };
+    try {
+      const [u] = await db.select().from(schema.user).limit(1);
+      return c.json({ db: "ok", userFound: !!u, env }, 200);
+    } catch (e) {
+      return c.json(
+        { db: "error", error: e instanceof Error ? e.message : String(e), env },
+        500,
+      );
+    }
+  })
+
   // ---- current session context ----
   .get("/me", requireAuth, async (c) => {
     const user = c.get("user")!;
