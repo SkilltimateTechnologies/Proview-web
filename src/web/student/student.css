@@ -13,7 +13,7 @@
   display: flex; align-items: center; justify-content: center; font-weight: 800; font-family: var(--font-serif); font-size: 18px;
 }
 .side .brand-college-logo { max-height: 44px; max-width: 170px; width: auto; object-fit: contain; display: block; }
-.side .brand-name { font-weight: 700; color: var(--color-ink); font-size: 12px; line-height: 1.25; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.side .brand-name { font-weight: 700; color: var(--color-ink); font-size: 15px; }
 .side .brand-sub { font-family: var(--font-mono); font-size: 10px; color: var(--color-muted); text-transform: uppercase; letter-spacing: .08em; }
 .side .snav {
   display: flex; align-items: center; gap: 11px; padding: 10px 12px; border-radius: 10px;
@@ -99,6 +99,45 @@
   outline: none; resize: vertical; tab-size: 4;
 }
 .code-area:focus { border-color: var(--brand); }
+
+/* Code IDE (highlighted editor) */
+.ide {
+  display: flex; border: 1px solid #22344b; border-radius: 11px; overflow: hidden;
+  background: #0f1b2b; font-family: var(--font-mono); font-size: 13px; line-height: 1.6;
+}
+.ide-gutter {
+  flex: none; padding: 16px 10px 16px 14px; text-align: right; color: #4d637f;
+  background: #0c1624; user-select: none; overflow: hidden; min-width: 42px;
+  border-right: 1px solid #1c2c40; white-space: pre; tab-size: 4;
+}
+.ide-gutter > div { height: calc(13px * 1.6); }
+.ide-code { position: relative; flex: 1; min-width: 0; }
+.ide-hl, .ide-input {
+  margin: 0; padding: 16px; border: 0; font: inherit; line-height: 1.6; tab-size: 4;
+  white-space: pre; overflow: auto; word-wrap: normal;
+  width: 100%; height: 340px; box-sizing: border-box;
+}
+.ide-hl {
+  position: absolute; inset: 0; pointer-events: none; color: #e6edf5;
+  overflow: hidden;
+}
+.ide-hl code { font: inherit; white-space: pre; }
+.ide-input {
+  position: relative; background: transparent; color: transparent; caret-color: #e6edf5;
+  resize: none; outline: none; z-index: 1;
+}
+.ide-input::selection { background: rgba(90,140,255,.32); }
+.ide .tk-kw   { color: #ff7b9c; }
+.ide .tk-str  { color: #9ce08a; }
+.ide .tk-num  { color: #f0b866; }
+.ide .tk-com  { color: #5f7793; font-style: italic; }
+.ide .tk-fn   { color: #62c8ff; }
+.ide .tk-type { color: #6fd7c7; }
+
+/* Finish-exam block in side panel */
+.side-finish { margin-bottom: 20px; padding-bottom: 20px; border-bottom: 1px solid var(--color-line); }
+.side-finish .btn { width: 100%; padding: 12px; font-size: 14px; }
+.side-finish-stats { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--color-ink2); margin-bottom: 10px; }
 
 /* Download progress */
 .dl-bar { height: 10px; border-radius: 999px; background: #eceff3; overflow: hidden; }

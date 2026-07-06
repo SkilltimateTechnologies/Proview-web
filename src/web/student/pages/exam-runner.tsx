@@ -624,6 +624,15 @@ export function ExamRunner() {
         </div>
 
         <aside className="q-side">
+          <div className="side-finish">
+            <div className="side-finish-stats">
+              <span><strong>{answeredCount}</strong>/{questions.length} answered</span>
+              {flagCount > 0 && <span style={{ color: "var(--color-warn)" }}><Icon name="flag" size={12} /> {flagCount} flagged</span>}
+            </div>
+            <button className="btn btn-primary" onClick={() => void doSubmit()} disabled={submitting}>
+              {submitting ? <Icon name="loader-circle" className="animate-spin" /> : <Icon name="send" />} Finish exam
+            </button>
+          </div>
           <div className="mono-label" style={{ marginBottom: 12 }}>Question palette</div>
           <div className="palette-grid" style={{ marginBottom: 18 }}>
             {questions.map((qq, i) => {
@@ -734,6 +743,114 @@ function QuestionInput({ q, value, onChange, online }: { q: BundleQuestion; valu
   );
 }
 
+// ---- Lightweight syntax highlighter (no deps) ----
+const CODE_KEYWORDS: Record<string, Set<string>> = {
+  python: new Set(["False","None","True","and","as","assert","async","await","break","class","continue","def","del","elif","else","except","finally","for","from","global","if","import","in","is","lambda","nonlocal","not","or","pass","raise","return","try","while","with","yield","self","print","range","len","str","int","float","list","dict","set","tuple","bool","input","enumerate","zip","map","filter","sum","min","max","abs","sorted","open"]),
+  javascript: new Set(["var","let","const","function","return","if","else","for","while","do","switch","case","break","continue","default","class","extends","super","new","this","typeof","instanceof","in","of","try","catch","finally","throw","async","await","yield","import","export","from","as","null","undefined","true","false","void","delete","console","log"]),
+  java: new Set(["abstract","assert","boolean","break","byte","case","catch","char","class","const","continue","default","do","double","else","enum","extends","final","finally","float","for","goto","if","implements","import","instanceof","int","interface","long","native","new","package","private","protected","public","return","short","static","strictfp","super","switch","synchronized","this","throw","throws","transient","try","void","volatile","while","true","false","null","String","System","out","println","print"]),
+  c: new Set(["auto","break","case","char","const","continue","default","do","double","else","enum","extern","float","for","goto","if","inline","int","long","register","restrict","return","short","signed","sizeof","static","struct","switch","typedef","union","unsigned","void","volatile","while","printf","scanf","include","define","std","cout","cin","endl","using","namespace","class","public","private","new","delete","bool","true","false"]),
+};
+function langKeywords(lang: string): Set<string> {
+  const l = lang.toLowerCase();
+  if (l.startsWith("py")) return CODE_KEYWORDS.python;
+  if (l === "js" || l === "javascript" || l === "node" || l === "ts" || l === "typescript") return CODE_KEYWORDS.javascript;
+  if (l === "java" || l === "kotlin") return CODE_KEYWORDS.java;
+  if (l === "c" || l === "cpp" || l === "c++" || l === "csharp" || l === "c#" || l === "go" || l === "rust") return CODE_KEYWORDS.c;
+  return CODE_KEYWORDS.python;
+}
+function escHtml(s: string) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+function highlightCode(code: string, lang: string): string {
+  const kw = langKeywords(lang);
+  const re = /(#[^\n]*|\/\/[^\n]*|\/\*[\s\S]*?\*\/)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(\b\d[\d_.eExXbBoOaAfF]*\b)|([A-Za-z_$][\w$]*)/g;
+  let out = "", last = 0, m: RegExpExecArray | null;
+  while ((m = re.exec(code))) {
+    out += escHtml(code.slice(last, m.index));
+    if (m[1]) out += `<span class="tk-com">${escHtml(m[1])}</span>`;
+    else if (m[2]) out += `<span class="tk-str">${escHtml(m[2])}</span>`;
+    else if (m[3]) out += `<span class="tk-num">${escHtml(m[3])}</span>`;
+    else {
+      const w = m[4];
+      const rest = code.slice(m.index + w.length);
+      if (kw.has(w)) out += `<span class="tk-kw">${escHtml(w)}</span>`;
+      else if (/^\s*\(/.test(rest)) out += `<span class="tk-fn">${escHtml(w)}</span>`;
+      else if (/^[A-Z]/.test(w)) out += `<span class="tk-type">${escHtml(w)}</span>`;
+      else out += escHtml(w);
+    }
+    last = m.index + m[0].length;
+  }
+  out += escHtml(code.slice(last));
+  return out + "\n";
+}
+
+function CodeEditor({ code, language, onChange }: { code: string; language: string; onChange: (v: string) => void }) {
+  const taRef = useRef<HTMLTextAreaElement>(null);
+  const preRef = useRef<HTMLPreElement>(null);
+  const gutRef = useRef<HTMLDivElement>(null);
+  const lineCount = Math.max(1, code.split("\n").length);
+
+  function syncScroll() {
+    const ta = taRef.current; if (!ta) return;
+    if (preRef.current) { preRef.current.scrollTop = ta.scrollTop; preRef.current.scrollLeft = ta.scrollLeft; }
+    if (gutRef.current) gutRef.current.scrollTop = ta.scrollTop;
+  }
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    const ta = e.currentTarget;
+    const start = ta.selectionStart, end = ta.selectionEnd;
+    if (e.key === "Tab") {
+      e.preventDefault();
+      if (e.shiftKey) {
+        // dedent line start
+        const lineStart = code.lastIndexOf("\n", start - 1) + 1;
+        const removed = code.slice(lineStart).match(/^( {1,4}|\t)/);
+        if (removed) {
+          const n = removed[0].length;
+          const next = code.slice(0, lineStart) + code.slice(lineStart + n);
+          onChange(next);
+          requestAnimationFrame(() => { ta.selectionStart = ta.selectionEnd = Math.max(lineStart, start - n); });
+        }
+      } else {
+        const next = code.slice(0, start) + "    " + code.slice(end);
+        onChange(next);
+        requestAnimationFrame(() => { ta.selectionStart = ta.selectionEnd = start + 4; });
+      }
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const lineStart = code.lastIndexOf("\n", start - 1) + 1;
+      const curLine = code.slice(lineStart, start);
+      const indent = (curLine.match(/^[ \t]*/) || [""])[0];
+      const extra = /[:{[(]\s*$/.test(curLine.trimEnd()) ? "    " : "";
+      const insert = "\n" + indent + extra;
+      const next = code.slice(0, start) + insert + code.slice(end);
+      onChange(next);
+      requestAnimationFrame(() => { ta.selectionStart = ta.selectionEnd = start + insert.length; });
+    }
+  }
+
+  return (
+    <div className="ide">
+      <div className="ide-gutter" ref={gutRef}>
+        {Array.from({ length: lineCount }, (_, i) => <div key={i}>{i + 1}</div>)}
+      </div>
+      <div className="ide-code">
+        <pre className="ide-hl" ref={preRef} aria-hidden="true"><code dangerouslySetInnerHTML={{ __html: highlightCode(code, language) }} /></pre>
+        <textarea
+          ref={taRef}
+          className="ide-input"
+          value={code}
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
+          onScroll={syncScroll}
+          onKeyDown={onKeyDown}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="Write your solution here…"
+        />
+      </div>
+    </div>
+  );
+}
+
 function CodingInput({ q, value, onChange, online }: { q: BundleQuestion; value: unknown; onChange: (v: unknown) => void; online: boolean }) {
   const code = (value as string) ?? q.meta.starter ?? "";
   const language = q.meta.language || "python";
@@ -763,7 +880,7 @@ function CodingInput({ q, value, onChange, online }: { q: BundleQuestion; value:
           {running ? <Icon name="loader-circle" className="animate-spin" size={14} /> : <Icon name="play" size={14} />} {running ? "Running…" : "Run code"}
         </button>
       </div>
-      <textarea className="code-area" value={code} spellCheck={false} onChange={(e) => onChange(e.target.value)} placeholder="Write your solution here…" />
+      <CodeEditor code={code} language={language} onChange={(v) => onChange(v)} />
       <div style={{ marginTop: 12 }}>
         <div className="mono-label" style={{ marginBottom: 6 }}>Custom input (stdin) — optional</div>
         <textarea className="code-area" style={{ minHeight: 60 }} value={stdin} spellCheck={false} onChange={(e) => setStdin(e.target.value)} placeholder="Input passed to your program when you press Run" />
