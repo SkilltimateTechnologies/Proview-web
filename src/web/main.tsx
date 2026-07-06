@@ -8,7 +8,9 @@ import { StudentApp } from "./student";
 
 const queryClient = new QueryClient();
 
-const isStudent = window.location.pathname.startsWith("/student");
+// Student portal base path — deliberately obscure so students can't guess it.
+// Any other URL falls through to the admin app (which shows the admin login).
+const isStudent = window.location.pathname.startsWith("/px9k2m7");
 
 createRoot(document.getElementById("root")!).render(
 	<StrictMode>

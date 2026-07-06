@@ -76,6 +76,16 @@ type ExamRow = { id: string; title: string; status: string; startAt: number | st
 
 const STATUS_COLOR: Record<string, string> = { finished: "#2e7d5b", live: "#c0453b", scheduled: "#b7791f", draft: "#8a929c" };
 
+// A scheduled assessment becomes LIVE automatically once its start time passes
+// (students can already start it at that point), so reflect that in the badge.
+function displayStatus(e: { status: string; startAt: number | string | null }): string {
+  if (e.status === "scheduled") {
+    const ms = toMs(e.startAt);
+    if (ms !== null && Date.now() >= ms) return "live";
+  }
+  return e.status;
+}
+
 type PickQ = { id: string; prompt: string; points: number; type: string; topic?: string | null; categoryName?: string | null; difficulty?: string };
 const Q_TYPE_LABEL: Record<string, string> = {
   mcq: "MCQ", multi: "Multi", truefalse: "T/F", fillblank: "Fill", short: "Short", essay: "Essay", coding: "Coding",
@@ -107,13 +117,15 @@ export default function Exams() {
         <EmptyState title="No assessments yet" hint="Create your first assessment to schedule an exam." />
       ) : (
         <div className="space-y-3">
-          {pg.pageItems.map((e) => (
+          {pg.pageItems.map((e) => {
+            const ds = displayStatus(e);
+            return (
             <div key={e.id} className="card p-4 flex items-center justify-between gap-3 flex-wrap">
               <div className="min-w-0">
                 <div className="font-medium text-[var(--color-ink)]">{e.title}</div>
                 <div className="mono-label mt-1 flex items-center gap-2 flex-wrap">
                   <span>{e.durationMin} min · {e.totalPoints} pts</span>
-                  {e.startAt && e.status !== "scheduled" && (
+                  {e.startAt && ds !== "scheduled" && (
                     <span className="inline-flex items-center gap-1">
                       <CalendarClock size={13} /> {fmtDate(e.startAt)}
                     </span>
@@ -121,19 +133,19 @@ export default function Exams() {
                 </div>
               </div>
               <div className="flex items-center gap-3 flex-wrap">
-                <Pill label={e.status.toUpperCase()} color={STATUS_COLOR[e.status]} />
-                {e.status === "scheduled" && (
+                <Pill label={ds.toUpperCase()} color={STATUS_COLOR[ds]} />
+                {ds === "scheduled" && (
                   <span className="inline-flex items-center gap-1.5 text-sm text-[var(--color-ink2)]">
                     <CalendarClock size={14} /> {fmtDate(e.startAt)}
                     <span className="mono-label" style={{ color: "var(--brand)" }}>· {timeUntil(e.startAt)}</span>
                   </span>
                 )}
-                {e.status === "live" && (
+                {ds === "live" && (
                   <span className="inline-flex items-center gap-1.5 text-sm" style={{ color: "#c0453b" }}>
                     <Clock size={14} /> In progress
                   </span>
                 )}
-                {(e.status === "scheduled" || e.status === "draft") && (
+                {(ds === "scheduled" || ds === "live" || e.status === "draft") && (
                   <button className="btn btn-ghost py-1.5 text-sm" onClick={() => setEditing(e as ExamRow)}>
                     <Pencil size={15} /> {e.status === "draft" ? "Edit & schedule" : "Edit"}
                   </button>
@@ -149,7 +161,8 @@ export default function Exams() {
                 )}
               </div>
             </div>
-          ))}
+            );
+          })}
           <Pager {...pg} onChange={pg.setPage} unit="assessments" />
         </div>
       )}

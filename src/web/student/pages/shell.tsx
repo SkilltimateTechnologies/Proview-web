@@ -86,7 +86,7 @@ export function Shell() {
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <NetBadge online={online} />
-            <button className="btn btn-ghost btn-sm" onClick={() => { logout(); window.location.replace(window.location.origin + "/student/exit"); }}>
+            <button className="btn btn-ghost btn-sm" onClick={() => { logout(); window.location.replace(window.location.origin + "/px9k2m7/exit"); }}>
               <Icon name="log-out" size={15} /> Sign out
             </button>
           </div>
@@ -125,7 +125,7 @@ export function Shell() {
               <div style={{ fontSize: 11, color: "var(--color-muted)", fontFamily: "var(--font-mono)" }}>{student?.rollNo}</div>
             </div>
           </div>
-          <button className="snav" style={{ width: "100%" }} onClick={() => { logout(); window.location.replace(window.location.origin + "/student/exit"); }}>
+          <button className="snav" style={{ width: "100%" }} onClick={() => { logout(); window.location.replace(window.location.origin + "/px9k2m7/exit"); }}>
             <Icon name="log-out" /> Sign out
           </button>
         </div>

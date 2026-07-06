@@ -13,7 +13,7 @@ function Exit() {
   // The button below is a manual fallback in case auto-quit is blocked.
   const quitSeb = () => {
     try { window.close(); } catch { /* ignore */ }
-    window.location.replace(window.location.origin + "/student/exit");
+    window.location.replace(window.location.origin + "/px9k2m7/exit");
   };
   return (
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "#0b1120", color: "#e6edf7", fontFamily: "system-ui, sans-serif", gap: 14, textAlign: "center", padding: 24 }}>
@@ -21,7 +21,7 @@ function Exit() {
       <h1 style={{ fontSize: 24, margin: 0 }}>Session ended</h1>
       <p style={{ color: "#7d8ba0", maxWidth: 420, margin: 0 }}>You have signed out of the Proview secure exam client. The secure browser will close automatically.</p>
       <button onClick={quitSeb} style={{ marginTop: 10, background: "#1A3EBF", color: "#fff", border: "none", borderRadius: 8, padding: "10px 20px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>Close secure browser</button>
-      <a href="/student/login" style={{ marginTop: 4, color: "#5b8cff", textDecoration: "none", fontSize: 13 }}>Sign in again</a>
+      <a href="/px9k2m7/login" style={{ marginTop: 4, color: "#5b8cff", textDecoration: "none", fontSize: 13 }}>Sign in again</a>
     </div>
   );
 }
@@ -78,7 +78,7 @@ function Routes() {
 
 export function StudentApp() {
   return (
-    <Router base="/student">
+    <Router base="/px9k2m7">
       <SessionProvider>
         <Routes />
       </SessionProvider>
