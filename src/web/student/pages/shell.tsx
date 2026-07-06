@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useParams, Link } from "wouter";
 import { api, type ExamListItem, type Review as ReviewData } from "../lib/api";
 import { useSession } from "../lib/session";
@@ -38,19 +38,50 @@ export function Shell() {
   const [err, setErr] = useState("");
   const [reviewId, setReviewId] = useState<string | null>(null);
 
-  async function load() {
+  const loadRef = useRef<() => Promise<void>>(async () => {});
+  loadRef.current = async () => {
     try {
       const res = await api.exams();
       setExams(res.exams);
+      setErr("");
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Failed to load exams");
-      setExams([]);
+      setExams((prev) => prev ?? []);
     }
-  }
+  };
+
+  // Keep the exam list fresh so a student who is already logged in and waiting
+  // sees the Start gate appear the moment an exam goes live — no manual refresh.
+  //  1. Poll every 15s while the dashboard is open (only when online).
+  //  2. Additionally, schedule a precise one-shot refresh for the exact instant
+  //     the nearest upcoming exam's start time hits, so the flip is immediate.
   useEffect(() => {
-    void load();
+    void loadRef.current();
+    const poll = setInterval(() => {
+      if (typeof navigator === "undefined" || navigator.onLine) void loadRef.current();
+    }, 15000);
+    // Refresh as soon as the tab regains focus (e.g. student switches back at 11:30).
+    const onFocus = () => void loadRef.current();
+    window.addEventListener("focus", onFocus);
+    return () => { clearInterval(poll); window.removeEventListener("focus", onFocus); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Precise refresh right when the soonest upcoming exam is due to start.
+  useEffect(() => {
+    if (!exams) return;
+    const now = Date.now();
+    const nextStart = exams
+      .filter((e) => e.phase === "upcoming" && e.startAt)
+      .map((e) => new Date(e.startAt as string).getTime())
+      .filter((t) => t > now)
+      .sort((a, b) => a - b)[0];
+    if (nextStart == null) return;
+    // +500ms cushion so the server has definitely crossed startAt when we refetch.
+    const delay = Math.min(nextStart - now + 500, 2_147_000_000);
+    const t = setTimeout(() => void loadRef.current(), delay);
+    return () => clearTimeout(t);
+  }, [exams]);
 
   const live = useMemo(() => (exams || []).filter((e) => e.phase === "available" || e.phase === "in_progress"), [exams]);
   // "Finished Exams" shows completed attempts and any missed (absent) exams —
