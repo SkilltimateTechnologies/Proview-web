@@ -104,7 +104,7 @@ export function Shell() {
         <div className="brand" style={{ flexDirection: "column", alignItems: "flex-start", gap: 8 }}>
           <img src={logo} alt="Skilltimate" style={{ height: 30, width: "auto", maxWidth: 170, objectFit: "contain" }} />
           <div style={{ minWidth: 0 }}>
-            <div className="brand-name">{student?.collegeName || "Proview"}</div>
+            <div className="brand-name" style={{ fontSize: 12, lineHeight: 1.3, whiteSpace: "normal", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{student?.collegeName || "Proview"}</div>
             <div className="brand-sub">Student Portal</div>
           </div>
         </div>

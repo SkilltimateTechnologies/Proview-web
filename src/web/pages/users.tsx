@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useLocation } from "wouter";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Upload, X, Search, Shield, GraduationCap, UserCog, Mail, Sliders, KeyRound, Layers, Copy, Check, Pencil } from "lucide-react";
+import { Plus, Upload, X, Search, GraduationCap, UserCog, Mail, Sliders, KeyRound, Layers, Copy, Check, Pencil } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Field, Drawer, usePagination, Pager } from "../components/ui";
@@ -38,7 +38,7 @@ type StudentRow = {
 };
 type ClassRow = { id: string; code: string };
 
-type Filter = "students" | "tpo" | "admin";
+type Filter = "students" | "tpo";
 
 const ROLE_META: Record<string, { label: string; color: string }> = {
   super_admin: { label: "Super Admin", color: "#1e3a5f" },
@@ -87,7 +87,6 @@ export default function Users() {
 
   const s = search.toLowerCase();
   const allUsers = list.data?.users ?? [];
-  const admins = allUsers.filter((u) => u.role === "super_admin" || u.role === "college_admin");
   const tpos = allUsers.filter((u) => u.role === "tpo");
   const students = studentsQ.data?.students ?? [];
   const classes = classesQ.data?.classes ?? [];
@@ -106,7 +105,7 @@ export default function Users() {
       return la.localeCompare(lb) || a.rollNo.localeCompare(b.rollNo);
     });
 
-  const staffRows = (filter === "admin" ? admins : tpos).filter(uMatch);
+  const staffRows = tpos.filter(uMatch);
 
   const studentPg = usePagination(filteredStudents);
   const staffPg = usePagination(staffRows);
@@ -114,7 +113,6 @@ export default function Users() {
   const FILTERS: Array<{ k: Filter; label: string; count: number; icon: React.ElementType }> = [
     { k: "students", label: "Students", count: students.length, icon: GraduationCap },
     { k: "tpo", label: "TPOs", count: tpos.length, icon: UserCog },
-    { k: "admin", label: "Admins", count: admins.length, icon: Shield },
   ];
 
   return (
@@ -128,12 +126,11 @@ export default function Users() {
             {filter === "students" && <button className="btn btn-ghost" onClick={() => setCsv(true)}><Upload size={16} /> Bulk upload CSV</button>}
             {filter === "students" && <button className="btn btn-primary" onClick={() => setAdd(true)}><Plus size={16} /> Add student</button>}
             {filter === "tpo" && <button className="btn btn-primary" onClick={() => setAdd(true)}><Plus size={16} /> Add TPO</button>}
-            {filter === "admin" && <button className="btn btn-primary" onClick={() => setAdd(true)}><Plus size={16} /> Add admin</button>}
           </div>
         }
       />
 
-      {add && (filter === "students" ? <AddStudent classes={classes} onClose={() => setAdd(false)} /> : <AddUser role={filter === "admin" ? "college_admin" : "tpo"} onClose={() => setAdd(false)} />)}
+      {add && (filter === "students" ? <AddStudent classes={classes} onClose={() => setAdd(false)} /> : <AddUser role="tpo" onClose={() => setAdd(false)} />)}
       {editStudent && <AddStudent classes={classes} initial={editStudent} onClose={() => setEditStudent(null)} />}
       {editUser && <AddUser role={editUser.role === "college_admin" ? "college_admin" : "tpo"} initial={editUser} onClose={() => setEditUser(null)} />}
       {csv && <CsvUpload onClose={() => setCsv(false)} />}
@@ -229,10 +226,10 @@ export default function Users() {
       ) : (
         (() => {
           const rows = staffRows;
-          if (rows.length === 0) return <EmptyState title={`No ${filter === "admin" ? "admins" : "TPOs"} found`} />;
+          if (rows.length === 0) return <EmptyState title="No TPOs found" />;
           return (
             <>
-              <div className="mono-label mb-2">{rows.length} {filter === "admin" ? "admin" : "TPO"}{rows.length === 1 ? "" : "s"}</div>
+              <div className="mono-label mb-2">{rows.length} TPO{rows.length === 1 ? "" : "s"}</div>
               <div className="table-wrap">
                 <div className="table-scroll">
                   <table className="data-table">
@@ -282,7 +279,7 @@ export default function Users() {
                   </table>
                 </div>
               </div>
-              <Pager {...staffPg} onChange={staffPg.setPage} unit={filter === "admin" ? "admins" : "TPOs"} />
+              <Pager {...staffPg} onChange={staffPg.setPage} unit="TPOs" />
             </>
           );
         })()
