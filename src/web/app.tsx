@@ -8,7 +8,7 @@ import Dashboard from "./pages/dashboard";
 import Monitor from "./pages/monitor";
 import Reports from "./pages/reports";
 import ReportDetail from "./pages/report-detail";
-import Exams, { NewExam } from "./pages/exams";
+import Exams, { NewExam, EditExam } from "./pages/exams";
 import Questions from "./pages/questions";
 import Users from "./pages/users";
 import Sections from "./pages/sections";
@@ -28,6 +28,7 @@ function Protected() {
         <Route path="/reports" component={Reports} />
         <Route path="/reports/:examId" component={ReportDetail} />
         <Route path="/exams/new" component={NewExam} />
+        <Route path="/exams/:id/edit" component={EditExam} />
         <Route path="/exams" component={Exams} />
         <Route path="/questions" component={Questions} />
         <Route path="/users" component={Users} />

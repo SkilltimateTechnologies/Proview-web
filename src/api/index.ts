@@ -1002,6 +1002,19 @@ const app = new Hono<{ Variables: Vars }>()
     rows.sort((a, b) => dateVal(b) - dateVal(a));
     return c.json({ exams: rows }, 200);
   })
+  // Single exam with its selected question IDs (for the edit page).
+  .get("/exams/:id", requireAuth, requirePermission("exams"), async (c) => {
+    const p = c.get("profile")!;
+    const eid = c.req.param("id");
+    const [row] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    if (!row || (p.role !== "super_admin" && row.tenantId !== p.tenantId)) return c.json({ error: "not found" }, 404);
+    const eqs = await db
+      .select({ questionId: schema.examQuestions.questionId })
+      .from(schema.examQuestions)
+      .where(eq(schema.examQuestions.examId, eid))
+      .orderBy(schema.examQuestions.order);
+    return c.json({ exam: row, questionIds: eqs.map((e) => e.questionId) }, 200);
+  })
   .post("/exams", requireAuth, requirePermission("exams"), async (c) => {
     const p = c.get("profile")!;
     const b = await c.req.json();
@@ -1047,6 +1060,18 @@ const app = new Hono<{ Variables: Vars }>()
       patch.endAt = b.startAt ? new Date(new Date(b.startAt).getTime() + 2 * 60 * 60 * 1000) : null;
     } else if (b.endAt !== undefined) {
       patch.endAt = b.endAt ? new Date(b.endAt) : null;
+    }
+    // Optionally replace the exam's question set and recompute total points.
+    if (Array.isArray(b.questionIds)) {
+      const qids: string[] = b.questionIds;
+      const qs = qids.length ? await db.select().from(schema.questions).where(inArray(schema.questions.id, qids)) : [];
+      patch.totalPoints = qs.reduce((s, q) => s + q.points, 0);
+      await db.delete(schema.examQuestions).where(eq(schema.examQuestions.examId, eid));
+      if (qids.length) {
+        await db.insert(schema.examQuestions).values(
+          qids.map((q, i) => ({ id: id("eq"), examId: eid, questionId: q, order: i, points: qs.find((x) => x.id === q)?.points ?? 1 })),
+        );
+      }
     }
     const [row] = await db.update(schema.exams).set(patch).where(eq(schema.exams.id, eid)).returning();
     return c.json({ exam: row }, 200);

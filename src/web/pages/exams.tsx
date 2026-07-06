@@ -2,10 +2,10 @@ import { useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Plus, Lock, BarChart3, Clock, CalendarClock, ArrowLeft, Pencil, Ban } from "lucide-react";
-import { useLocation } from "wouter";
+import { useLocation, useParams } from "wouter";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
-import { Loader, EmptyState, Pill, Field, usePagination, Pager, Drawer } from "../components/ui";
+import { Loader, EmptyState, Pill, Field, usePagination, Pager } from "../components/ui";
 
 function toMs(ts: number | string | null | undefined): number | null {
   if (ts === null || ts === undefined) return null;
@@ -93,7 +93,6 @@ const Q_TYPE_LABEL: Record<string, string> = {
 
 export default function Exams() {
   const [, navigate] = useLocation();
-  const [editing, setEditing] = useState<ExamRow | null>(null);
 
   const exams = useQuery({
     queryKey: ["exams"],
@@ -146,7 +145,7 @@ export default function Exams() {
                   </span>
                 )}
                 {(ds === "scheduled" || ds === "live" || e.status === "draft") && (
-                  <button className="btn btn-ghost py-1.5 text-sm" onClick={() => setEditing(e as ExamRow)}>
+                  <button className="btn btn-ghost py-1.5 text-sm" onClick={() => navigate(`/exams/${e.id}/edit`)}>
                     <Pencil size={15} /> {e.status === "draft" ? "Edit & schedule" : "Edit"}
                   </button>
                 )}
@@ -166,24 +165,49 @@ export default function Exams() {
           <Pager {...pg} onChange={pg.setPage} unit="assessments" />
         </div>
       )}
-
-      {editing && <EditExamDrawer exam={editing} onClose={() => setEditing(null)} />}
     </div>
   );
 }
 
-function EditExamDrawer({ exam, onClose }: { exam: ExamRow; onClose: () => void }) {
+export function EditExam() {
   const qc = useQueryClient();
-  const classes = useQuery({ queryKey: ["classes"], queryFn: async () => (await api.classes.$get()).json() });
-  const sections = (classes.data?.classes ?? []) as Array<{ id: string; code: string }>;
+  const [, navigate] = useLocation();
+  const params = useParams();
+  const examId = params.id as string;
 
-  const initial = splitIST(exam.startAt);
-  const [title, setTitle] = useState(exam.title);
-  const [durationMin, setDurationMin] = useState(exam.durationMin);
-  const [date, setDate] = useState(initial.date);
-  const [slot, setSlot] = useState(initial.slot);
-  const [scope, setScope] = useState<"all" | "specific">(exam.sectionIds && exam.sectionIds.length ? "specific" : "all");
-  const [sectionIds, setSectionIds] = useState<string[]>(exam.sectionIds ?? []);
+  const examQ = useQuery({
+    queryKey: ["exam", examId],
+    queryFn: async () => (await api.exams[":id"].$get({ param: { id: examId } })).json(),
+  });
+  const classes = useQuery({ queryKey: ["classes"], queryFn: async () => (await api.classes.$get()).json() });
+  const questions = useQuery({ queryKey: ["questions-pick"], queryFn: async () => (await api.questions.$get()).json() });
+  const sections = (classes.data?.classes ?? []) as Array<{ id: string; code: string }>;
+  const qList = (questions.data?.questions ?? []) as PickQ[];
+
+  const exam = (examQ.data && "exam" in examQ.data ? examQ.data.exam : null) as ExamRow | null;
+  const initialQIds = (examQ.data && "questionIds" in examQ.data ? examQ.data.questionIds : []) as string[];
+
+  const [title, setTitle] = useState("");
+  const [durationMin, setDurationMin] = useState(60);
+  const [date, setDate] = useState("");
+  const [slot, setSlot] = useState("");
+  const [scope, setScope] = useState<"all" | "specific">("all");
+  const [sectionIds, setSectionIds] = useState<string[]>([]);
+  const [picked, setPicked] = useState<string[]>([]);
+  const [hydrated, setHydrated] = useState(false);
+
+  // Hydrate the form once the exam loads.
+  if (exam && !hydrated) {
+    const initial = splitIST(exam.startAt);
+    setTitle(exam.title);
+    setDurationMin(exam.durationMin);
+    setDate(initial.date);
+    setSlot(initial.slot);
+    setScope(exam.sectionIds && exam.sectionIds.length ? "specific" : "all");
+    setSectionIds(exam.sectionIds ?? []);
+    setPicked(initialQIds);
+    setHydrated(true);
+  }
 
   const sectionsValid = scope === "all" || sectionIds.length > 0;
   function toggleSection(sid: string) {
@@ -192,20 +216,22 @@ function EditExamDrawer({ exam, onClose }: { exam: ExamRow; onClose: () => void 
 
   const done = () => {
     qc.invalidateQueries({ queryKey: ["exams"] });
-    onClose();
+    qc.invalidateQueries({ queryKey: ["exam", examId] });
+    navigate("/exams");
   };
 
   const save = useMutation({
     mutationFn: async () => {
       const startAt = combineIST(date, slot);
       return (await api.exams[":id"].$patch({
-        param: { id: exam.id },
+        param: { id: examId },
         // A start time means the assessment is scheduled; no start time keeps it a draft.
         json: {
           title,
           durationMin,
           startAt,
           sectionIds: scope === "specific" ? sectionIds : [],
+          questionIds: picked,
           status: startAt ? "scheduled" : "draft",
         },
       })).json();
@@ -213,27 +239,42 @@ function EditExamDrawer({ exam, onClose }: { exam: ExamRow; onClose: () => void 
     onSuccess: done,
   });
 
-  const isDraft = exam.status === "draft";
-  const scheduled = Boolean(date && slot);
-
   const cancelExam = useMutation({
     mutationFn: async () =>
       (await api.exams[":id"].$patch({
-        param: { id: exam.id },
+        param: { id: examId },
         json: { status: "draft", startAt: null },
       })).json(),
     onSuccess: done,
   });
 
+  if (examQ.isLoading || !exam) {
+    return (
+      <div className="rise">
+        <button className="btn btn-ghost mb-3 -ml-2" onClick={() => navigate("/exams")}>
+          <ArrowLeft size={16} /> Back to assessments
+        </button>
+        {examQ.isLoading ? <Loader /> : <EmptyState title="Assessment not found" hint="It may have been removed." />}
+      </div>
+    );
+  }
+
+  const isDraft = exam.status === "draft";
+  const scheduled = Boolean(date && slot);
+  const total = qList.filter((q) => picked.includes(q.id)).reduce((s, q) => s + q.points, 0);
+
   return (
-    <Drawer eyebrow="Assessment" title={isDraft ? "Edit & schedule assessment" : "Edit scheduled assessment"} subtitle={`${exam.totalPoints} pts`} onClose={onClose} width="max-w-xl">
-      <div className="space-y-4">
-        <Field label="Title"><input className="input" value={title} onChange={(e) => setTitle(e.target.value)} /></Field>
-        <Field label="Duration (min)"><input className="input" type="number" value={durationMin} onChange={(e) => setDurationMin(Number(e.target.value))} /></Field>
+    <div className="rise">
+      <button className="btn btn-ghost mb-3 -ml-2" onClick={() => navigate("/exams")}>
+        <ArrowLeft size={16} /> Back to assessments
+      </button>
+      <PageHeader eyebrow="Assessment" title={isDraft ? "Edit & schedule assessment" : "Edit assessment"} />
+
+      <div className="card p-5">
         <div className="grid sm:grid-cols-2 gap-4">
-          <Field label="Start date">
-            <input className="input" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
-          </Field>
+          <Field label="Title"><input className="input" value={title} onChange={(e) => setTitle(e.target.value)} /></Field>
+          <Field label="Duration (min)"><input className="input" type="number" value={durationMin} onChange={(e) => setDurationMin(Number(e.target.value))} /></Field>
+          <Field label="Start date"><input className="input" type="date" value={date} onChange={(e) => setDate(e.target.value)} /></Field>
           <Field label="Time slot (IST)">
             <select className="input" value={slot} onChange={(e) => setSlot(e.target.value)}>
               <option value="">Select a slot</option>
@@ -242,19 +283,19 @@ function EditExamDrawer({ exam, onClose }: { exam: ExamRow; onClose: () => void 
           </Field>
         </div>
         {scheduled && (
-          <p className="text-xs text-[var(--color-ink2)] -mt-2">
+          <p className="mt-3 text-xs text-[var(--color-ink2)]">
             <Lock size={11} className="inline -mt-0.5 mr-1" />
             The exam window closes 2 hours after the start time. Students who don't start by then are marked absent.
           </p>
         )}
         {isDraft && !scheduled && (
-          <p className="text-xs text-[var(--color-ink2)] -mt-2">
+          <p className="mt-3 text-xs text-[var(--color-ink2)]">
             Set a start date &amp; time slot to schedule this assessment. Leave it empty to keep it as a draft.
           </p>
         )}
 
         {/* Sections scope */}
-        <div>
+        <div className="mt-4">
           <div className="mono-label mb-2">Sections</div>
           <div className="flex gap-2 mb-3">
             <button className={`btn ${scope === "all" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("all")}>All sections</button>
@@ -279,15 +320,21 @@ function EditExamDrawer({ exam, onClose }: { exam: ExamRow; onClose: () => void 
           )}
         </div>
 
-        <div className="flex items-center gap-2 pt-2">
-          <button className="btn btn-primary" disabled={save.isPending || !title.trim() || !sectionsValid} onClick={() => save.mutate()}>
+        {questions.isLoading ? (
+          <div className="mt-5"><Loader /></div>
+        ) : (
+          <QuestionPicker questions={qList} picked={picked} setPicked={setPicked} total={total} />
+        )}
+
+        <div className="flex items-center gap-2 mt-5">
+          <button className="btn btn-primary" disabled={save.isPending || !title.trim() || picked.length === 0 || !sectionsValid} onClick={() => save.mutate()}>
             {save.isPending ? "Saving…" : isDraft ? (scheduled ? "Save & schedule" : "Save draft") : "Save changes"}
           </button>
-          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-ghost" onClick={() => navigate("/exams")}>Cancel</button>
         </div>
 
         {!isDraft && (
-          <div className="mt-4 pt-4 border-t border-[var(--color-line)]">
+          <div className="mt-5 pt-4 border-t border-[var(--color-line)]">
             <div className="mono-label mb-2">Cancel assessment</div>
             <p className="text-sm text-[var(--color-ink2)] mb-3">
               Stop this scheduled assessment. It will be unscheduled and moved back to draft so students can no longer start it.
@@ -303,7 +350,7 @@ function EditExamDrawer({ exam, onClose }: { exam: ExamRow; onClose: () => void 
           </div>
         )}
       </div>
-    </Drawer>
+    </div>
   );
 }
 
