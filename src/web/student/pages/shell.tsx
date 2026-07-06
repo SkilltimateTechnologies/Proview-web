@@ -35,7 +35,6 @@ export function Shell() {
   const { student, logout } = useSession();
   const online = useOnline();
   const [exams, setExams] = useState<ExamListItem[] | null>(null);
-  const [logoError, setLogoError] = useState(false);
   const [err, setErr] = useState("");
   const [reviewId, setReviewId] = useState<string | null>(null);
 
@@ -102,21 +101,12 @@ export function Shell() {
   return (
     <div className="app-shell">
       <aside className="side">
-        <div className="brand">
-          {student?.logoUrl && !logoError ? (
-            // College logo uploaded → show only the logo (no wordmark).
-            <img src={student.logoUrl} alt={student.collegeName} className="brand-college-logo" onError={() => setLogoError(true)} />
-          ) : (
-            <>
-              <div className="brand-mark" style={{ background: "var(--brand)", color: "#fff" }}>
-                {(student?.collegeShort || "S").slice(0, 2).toUpperCase()}
-              </div>
-              <div style={{ minWidth: 0 }}>
-                <div className="brand-name">{student?.collegeName || "Proview"}</div>
-                <div className="brand-sub">Student Portal</div>
-              </div>
-            </>
-          )}
+        <div className="brand" style={{ flexDirection: "column", alignItems: "flex-start", gap: 8 }}>
+          <img src={logo} alt="Skilltimate" style={{ height: 30, width: "auto", maxWidth: 170, objectFit: "contain" }} />
+          <div style={{ minWidth: 0 }}>
+            <div className="brand-name">{student?.collegeName || "Proview"}</div>
+            <div className="brand-sub">Student Portal</div>
+          </div>
         </div>
         <nav className="snav-list">
           {NAV.map((n) => (

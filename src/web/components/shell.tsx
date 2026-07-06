@@ -43,28 +43,12 @@ function visibleNav(me: Me | null): NavDef[] {
   });
 }
 
-/** Small college identity badge (logo + name). Used for non-super users. */
+/** Identity badge: Skilltimate logo with the college name below it. */
 function CollegeBadge({ me }: { me: Me | null }) {
-  const brand = me?.tenant?.primaryColor ?? "#1e3a5f";
-  const short = me?.tenant?.shortName ?? "SK";
-  const hasLogo = !!me?.tenant?.logoUrl;
-  // When a logo is uploaded, show ONLY the logo (no wordmark/text).
-  if (hasLogo) {
-    return (
-      <div className="flex items-center">
-        <img src={me!.tenant!.logoUrl!} alt="" className="h-11 max-w-[180px] w-auto rounded-lg object-contain" />
-      </div>
-    );
-  }
   return (
-    <div className="flex items-center gap-2.5">
-      <div className="h-9 w-9 rounded-lg flex items-center justify-center text-white font-bold text-sm" style={{ background: brand, fontFamily: "var(--font-mono)" }}>
-        {short}
-      </div>
-      <div className="min-w-0">
-        <div className="font-semibold text-[15px] leading-tight text-[var(--color-ink)] truncate">{me?.tenant?.name ?? "Proview"}</div>
-        {me && <div className="text-[11px] text-[var(--color-muted)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{me.user.name}</div>}
-      </div>
+    <div className="flex flex-col gap-1.5 min-w-0">
+      <img src="/skilltimate-logo.png" alt="Skilltimate" className="h-8 w-auto max-w-[170px] object-contain object-left" />
+      <div className="font-semibold text-[14px] leading-tight text-[var(--color-ink)] truncate">{me?.tenant?.name ?? "Proview"}</div>
     </div>
   );
 }
@@ -103,28 +87,16 @@ function WorkspaceSwitcher({ me }: { me: Me | null }) {
     qc.invalidateQueries();
   }
 
-  const brand = active?.primaryColor ?? "#1e3a5f";
-
   return (
     <div className="relative">
       <button
         onClick={() => setOpen((v) => !v)}
         className="group w-full flex items-center gap-2.5 rounded-lg px-1.5 py-1.5 text-left hover:bg-[var(--color-brand-soft)] transition"
       >
-        {active?.logoUrl ? (
-          // Logo uploaded → show only the logo, no wordmark/text.
-          <img src={active.logoUrl} alt="" className="h-11 max-w-[170px] w-auto rounded-lg object-contain shrink-0 flex-1" />
-        ) : (
-          <>
-            <div className="h-9 w-9 rounded-lg flex items-center justify-center text-white font-bold text-sm shrink-0" style={{ background: brand, fontFamily: "var(--font-mono)" }}>
-              {active?.shortName ?? "SK"}
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="font-semibold text-[15px] leading-tight text-[var(--color-ink)] truncate">{active?.name ?? "Select college"}</div>
-              <div className="text-[11px] text-[var(--color-muted)] truncate" style={{ fontFamily: "var(--font-mono)" }}>Skilltimate Admin</div>
-            </div>
-          </>
-        )}
+        <div className="flex flex-col gap-1.5 min-w-0 flex-1">
+          <img src="/skilltimate-logo.png" alt="Skilltimate" className="h-8 w-auto max-w-[160px] object-contain object-left" />
+          <div className="font-semibold text-[14px] leading-tight text-[var(--color-ink)] truncate">{active?.name ?? "Select college"}</div>
+        </div>
         <span className="shrink-0 h-6 w-6 rounded-md flex items-center justify-center text-[var(--color-muted)] group-hover:bg-white group-hover:text-[var(--brand)] transition" title="Switch college">
           <ArrowLeftRight size={14} />
         </span>
