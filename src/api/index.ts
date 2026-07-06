@@ -1020,7 +1020,9 @@ const app = new Hono<{ Variables: Vars }>()
         sectionIds: Array.isArray(b.sectionIds) && b.sectionIds.length ? b.sectionIds : null,
         status: b.status ?? "scheduled",
         startAt: b.startAt ? new Date(b.startAt) : null,
-        endAt: b.endAt ? new Date(b.endAt) : null,
+        // Fixed 2-hour window: after start + 2h the exam window closes and
+        // any student who hasn't submitted is marked absent.
+        endAt: b.startAt ? new Date(new Date(b.startAt).getTime() + 2 * 60 * 60 * 1000) : null,
         durationMin: b.durationMin ?? 60,
         totalPoints: total,
         createdBy: p.userId,
@@ -1038,8 +1040,14 @@ const app = new Hono<{ Variables: Vars }>()
     const b = await c.req.json();
     const patch: Record<string, unknown> = {};
     for (const k of ["title", "status", "durationMin"]) if (b[k] !== undefined) patch[k] = b[k];
-    if (b.startAt !== undefined) patch.startAt = b.startAt ? new Date(b.startAt) : null;
-    if (b.endAt !== undefined) patch.endAt = b.endAt ? new Date(b.endAt) : null;
+    if (b.sectionIds !== undefined) patch.sectionIds = Array.isArray(b.sectionIds) && b.sectionIds.length ? b.sectionIds : null;
+    if (b.startAt !== undefined) {
+      patch.startAt = b.startAt ? new Date(b.startAt) : null;
+      // Keep the fixed 2-hour window in sync with the start time.
+      patch.endAt = b.startAt ? new Date(new Date(b.startAt).getTime() + 2 * 60 * 60 * 1000) : null;
+    } else if (b.endAt !== undefined) {
+      patch.endAt = b.endAt ? new Date(b.endAt) : null;
+    }
     const [row] = await db.update(schema.exams).set(patch).where(eq(schema.exams.id, eid)).returning();
     return c.json({ exam: row }, 200);
   })

@@ -38,7 +38,41 @@ function toLocalInput(ts: number | string | null | undefined): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-type ExamRow = { id: string; title: string; status: string; startAt: number | string | null; durationMin: number; totalPoints: number };
+// Fixed IST time slots (09:00 AM → 04:00 PM, every 30 min).
+const TIME_SLOTS: string[] = (() => {
+  const out: string[] = [];
+  for (let m = 9 * 60; m <= 16 * 60; m += 30) out.push(`${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`);
+  return out;
+})();
+function slotLabel(hhmm: string): string {
+  const [h, m] = hhmm.split(":").map(Number);
+  const ap = h >= 12 ? "PM" : "AM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${String(h12).padStart(2, "0")}:${String(m).padStart(2, "0")} ${ap}`;
+}
+// Combine a date (YYYY-MM-DD) + slot (HH:mm) into an IST wall-clock ISO string
+// that carries the +05:30 offset so the server stores the correct instant.
+function combineIST(dateStr: string, slot: string): number | null {
+  if (!dateStr || !slot) return null;
+  const iso = `${dateStr}T${slot}:00+05:30`;
+  const ms = new Date(iso).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+// Split a stored timestamp back into an IST date + slot for editing.
+function splitIST(ts: number | string | null | undefined): { date: string; slot: string } {
+  const ms = toMs(ts);
+  if (!ms) return { date: "", slot: "" };
+  // Render the instant in IST, then read off the parts.
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(new Date(ms));
+  const g = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  let hh = g("hour");
+  if (hh === "24") hh = "00";
+  return { date: `${g("year")}-${g("month")}-${g("day")}`, slot: `${hh}:${g("minute")}` };
+}
+
+type ExamRow = { id: string; title: string; status: string; startAt: number | string | null; durationMin: number; totalPoints: number; sectionIds?: string[] | null };
 
 const STATUS_COLOR: Record<string, string> = { finished: "#2e7d5b", live: "#c0453b", scheduled: "#b7791f", draft: "#8a929c" };
 
@@ -127,9 +161,21 @@ export default function Exams() {
 
 function EditExamDrawer({ exam, onClose }: { exam: ExamRow; onClose: () => void }) {
   const qc = useQueryClient();
+  const classes = useQuery({ queryKey: ["classes"], queryFn: async () => (await api.classes.$get()).json() });
+  const sections = (classes.data?.classes ?? []) as Array<{ id: string; code: string }>;
+
+  const initial = splitIST(exam.startAt);
   const [title, setTitle] = useState(exam.title);
   const [durationMin, setDurationMin] = useState(exam.durationMin);
-  const [startLocal, setStartLocal] = useState(toLocalInput(exam.startAt));
+  const [date, setDate] = useState(initial.date);
+  const [slot, setSlot] = useState(initial.slot);
+  const [scope, setScope] = useState<"all" | "specific">(exam.sectionIds && exam.sectionIds.length ? "specific" : "all");
+  const [sectionIds, setSectionIds] = useState<string[]>(exam.sectionIds ?? []);
+
+  const sectionsValid = scope === "all" || sectionIds.length > 0;
+  function toggleSection(sid: string) {
+    setSectionIds((p) => (p.includes(sid) ? p.filter((x) => x !== sid) : [...p, sid]));
+  }
 
   const done = () => {
     qc.invalidateQueries({ queryKey: ["exams"] });
@@ -138,17 +184,24 @@ function EditExamDrawer({ exam, onClose }: { exam: ExamRow; onClose: () => void 
 
   const save = useMutation({
     mutationFn: async () => {
-      const startAt = startLocal ? new Date(startLocal).getTime() : null;
+      const startAt = combineIST(date, slot);
       return (await api.exams[":id"].$patch({
         param: { id: exam.id },
         // A start time means the assessment is scheduled; no start time keeps it a draft.
-        json: { title, durationMin, startAt, status: startAt ? "scheduled" : "draft" },
+        json: {
+          title,
+          durationMin,
+          startAt,
+          sectionIds: scope === "specific" ? sectionIds : [],
+          status: startAt ? "scheduled" : "draft",
+        },
       })).json();
     },
     onSuccess: done,
   });
 
   const isDraft = exam.status === "draft";
+  const scheduled = Boolean(date && slot);
 
   const cancelExam = useMutation({
     mutationFn: async () =>
@@ -164,18 +217,58 @@ function EditExamDrawer({ exam, onClose }: { exam: ExamRow; onClose: () => void 
       <div className="space-y-4">
         <Field label="Title"><input className="input" value={title} onChange={(e) => setTitle(e.target.value)} /></Field>
         <Field label="Duration (min)"><input className="input" type="number" value={durationMin} onChange={(e) => setDurationMin(Number(e.target.value))} /></Field>
-        <Field label="Start date & time">
-          <input className="input" type="datetime-local" value={startLocal} onChange={(e) => setStartLocal(e.target.value)} />
-        </Field>
-        {isDraft && (
+        <div className="grid sm:grid-cols-2 gap-4">
+          <Field label="Start date">
+            <input className="input" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+          </Field>
+          <Field label="Time slot (IST)">
+            <select className="input" value={slot} onChange={(e) => setSlot(e.target.value)}>
+              <option value="">Select a slot</option>
+              {TIME_SLOTS.map((s) => <option key={s} value={s}>{slotLabel(s)}</option>)}
+            </select>
+          </Field>
+        </div>
+        {scheduled && (
           <p className="text-xs text-[var(--color-ink2)] -mt-2">
-            Set a start date &amp; time to schedule this assessment. Leave it empty to keep it as a draft.
+            <Lock size={11} className="inline -mt-0.5 mr-1" />
+            The exam window closes 2 hours after the start time. Students who don't start by then are marked absent.
+          </p>
+        )}
+        {isDraft && !scheduled && (
+          <p className="text-xs text-[var(--color-ink2)] -mt-2">
+            Set a start date &amp; time slot to schedule this assessment. Leave it empty to keep it as a draft.
           </p>
         )}
 
+        {/* Sections scope */}
+        <div>
+          <div className="mono-label mb-2">Sections</div>
+          <div className="flex gap-2 mb-3">
+            <button className={`btn ${scope === "all" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("all")}>All sections</button>
+            <button className={`btn ${scope === "specific" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("specific")}>Specific sections</button>
+          </div>
+          {scope === "specific" && (
+            <div className="flex flex-wrap gap-2">
+              {sections.length === 0 && <div className="text-sm text-[var(--color-ink2)]">No sections yet. Add classes in Users.</div>}
+              {sections.map((s) => {
+                const on = sectionIds.includes(s.id);
+                return (
+                  <button
+                    key={s.id}
+                    onClick={() => toggleSection(s.id)}
+                    className={`rounded-lg border px-3 py-1.5 text-sm transition ${on ? "border-[var(--color-brand)] bg-[var(--color-brand-soft)] text-[var(--color-brand)] font-medium" : "border-[var(--color-line)] text-[var(--color-ink)]"}`}
+                  >
+                    {s.code}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
         <div className="flex items-center gap-2 pt-2">
-          <button className="btn btn-primary" disabled={save.isPending || !title.trim()} onClick={() => save.mutate()}>
-            {save.isPending ? "Saving…" : isDraft ? (startLocal ? "Save & schedule" : "Save draft") : "Save changes"}
+          <button className="btn btn-primary" disabled={save.isPending || !title.trim() || !sectionsValid} onClick={() => save.mutate()}>
+            {save.isPending ? "Saving…" : isDraft ? (scheduled ? "Save & schedule" : "Save draft") : "Save changes"}
           </button>
           <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
         </div>
@@ -214,7 +307,8 @@ export function NewExam() {
   const [scope, setScope] = useState<"all" | "specific">("all");
   const [sectionIds, setSectionIds] = useState<string[]>([]);
   const [durationMin, setDurationMin] = useState(60);
-  const [startLocal, setStartLocal] = useState("");
+  const [date, setDate] = useState("");
+  const [slot, setSlot] = useState("");
   const [picked, setPicked] = useState<string[]>([]);
 
   const sectionsValid = scope === "all" || sectionIds.length > 0;
@@ -225,7 +319,7 @@ export function NewExam() {
 
   const create = useMutation({
     mutationFn: async () => {
-      const startAt = startLocal ? new Date(startLocal).getTime() : undefined;
+      const startAt = combineIST(date, slot) ?? undefined;
       const res = await api.exams.$post({
         json: {
           title,
@@ -262,8 +356,20 @@ export function NewExam() {
         <div className="grid sm:grid-cols-2 gap-4">
           <Field label="Title"><input className="input" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Mid-Sem Test" /></Field>
           <Field label="Duration (min)"><input className="input" type="number" value={durationMin} onChange={(e) => setDurationMin(Number(e.target.value))} /></Field>
-          <Field label="Start date & time"><input className="input" type="datetime-local" value={startLocal} onChange={(e) => setStartLocal(e.target.value)} /></Field>
+          <Field label="Start date"><input className="input" type="date" value={date} onChange={(e) => setDate(e.target.value)} /></Field>
+          <Field label="Time slot (IST)">
+            <select className="input" value={slot} onChange={(e) => setSlot(e.target.value)}>
+              <option value="">Select a slot</option>
+              {TIME_SLOTS.map((s) => <option key={s} value={s}>{slotLabel(s)}</option>)}
+            </select>
+          </Field>
         </div>
+        {date && slot && (
+          <p className="mt-3 text-xs text-[var(--color-ink2)]">
+            <Lock size={11} className="inline -mt-0.5 mr-1" />
+            The exam window closes 2 hours after the start time. Students who don't start by then are marked absent.
+          </p>
+        )}
 
         {/* Sections scope */}
         <div className="mt-4">
