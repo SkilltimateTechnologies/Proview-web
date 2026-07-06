@@ -167,7 +167,12 @@ export function ExamRunner() {
     if (proctoringRef.current.requireWebcam && !camReady) { setCamError("Enable your camera to start."); return; }
     if (!online) { setErr("An internet connection is required to start this exam."); return; }
     if (proctoringRef.current.requireSingleScreen) {
-      const count = await getDisplayCount().catch(() => 1);
+      // Never let the display check block the start flow — cap it so a hung
+      // permission prompt (seen inside SEB kiosk) can't freeze "Start secure exam".
+      const count = await Promise.race([
+        getDisplayCount().catch(() => 1),
+        new Promise<number>((r) => setTimeout(() => r(1), 1500)),
+      ]);
       setDisplayCount(count);
       if (count > 1) { setErr("Disconnect all extra monitors — only one display is allowed during the exam."); return; }
     }

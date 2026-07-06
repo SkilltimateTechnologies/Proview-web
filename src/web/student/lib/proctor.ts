@@ -163,11 +163,17 @@ export async function getDisplayCount(): Promise<number> {
     try { return await window.examly.getDisplayCount(); } catch { /* ignore */ }
   }
   // Browser fallback: multi-screen details API (Chromium, needs permission).
+  // IMPORTANT: inside SEB's kiosk Chromium, getScreenDetails() can hang forever
+  // waiting on a window-management permission prompt that never appears. That
+  // would freeze the "Start secure exam" flow (the await never settles). Race it
+  // against a short timeout so the check can never block starting the exam —
+  // SEB already enforces single-display at the OS level, so 1 is a safe fallback.
   const anyWin = window as unknown as { getScreenDetails?: () => Promise<{ screens: unknown[] }> };
   if (anyWin.getScreenDetails) {
     try {
-      const d = await anyWin.getScreenDetails();
-      if (d?.screens?.length) return d.screens.length;
+      const timeout = new Promise<number>((resolve) => setTimeout(() => resolve(1), 1200));
+      const query = anyWin.getScreenDetails().then((d) => (d?.screens?.length ? d.screens.length : 1));
+      return await Promise.race([query, timeout]);
     } catch { /* permission denied — assume single */ }
   }
   return 1;
