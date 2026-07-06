@@ -9,7 +9,7 @@ import { authMiddleware, requireAuth, requireSuperAdmin, requirePermission } fro
 import type { SessionUser, ProfileCtx } from "./middleware/auth";
 import { id, displayId, autoGrade, computeYear } from "./lib/util";
 import { generateQuestions, gradeSubjective } from "./lib/ai";
-import { presignPut } from "./lib/s3";
+import { presignPut, getObject } from "./lib/s3";
 import { signStudentToken, verifyStudentToken } from "./lib/student-token";
 
 type Vars = { user: SessionUser | null; profile: ProfileCtx | null };
@@ -69,7 +69,26 @@ const app = new Hono<{ Variables: Vars }>()
     const { name, contentType } = await c.req.json();
     const key = `uploads/${Date.now()}-${id()}-${(name ?? "file").replace(/[^\w.-]/g, "_")}`;
     const url = await presignPut(key, contentType ?? "application/octet-stream");
-    return c.json({ url, key, publicUrl: `${process.env.S3_ENDPOINT}/${process.env.S3_BUCKET}/${key}` }, 200);
+    // Tigris objects are not public-read (raw endpoint URL returns 403), so we
+    // serve uploads through our own same-origin proxy route below.
+    return c.json({ url, key, publicUrl: `/api/files/${key}` }, 200);
+  })
+
+  // ---- public file proxy (streams object from S3; no auth needed to view) ----
+  .get("/files/*", async (c) => {
+    const key = c.req.path.replace(/^\/api\/files\//, "");
+    if (!key) return c.text("Not found", 404);
+    try {
+      const out = await getObject(key);
+      if (!out.Body) return c.text("Not found", 404);
+      const buf = await out.Body.transformToByteArray();
+      return c.body(buf, 200, {
+        "Content-Type": out.ContentType ?? "application/octet-stream",
+        "Cache-Control": "public, max-age=31536000, immutable",
+      });
+    } catch {
+      return c.text("Not found", 404);
+    }
   })
 
   // =================== TENANTS (super admin) ===================

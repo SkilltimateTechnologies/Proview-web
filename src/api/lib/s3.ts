@@ -21,3 +21,8 @@ export async function presignPut(key: string, contentType: string) {
 export async function presignGet(key: string) {
   return getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET, Key: key }), { expiresIn: 3600 * 24 });
 }
+
+export async function getObject(key: string) {
+  const out = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+  return out;
+}
