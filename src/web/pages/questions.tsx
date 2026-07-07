@@ -16,6 +16,23 @@ const TYPES = [
 ];
 const TYPE_LABEL: Record<string, string> = Object.fromEntries(TYPES.map((t) => [t.v, t.label]));
 
+// Languages supported by the Judge0 runner + student IDE highlighter.
+const CODE_LANGS = [
+  { v: "python", label: "Python 3" },
+  { v: "java", label: "Java" },
+  { v: "cpp", label: "C++" },
+  { v: "c", label: "C" },
+  { v: "csharp", label: "C#" },
+  { v: "javascript", label: "JavaScript (Node)" },
+  { v: "typescript", label: "TypeScript" },
+  { v: "go", label: "Go" },
+  { v: "ruby", label: "Ruby" },
+  { v: "php", label: "PHP" },
+  { v: "kotlin", label: "Kotlin" },
+  { v: "swift", label: "Swift" },
+  { v: "rust", label: "Rust" },
+];
+
 type Gen = { type: string; prompt: string; options?: string[]; correct?: unknown; points?: number; difficulty?: string; meta?: Record<string, unknown> };
 type Cat = { id: string; name: string; description?: string | null; questionCount: number };
 
@@ -299,6 +316,8 @@ function ManualForm({ categoryId, initial, onClose }: { categoryId: string; init
   const [difficulty, setDifficulty] = useState(initial?.difficulty ?? "medium");
   const [isGlobal, setIsGlobal] = useState(initial ? initial.isGlobal !== false : true);
   const [explanation, setExplanation] = useState<string>((initial?.meta as any)?.explanation ?? "");
+  const [codeLang, setCodeLang] = useState<string>((initial?.meta as any)?.language ?? "python");
+  const [starter, setStarter] = useState<string>((initial?.meta as any)?.starter ?? "");
 
   const hasOptions = ["mcq", "multi", "fillblank"].includes(type);
 
@@ -318,7 +337,11 @@ function ManualForm({ categoryId, initial, onClose }: { categoryId: string; init
         topic,
         difficulty,
         isGlobal,
-        meta: { ...(initial?.meta ?? {}), explanation: explanation.trim() || undefined },
+        meta: {
+          ...(initial?.meta ?? {}),
+          explanation: explanation.trim() || undefined,
+          ...(type === "coding" ? { language: codeLang, starter: starter || undefined } : {}),
+        },
       };
       if (initial) return (await api.questions[":id"].$patch({ param: { id: initial.id }, json })).json();
       return (await api.questions.$post({ json })).json();
@@ -390,9 +413,34 @@ function ManualForm({ categoryId, initial, onClose }: { categoryId: string; init
         </div>
       )}
 
-      {["short", "essay", "coding"].includes(type) && (
+      {["short", "essay"].includes(type) && (
         <div className="mt-4 text-sm text-[var(--color-ink2)] bg-[var(--color-brand-soft)] rounded-lg px-3 py-2">
           This type is graded by AI at submission time. No fixed answer needed.
+        </div>
+      )}
+
+      {type === "coding" && (
+        <div className="mt-4 space-y-4">
+          <div className="grid sm:grid-cols-2 gap-4">
+            <Field label="Programming language">
+              <select className="input" value={codeLang} onChange={(e) => setCodeLang(e.target.value)}>
+                {CODE_LANGS.map((l) => <option key={l.v} value={l.v}>{l.label}</option>)}
+              </select>
+            </Field>
+          </div>
+          <Field label="Starter code (loaded into the student's editor, optional)">
+            <textarea
+              className="input font-mono text-[13px]"
+              rows={6}
+              value={starter}
+              onChange={(e) => setStarter(e.target.value)}
+              placeholder={`# Students see this in the ${codeLang} editor as a starting point…`}
+              spellCheck={false}
+            />
+          </Field>
+          <div className="text-sm text-[var(--color-ink2)] bg-[var(--color-brand-soft)] rounded-lg px-3 py-2">
+            The student's IDE loads in <b>{CODE_LANGS.find((l) => l.v === codeLang)?.label ?? codeLang}</b> and runs against Judge0. Graded by AI at submission time.
+          </div>
         </div>
       )}
 
