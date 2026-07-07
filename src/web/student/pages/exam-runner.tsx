@@ -710,24 +710,23 @@ export function ExamRunner() {
   }
 
   // ===== DONE =====
-  // Show the score immediately as marks out of 100 (the server returns a
-  // percentage on a 0–100 scale, so "X/100" is the same number framed as marks).
-  // The detailed answer report is NOT available to students — only the score.
+  // Do NOT show a score here. At submit time only objective questions are graded
+  // inline; subjective/coding are graded in the background afterward, so any number
+  // shown now would be a misleading partial score. Scores are also intentionally
+  // locked to students until the exam closes — the real result appears on the
+  // dashboard once results are released.
   if (phase === "done" && result) {
-    const marks = result.score != null ? Math.round(result.score) : null;
     return (
       <div className="runner" style={{ alignItems: "center", justifyContent: "center" }}>
         <div className="card" style={{ padding: 36, maxWidth: 480, width: "100%", textAlign: "center" }}>
           <div style={{ width: 58, height: 58, borderRadius: 999, background: "#e7f5ee", color: "var(--color-success)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}><Icon name="check" size={30} /></div>
           <h1 style={{ fontFamily: "var(--font-serif)", fontSize: 26, marginBottom: 6 }}>Exam submitted</h1>
-          <p style={{ color: "var(--color-ink2)", marginBottom: 20, lineHeight: 1.6 }}>Your answers were submitted and scored successfully.</p>
+          <p style={{ color: "var(--color-ink2)", marginBottom: 20, lineHeight: 1.6 }}>Your answers were submitted successfully.</p>
 
-          {marks != null && (
-            <div style={{ background: "var(--color-brand-soft)", borderRadius: 14, padding: "16px 14px", marginBottom: 12 }}>
-              <div className="mono-label" style={{ marginBottom: 4 }}>Your score</div>
-              <div className="stat-num" style={{ fontSize: 38, lineHeight: 1 }}>{marks}<span style={{ fontSize: 20, color: "var(--color-ink2)" }}>/100</span></div>
-            </div>
-          )}
+          <div style={{ background: "var(--color-brand-soft)", borderRadius: 14, padding: "16px 14px", marginBottom: 12, display: "flex", alignItems: "center", gap: 10, justifyContent: "center" }}>
+            <Icon name="lock" size={16} />
+            <span style={{ color: "var(--color-ink2)", fontSize: 13.5, lineHeight: 1.5, textAlign: "left" }}>Your score will be available on your dashboard once the exam closes and results are released.</span>
+          </div>
 
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 22 }}>
             <div style={{ background: "#e7f5ee", borderRadius: 12, padding: "14px 10px" }}>
