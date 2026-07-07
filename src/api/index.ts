@@ -651,7 +651,7 @@ const app = new Hono<{ Variables: Vars }>()
       const endAtMs = effectiveEndMs(exam, attempt, now);
       return c.json({ status: "in_progress", attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), serverNow: new Date(now), held: !!exam.heldAt }, 200);
     }
-    return c.json({ status: attempt.status, attemptId: attempt.id, startedAt: attempt.startedAt, endAt: null, serverNow: new Date(now), held: false }, 200);
+    return c.json({ status: attempt.status, attemptId: attempt.id, startedAt: attempt.startedAt, endAt: null, serverNow: new Date(now), held: false, score: attempt.score }, 200);
   })
 
   // Resume a locked exam after an internet drop. The client reports how long it

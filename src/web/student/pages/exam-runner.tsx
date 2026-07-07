@@ -81,6 +81,11 @@ export function ExamRunner() {
   const [now, setNow] = useState(Date.now());
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<{ answered: number; skipped: number; events: number; attemptId: string; score: number | null } | null>(null);
+  // Grading poll: after submit, AI grades subjective/coding in the background.
+  // We poll the attempt status until it flips to "graded", then reveal the real
+  // final score (the score returned inline at submit is objective-only/partial).
+  const [gradeDone, setGradeDone] = useState(false);
+  const [gradedScore, setGradedScore] = useState<number | null>(null);
 
   const sessionRef = useRef<RunSession | null>(null);
   sessionRef.current = session;
@@ -409,6 +414,29 @@ export function ExamRunner() {
     return () => { stopped = true; clearInterval(t); };
   }, [phase, examId]);
 
+  // ---- Grading poll after submit ----
+  // Once the exam is submitted (phase "done"), poll the attempt status until it
+  // flips to "graded", then reveal the real final score. The score returned
+  // inline at submit is objective-only/partial, so we don't show it.
+  useEffect(() => {
+    if (phase !== "done" || !result || !examId || gradeDone) return;
+    let stop = false;
+    const poll = async () => {
+      try {
+        const st = await api.status(examId);
+        if (stop) return;
+        if (st.status === "graded") {
+          setGradedScore(typeof st.score === "number" ? st.score : null);
+          setGradeDone(true);
+          return;
+        }
+      } catch { /* ignore, retry */ }
+      if (!stop) timer = window.setTimeout(poll, 2500);
+    };
+    let timer = window.setTimeout(poll, 1500);
+    return () => { stop = true; window.clearTimeout(timer); };
+  }, [phase, result, examId, gradeDone]);
+
   // ---- Proctoring while running ----
   // DISABLED on web: real proctored exams run inside Safe Exam Browser (SEB),
   // which enforces lockdown at the OS level. The browser build is preview-only,
@@ -710,11 +738,10 @@ export function ExamRunner() {
   }
 
   // ===== DONE =====
-  // Do NOT show a score here. At submit time only objective questions are graded
-  // inline; subjective/coding are graded in the background afterward, so any number
-  // shown now would be a misleading partial score. Scores are also intentionally
-  // locked to students until the exam closes — the real result appears on the
-  // dashboard once results are released.
+  // At submit time only objective questions are graded inline; subjective/coding
+  // are graded by AI in the background afterward. We poll the attempt status and
+  // only show the real final score once grading finishes (gradeDone). Until then
+  // we show a "grading in progress" state — never the partial submit-time score.
   if (phase === "done" && result) {
     return (
       <div className="runner" style={{ alignItems: "center", justifyContent: "center" }}>
@@ -723,10 +750,22 @@ export function ExamRunner() {
           <h1 style={{ fontFamily: "var(--font-serif)", fontSize: 26, marginBottom: 6 }}>Exam submitted</h1>
           <p style={{ color: "var(--color-ink2)", marginBottom: 20, lineHeight: 1.6 }}>Your answers were submitted successfully.</p>
 
-          <div style={{ background: "var(--color-brand-soft)", borderRadius: 14, padding: "16px 14px", marginBottom: 12, display: "flex", alignItems: "center", gap: 10, justifyContent: "center" }}>
-            <Icon name="lock" size={16} />
-            <span style={{ color: "var(--color-ink2)", fontSize: 13.5, lineHeight: 1.5, textAlign: "left" }}>Your score will be available on your dashboard once the exam closes and results are released.</span>
-          </div>
+          {!gradeDone ? (
+            <div style={{ background: "var(--color-brand-soft)", borderRadius: 14, padding: "18px 14px", marginBottom: 12, display: "flex", alignItems: "center", gap: 12, justifyContent: "center" }}>
+              <Icon name="loader-circle" size={18} className="animate-spin" />
+              <span style={{ color: "var(--color-ink2)", fontSize: 13.5, lineHeight: 1.5, textAlign: "left" }}>Grading in progress… your final score will appear here in a moment.</span>
+            </div>
+          ) : gradedScore != null ? (
+            <div style={{ background: "#e7f5ee", borderRadius: 14, padding: "18px 14px", marginBottom: 12 }}>
+              <div className="mono-label" style={{ marginBottom: 4 }}>Your score</div>
+              <div style={{ fontFamily: "var(--font-serif)", fontSize: 40, fontWeight: 700, color: "var(--color-success)", lineHeight: 1 }}>{Math.round(gradedScore)}<span style={{ fontSize: 20, color: "var(--color-ink2)" }}>/100</span></div>
+            </div>
+          ) : (
+            <div style={{ background: "var(--color-brand-soft)", borderRadius: 14, padding: "16px 14px", marginBottom: 12, display: "flex", alignItems: "center", gap: 10, justifyContent: "center" }}>
+              <Icon name="check" size={16} />
+              <span style={{ color: "var(--color-ink2)", fontSize: 13.5, lineHeight: 1.5, textAlign: "left" }}>Grading complete. Your detailed result is available on your dashboard.</span>
+            </div>
+          )}
 
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 22 }}>
             <div style={{ background: "#e7f5ee", borderRadius: 12, padding: "14px 10px" }}>

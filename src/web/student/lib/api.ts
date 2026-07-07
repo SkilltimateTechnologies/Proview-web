@@ -76,7 +76,7 @@ export type Bundle = {
 export type StartInfo = { attemptId: string; startedAt: string; endAt: string; serverNow: string; durationMin: number; pausedMs?: number; held?: boolean };
 export type ResumeInfo = { attemptId: string; endAt: string; serverNow: string; pausedMs: number };
 export type HeartbeatInfo = { held: boolean; endAt: string; serverNow: string };
-export type StatusInfo = { status: "not_started" | "in_progress" | "submitted" | "graded"; attemptId: string | null; startedAt: string | null; endAt: string | null; serverNow: string; held: boolean };
+export type StatusInfo = { status: "not_started" | "in_progress" | "submitted" | "graded"; attemptId: string | null; startedAt: string | null; endAt: string | null; serverNow: string; held: boolean; score?: number | null };
 
 export type ReviewQuestion = {
   id: string;

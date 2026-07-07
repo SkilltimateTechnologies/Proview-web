@@ -272,14 +272,14 @@ function FinishedList({ exams, onOpen }: { exams: ExamListItem[]; onOpen: (attem
             <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--color-danger)", fontSize: 13, fontWeight: 600 }}>
               <Icon name="user-x" size={15} /> Marked absent — exam window closed
             </div>
-          ) : !e.resultsReady ? (
+          ) : e.attempt?.status !== "graded" ? (
             <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--color-ink2)", fontSize: 13, fontWeight: 600 }}>
-              <Icon name="lock" size={15} /> Results locked — available after the exam closes
+              <Icon name="loader-circle" size={15} className="animate-spin" /> Grading in progress — your score will appear shortly
             </div>
           ) : (
             <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
               {e.attempt?.score != null && <div style={{ textAlign: "right" }}><div className="mono-label">Score</div><div className="stat-num" style={{ fontSize: 20 }}>{e.attempt.score}%</div></div>}
-              {e.attempt && <button className="btn btn-ghost" onClick={() => onOpen(e.attempt!.id)}><Icon name="file-search" /> Review answers</button>}
+              {e.attempt && e.resultsReady && <button className="btn btn-ghost" onClick={() => onOpen(e.attempt!.id)}><Icon name="file-search" /> Review answers</button>}
             </div>
           )}
         </ExamCard>
@@ -377,9 +377,10 @@ function Dashboard({ finished, onReview }: { finished: ExamListItem[]; onReview:
   // Only truly-completed attempts count towards averages / completed count.
   // `finished` is already sorted latest-first upstream.
   const completed = useMemo(() => finished.filter((e) => e.phase === "finished"), [finished]);
-  // Scores stay hidden until the exam closes — only count released results with a
-  // real graded score in the average (a still-grading exam must not drag it to 0).
-  const revealed = useMemo(() => completed.filter((e) => e.resultsReady && e.attempt?.score != null), [completed]);
+  // A student sees their own score once their attempt is fully graded — only count
+  // graded attempts with a real score in the average (a still-grading exam must
+  // not drag it to 0).
+  const revealed = useMemo(() => completed.filter((e) => e.attempt?.status === "graded" && e.attempt?.score != null), [completed]);
   const avg = revealed.length ? Math.round((revealed.reduce((s, e) => s + (e.attempt?.score || 0), 0) / revealed.length) * 10) / 10 : null;
   return (
     <div style={{ display: "grid", gap: 24 }}>
@@ -399,14 +400,14 @@ function Dashboard({ finished, onReview }: { finished: ExamListItem[]; onReview:
           <div style={{ display: "grid", gap: 16 }}>
             {completed.slice(0, 3).map((e) => (
               <ExamCard key={e.id} e={e}>
-                {!e.resultsReady ? (
+                {e.attempt?.status !== "graded" ? (
                   <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--color-ink2)", fontSize: 13, fontWeight: 600 }}>
-                    <Icon name="lock" size={15} /> Results locked
+                    <Icon name="loader-circle" size={15} className="animate-spin" /> Grading in progress
                   </div>
                 ) : (
                   <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
                     {e.attempt?.score != null && <div style={{ textAlign: "right" }}><div className="mono-label">Score</div><div className="stat-num" style={{ fontSize: 20 }}>{e.attempt.score}%</div></div>}
-                    {e.attempt && <button className="btn btn-ghost" onClick={() => onReview(e.attempt!.id)}><Icon name="file-search" /> Review</button>}
+                    {e.attempt && e.resultsReady && <button className="btn btn-ghost" onClick={() => onReview(e.attempt!.id)}><Icon name="file-search" /> Review</button>}
                   </div>
                 )}
               </ExamCard>
