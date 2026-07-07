@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useState, type CSSProperties } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useParams, Link } from "wouter";
-import { ArrowLeft, Download, ChevronRight } from "lucide-react";
+import { ArrowLeft, Download, ChevronRight, Check, X, Sparkles, Lightbulb } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, Pill, Drawer, usePagination, Pager } from "../components/ui";
@@ -116,6 +116,23 @@ export default function ReportDetail() {
   );
 }
 
+type AnswerRow = {
+  id: string;
+  prompt: string;
+  type: string;
+  topic: string | null;
+  options: unknown;
+  correct: unknown;
+  explanation: string | null;
+  response: unknown;
+  score: number | null;
+  maxScore: number | null;
+  aiNotes: string | null;
+  autoGraded: unknown;
+};
+
+const LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H"];
+
 function AttemptDrawer({ examId, row, onClose }: { examId: string; row: Row; onClose: () => void }) {
   const q = useQuery({
     queryKey: ["attempt", examId, row.attemptId],
@@ -127,11 +144,15 @@ function AttemptDrawer({ examId, row, onClose }: { examId: string; row: Row; onC
   });
 
   const d = q.data && !("message" in q.data) ? q.data : null;
+  const answers = (d?.answers ?? []) as AnswerRow[];
+  const earned = answers.reduce((s, a) => s + (a.score || 0), 0);
+  const max = answers.reduce((s, a) => s + (a.maxScore || 0), 0);
 
   return (
     <Drawer eyebrow="Student report" title={row.name} subtitle={`${row.rollNo}${row.email ? " · " + row.email : ""}`} onClose={onClose} width="max-w-3xl">
-      <div className="grid grid-cols-2 gap-3 mb-6">
-        <div className="card p-4"><div className="stat-num text-[1.5rem]">{row.score ?? "—"}</div><div className="mono-label mt-1">Score</div></div>
+      <div className="grid grid-cols-3 gap-3 mb-6">
+        <div className="card p-4"><div className="stat-num text-[1.5rem]" style={{ color: "var(--brand)" }}>{row.score ?? "—"}</div><div className="mono-label mt-1">Score</div></div>
+        <div className="card p-4"><div className="stat-num text-[1.5rem]">{max > 0 ? `${Math.round(earned * 10) / 10}/${max}` : "—"}</div><div className="mono-label mt-1">Marks earned</div></div>
         <div className="card p-4"><div className="text-sm font-semibold text-[var(--color-ink)] capitalize pt-1">{row.status}</div><div className="mono-label mt-1">Status</div></div>
       </div>
 
@@ -141,29 +162,141 @@ function AttemptDrawer({ examId, row, onClose }: { examId: string; row: Row; onC
         <div className="card p-6 text-center text-sm text-[var(--color-ink2)]">Detailed breakdown not available for this attempt.</div>
       ) : (
         <>
-          <div className="mono-label mb-2">Answer breakdown ({d.answers.length})</div>
-          {d.answers.length === 0 ? (
+          <div className="mono-label mb-2">Answer breakdown ({answers.length})</div>
+          {answers.length === 0 ? (
             <div className="card p-4 text-sm text-[var(--color-ink2)] mb-6">No stored answers for this attempt.</div>
           ) : (
-            <div className="space-y-3 mb-6">
-              {d.answers.map((a, i) => (
-                <div key={a.id} className="rounded-xl border border-[var(--color-line)] p-3">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="text-sm font-medium text-[var(--color-ink)]">{i + 1}. {a.prompt}</div>
-                      <div className="mono-label mt-1">{a.type}{a.topic ? ` · ${a.topic}` : ""}</div>
-                    </div>
-                    <span className="stat-num text-sm shrink-0" style={{ color: (a.score ?? 0) >= (a.maxScore ?? 1) ? "#2e7d5b" : (a.score ?? 0) > 0 ? "#b7791f" : "#c0453b" }}>
-                      {a.score ?? 0}/{a.maxScore ?? "—"}
-                    </span>
-                  </div>
-                  {a.aiNotes && <div className="text-xs text-[var(--color-ink2)] mt-2 bg-[var(--color-brand-soft)] rounded-lg px-2.5 py-2">{a.aiNotes}</div>}
-                </div>
-              ))}
+            <div className="space-y-4 mb-6">
+              {answers.map((a, i) => <AnswerCard key={a.id} a={a} index={i} />)}
             </div>
           )}
         </>
       )}
     </Drawer>
+  );
+}
+
+function AnswerCard({ a, index }: { a: AnswerRow; index: number }) {
+  const score = a.score ?? 0;
+  const maxScore = a.maxScore ?? 0;
+  const scored = a.score != null;
+  const full = scored && score >= maxScore && maxScore > 0;
+  const zero = scored && score <= 0;
+  const scoreColor = full ? "#2e7d5b" : zero ? "#c0453b" : scored ? "#b7791f" : "var(--color-muted)";
+  const objective = a.type === "mcq" || a.type === "multi" || a.type === "truefalse" || a.type === "fillblank";
+
+  return (
+    <div className="card p-4 sm:p-5">
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <div className="min-w-0">
+          <div className="text-sm font-medium text-[var(--color-ink)] leading-relaxed">{index + 1}. {a.prompt}</div>
+          <div className="mono-label mt-1 uppercase">{a.type}{a.topic ? ` · ${a.topic}` : ""}</div>
+        </div>
+        <span className="stat-num text-sm shrink-0 whitespace-nowrap" style={{ color: scoreColor }}>
+          {score}/{maxScore || "—"} pt
+        </span>
+      </div>
+
+      {objective ? <ObjectiveReview a={a} /> : <SubjectiveReview a={a} />}
+
+      {a.aiNotes && (
+        <div className="mt-3 rounded-lg px-3 py-2.5" style={{ background: "var(--color-brand-soft)" }}>
+          <div className="mono-label flex items-center gap-1.5 mb-1"><Sparkles size={13} /> AI feedback</div>
+          <div className="text-[13.5px] text-[var(--color-ink)] leading-relaxed">{a.aiNotes}</div>
+        </div>
+      )}
+
+      {a.explanation && (
+        <div className="mt-3 rounded-lg px-3 py-2.5" style={{ background: "#f0f6ff", border: "1px solid #d6e4ff" }}>
+          <div className="mono-label flex items-center gap-1.5 mb-1" style={{ color: "#1A3EBF" }}><Lightbulb size={13} /> Explanation</div>
+          <div className="text-[13.5px] text-[var(--color-ink)] leading-relaxed">{a.explanation}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function optStyle(state: "correct" | "wrong" | "none"): CSSProperties {
+  const base: CSSProperties = {
+    display: "flex", alignItems: "flex-start", gap: 10, padding: "10px 12px",
+    border: "1px solid var(--color-line)", borderRadius: 10, background: "#fff", fontSize: 14,
+  };
+  if (state === "correct") return { ...base, borderColor: "#b7e0c8", background: "#e7f5ee" };
+  if (state === "wrong") return { ...base, borderColor: "#e8c9c6", background: "#fbeceb" };
+  return base;
+}
+
+const letterStyle: CSSProperties = {
+  width: 24, height: 24, borderRadius: 6, background: "#eef1f5", color: "var(--color-ink2)",
+  display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12, flex: "none",
+};
+
+function ObjectiveReview({ a }: { a: AnswerRow }) {
+  const correct = a.correct;
+  const resp = a.response;
+
+  if (a.type === "truefalse") {
+    const opts: [string, boolean][] = [["True", true], ["False", false]];
+    return (
+      <div className="grid gap-2">
+        {opts.map(([lbl, val]) => {
+          const chosen = resp === val;
+          const isC = correct === val;
+          return (
+            <div key={lbl} style={optStyle(isC ? "correct" : chosen ? "wrong" : "none")}>
+              <span style={letterStyle}>{val ? "T" : "F"}</span>
+              <span style={{ flex: 1 }}>{lbl}</span>
+              {isC && <Check size={16} color="#2e7d5b" />}
+              {chosen && !isC && <X size={16} color="#c0453b" />}
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  const options = Array.isArray(a.options) ? (a.options as string[]) : null;
+  if (!options) return <SubjectiveReview a={a} />;
+
+  const isCorrectOpt = (i: number) => (Array.isArray(correct) ? (correct as number[]).includes(i) : correct === i);
+  const isChosen = (i: number) => (Array.isArray(resp) ? (resp as number[]).includes(i) : resp === i);
+  const answered = Array.isArray(resp) ? resp.length > 0 : resp != null;
+
+  return (
+    <div className="grid gap-2">
+      {options.map((opt, i) => {
+        const isC = isCorrectOpt(i);
+        const chosen = isChosen(i);
+        return (
+          <div key={i} style={optStyle(isC ? "correct" : chosen ? "wrong" : "none")}>
+            <span style={letterStyle}>{LETTERS[i] ?? i + 1}</span>
+            <span style={{ flex: 1 }}>{opt}</span>
+            {isC && <Check size={16} color="#2e7d5b" />}
+            {chosen && !isC && <X size={16} color="#c0453b" />}
+          </div>
+        );
+      })}
+      {!answered && <div className="text-[13px] italic text-[var(--color-muted)] mt-0.5">No answer submitted.</div>}
+    </div>
+  );
+}
+
+function SubjectiveReview({ a }: { a: AnswerRow }) {
+  const raw = a.response;
+  const text = raw == null || String(raw).trim() === "" ? null : String(raw);
+  const isCode = a.type === "coding";
+  return (
+    <div>
+      <div className="mono-label mb-1.5">Student answer</div>
+      {text ? (
+        <pre style={{
+          whiteSpace: "pre-wrap", fontFamily: isCode ? "var(--font-mono)" : "var(--font-sans)", fontSize: 13,
+          background: isCode ? "#0f1b2b" : "#f6f7f9", color: isCode ? "#e6edf5" : "var(--color-ink)",
+          padding: 12, borderRadius: 10, lineHeight: 1.6, border: "1px solid var(--color-line)", margin: 0,
+        }}>{text}</pre>
+      ) : (
+        <div className="text-[13px] italic text-[var(--color-muted)]">No answer submitted.</div>
+      )}
+    </div>
   );
 }
