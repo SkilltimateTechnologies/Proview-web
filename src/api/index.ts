@@ -1242,13 +1242,25 @@ const app = new Hono<{ Variables: Vars }>()
     const p = c.get("profile")!;
     const tid = p.tenantId;
     if (!tid) return c.json({ exams: [] }, 200);
-    // Reports only cover CONDUCTED assessments — never drafts/scheduled.
-    // TPO sees finished only; others see finished + live (in-progress).
+    // Reports only cover CONDUCTED assessments — never drafts/scheduled-in-future.
+    // TPO sees finished only; others see finished + live (in-progress). A scheduled
+    // exam whose start time has passed is effectively live, so include it for
+    // non-TPO roles too (mirrors the Live Monitor / Schedule list behaviour).
+    const now = Date.now();
+    const startMs = (e: { startAt: number | string | null }) => {
+      if (e.startAt == null) return null;
+      const ms = typeof e.startAt === "number" ? e.startAt : new Date(e.startAt).getTime();
+      return Number.isNaN(ms) ? null : ms;
+    };
+    const isStarted = (e: { startAt: number | string | null }) => {
+      const ms = startMs(e);
+      return ms !== null && now >= ms;
+    };
     const allExams = await db.select().from(schema.exams).where(eq(schema.exams.tenantId, tid)).orderBy(desc(schema.exams.createdAt));
     const rows =
       p.role === "tpo"
         ? allExams.filter((e) => e.status === "finished")
-        : allExams.filter((e) => e.status === "finished" || e.status === "live");
+        : allExams.filter((e) => e.status === "finished" || e.status === "live" || (e.status === "scheduled" && isStarted(e)));
     const PASS_MARK = 40; // percentage
     const withStats = await Promise.all(
       rows.map(async (e) => {
