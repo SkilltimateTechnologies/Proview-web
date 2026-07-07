@@ -1,4 +1,5 @@
 import app from "./api";
+import { sweepPendingGrading } from "./api/lib/grade-queue";
 
 const port = Number(process.env.PORT ?? 3000);
 const distDir = `${import.meta.dir}/../dist`;
@@ -35,6 +36,10 @@ const server = Bun.serve({
 });
 
 console.log(`Web server listening on http://localhost:${server.port}`);
+
+// Recover any subjective answers left ungraded (e.g. restart mid-grading or a
+// prior AI rate-limit burst). Runs off the boot path, globally throttled.
+void sweepPendingGrading();
 
 function getStaticFilePath(pathname: string) {
   const cleanPath = decodeURIComponent(pathname)

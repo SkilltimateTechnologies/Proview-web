@@ -8,7 +8,8 @@ import * as schema from "./database/schema";
 import { authMiddleware, requireAuth, requireSuperAdmin, requirePermission } from "./middleware/auth";
 import type { SessionUser, ProfileCtx } from "./middleware/auth";
 import { id, displayId, autoGrade, computeYear } from "./lib/util";
-import { generateQuestions, gradeSubjective } from "./lib/ai";
+import { generateQuestions } from "./lib/ai";
+import { queueAttemptGrading } from "./lib/grade-queue";
 import { presignPut, getObject } from "./lib/s3";
 import { signStudentToken, verifyStudentToken } from "./lib/student-token";
 
@@ -749,8 +750,15 @@ const app = new Hono<{ Variables: Vars }>()
     // Wipe any prior answers for idempotency, then insert fresh.
     await db.delete(schema.answers).where(eq(schema.answers.attemptId, aid));
 
+    // Grade objective (mcq/multi/truefalse/fillblank) + blanks INLINE so submit
+    // stays fast. Subjective + coding answers are left pending (score=null,
+    // autoGraded=false) and graded off the request path by the background queue,
+    // so a whole class auto-submitting at the deadline never stalls or hits AI
+    // rate limits on the critical path.
     let earned = 0;
     let max = 0;
+    let hasPending = false;
+    const rows: (typeof schema.answers.$inferInsert)[] = [];
     for (const eq2 of eqs) {
       const q = qById.get(eq2.questionId);
       if (!q) continue;
@@ -760,54 +768,46 @@ const app = new Hono<{ Variables: Vars }>()
       const response = given?.response ?? null;
       let score: number | null = null;
       let autoGraded = false;
-      let aiNotes: string | null = null;
 
       const auto = autoGrade(q.type, q.correct, response, maxScore);
       if (auto !== null) {
         score = auto;
         autoGraded = true;
       } else if (response != null && String(response).trim() !== "") {
-        // AI grade subjective / coding on submit.
-        try {
-          const meta = (q.meta ?? {}) as Record<string, unknown>;
-          const res = await gradeSubjective({
-            question: q.prompt,
-            rubric: (meta.rubric as string) || (meta.solution as string) || undefined,
-            studentAnswer: String(typeof response === "string" ? response : JSON.stringify(response)),
-            maxPoints: maxScore,
-            isCode: q.type === "coding",
-            language: meta.language as string | undefined,
-            provider,
-          });
-          score = res.score;
-          aiNotes = res.notes;
-          autoGraded = true;
-        } catch {
-          score = null; // leave ungraded on failure
-        }
+        // Subjective / coding: defer to background grading.
+        score = null;
+        autoGraded = false;
+        hasPending = true;
       } else {
         score = 0; // blank answer
         autoGraded = true;
       }
       if (score != null) earned += score;
-      await db.insert(schema.answers).values({
+      rows.push({
         id: id("ans"),
         attemptId: aid,
         questionId: eq2.questionId,
         response,
         score,
         maxScore,
-        aiNotes,
+        aiNotes: null,
         autoGraded,
       });
     }
+    if (rows.length) await db.insert(schema.answers).values(rows);
 
+    // Partial score from objective answers only for now; flips to full once
+    // background grading completes. "submitted" and "graded" are treated
+    // identically downstream (both count as finished + show score).
     const scorePct = max > 0 ? Math.round((earned / max) * 1000) / 10 : 0;
     const [updated] = await db.update(schema.attempts).set({
-      status: "graded",
+      status: hasPending ? "submitted" : "graded",
       score: scorePct,
       submittedAt: new Date(),
     }).where(eq(schema.attempts.id, aid)).returning();
+
+    // Kick off background subjective grading (fire-and-forget, globally throttled).
+    if (hasPending) queueAttemptGrading(aid, provider);
 
     return c.json({ ok: true, attemptId: aid, score: updated.score }, 200);
   })
@@ -1130,16 +1130,28 @@ const app = new Hono<{ Variables: Vars }>()
     const patch: Record<string, unknown> = {};
     for (const k of ["title", "status", "durationMin"]) if (b[k] !== undefined) patch[k] = b[k];
     if (b.sectionIds !== undefined) patch.sectionIds = Array.isArray(b.sectionIds) && b.sectionIds.length ? b.sectionIds : null;
-    if (b.startAt !== undefined) {
-      patch.startAt = b.startAt ? new Date(b.startAt) : null;
-      // Keep the window (startAt + duration) in sync with the start time. Use the
-      // incoming duration when provided, otherwise the exam's current duration.
+    if (b.startAt !== undefined || b.durationMin !== undefined) {
+      // Keep the exam window (endAt = startAt + duration) in sync whenever EITHER
+      // the start time OR the duration changes. Editing only the duration must
+      // still move the window, otherwise the deadline stays stale and students
+      // can be cut off early / late. Fall back to the exam's stored values for
+      // whichever field the request did not include.
+      let startAtVal: Date | null | undefined;
       let durMin = b.durationMin;
-      if (durMin === undefined) {
-        const [ex] = await db.select({ durationMin: schema.exams.durationMin }).from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
-        durMin = ex?.durationMin ?? 60;
+      if (b.startAt !== undefined) {
+        patch.startAt = b.startAt ? new Date(b.startAt) : null;
+        startAtVal = patch.startAt as Date | null;
       }
-      patch.endAt = b.startAt ? new Date(new Date(b.startAt).getTime() + durMin * 60_000) : null;
+      if (startAtVal === undefined || durMin === undefined) {
+        const [ex] = await db
+          .select({ startAt: schema.exams.startAt, durationMin: schema.exams.durationMin })
+          .from(schema.exams)
+          .where(eq(schema.exams.id, eid))
+          .limit(1);
+        if (startAtVal === undefined) startAtVal = ex?.startAt ?? null;
+        if (durMin === undefined) durMin = ex?.durationMin ?? 60;
+      }
+      patch.endAt = startAtVal ? new Date(new Date(startAtVal).getTime() + durMin * 60_000) : null;
     } else if (b.endAt !== undefined) {
       patch.endAt = b.endAt ? new Date(b.endAt) : null;
     }
