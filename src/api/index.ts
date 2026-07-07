@@ -1288,6 +1288,8 @@ const app = new Hono<{ Variables: Vars }>()
               lastSeenAt: a.lastSeenAt,
               startedAt: a.startedAt,
               submittedAt: a.submittedAt,
+              score: a.status === "graded" ? a.score : null,
+              graded: a.status === "graded",
               snapshot: null as string | null,
             };
           }),

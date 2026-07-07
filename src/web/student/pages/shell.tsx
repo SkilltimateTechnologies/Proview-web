@@ -377,8 +377,9 @@ function Dashboard({ finished, onReview }: { finished: ExamListItem[]; onReview:
   // Only truly-completed attempts count towards averages / completed count.
   // `finished` is already sorted latest-first upstream.
   const completed = useMemo(() => finished.filter((e) => e.phase === "finished"), [finished]);
-  // Scores stay hidden until the exam closes — only count released results in the average.
-  const revealed = useMemo(() => completed.filter((e) => e.resultsReady), [completed]);
+  // Scores stay hidden until the exam closes — only count released results with a
+  // real graded score in the average (a still-grading exam must not drag it to 0).
+  const revealed = useMemo(() => completed.filter((e) => e.resultsReady && e.attempt?.score != null), [completed]);
   const avg = revealed.length ? Math.round((revealed.reduce((s, e) => s + (e.attempt?.score || 0), 0) / revealed.length) * 10) / 10 : null;
   return (
     <div style={{ display: "grid", gap: 24 }}>

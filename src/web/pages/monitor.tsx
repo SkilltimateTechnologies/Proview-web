@@ -15,6 +15,8 @@ type LiveStudent = {
   lastSeenAt?: string | number | null;
   startedAt: string | number | null;
   submittedAt?: string | number | null;
+  score?: number | null;
+  graded?: boolean;
   snapshot: string | null;
   examTitle?: string;
 };
@@ -194,6 +196,7 @@ export default function Monitor() {
                             <th>Student</th>
                             <th>Roll No</th>
                             <th>Status</th>
+                            <th className="text-right">Score</th>
                             <th className="text-right">Started</th>
                           </tr>
                         </thead>
@@ -227,6 +230,15 @@ export default function Monitor() {
                                   <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[#c0453b]"><UserX size={14} /> Absent</span>
                                 ) : (
                                   <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--color-muted)]"><CircleDashed size={14} /> Not started</span>
+                                )}
+                              </td>
+                              <td className="text-right">
+                                {s.status === "finished" && s.graded && s.score != null ? (
+                                  <span className="stat-num text-sm" style={{ color: s.score >= 100 ? "#2e7d5b" : s.score <= 0 ? "#c0453b" : "#b7791f" }}>{s.score}%</span>
+                                ) : s.status === "finished" ? (
+                                  <span className="mono-label text-[var(--color-muted)]">Grading…</span>
+                                ) : (
+                                  <span className="mono-label text-[var(--color-muted)]">—</span>
                                 )}
                               </td>
                               <td className="text-right"><span className="mono-label">{fmtTime(s.startedAt)}</span></td>
@@ -295,6 +307,9 @@ function StudentDrawer({ s, onClose }: { s: LiveStudent; onClose: () => void }) 
           <Pill label="ABSENT" color="#c0453b" />
         ) : (
           <Pill label="NOT STARTED" color="#8a8f98" />
+        )}
+        {s.status === "finished" && s.graded && s.score != null && (
+          <Pill label={`SCORE ${s.score}%`} color={s.score >= 100 ? "#2e7d5b" : s.score <= 0 ? "#c0453b" : "#b7791f"} />
         )}
         {s.status !== "not_started" && s.status !== "absent" && (
           <span className="inline-flex items-center gap-1.5 text-sm text-[var(--color-ink2)]"><Clock size={14} /> Started {fmtTime(s.startedAt)}</span>
