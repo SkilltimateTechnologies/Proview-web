@@ -145,15 +145,11 @@ function AttemptDrawer({ examId, row, onClose }: { examId: string; row: Row; onC
 
   const d = q.data && !("message" in q.data) ? q.data : null;
   const answers = (d?.answers ?? []) as AnswerRow[];
-  const earned = answers.reduce((s, a) => s + (a.score || 0), 0);
-  const max = answers.reduce((s, a) => s + (a.maxScore || 0), 0);
 
   return (
     <Drawer eyebrow="Student report" title={row.name} subtitle={`${row.rollNo}${row.email ? " · " + row.email : ""}`} onClose={onClose} width="max-w-3xl">
-      <div className="grid grid-cols-3 gap-3 mb-6">
-        <div className="card p-4"><div className="stat-num text-[1.5rem]" style={{ color: "var(--brand)" }}>{row.score ?? "—"}</div><div className="mono-label mt-1">Score</div></div>
-        <div className="card p-4"><div className="stat-num text-[1.5rem]">{max > 0 ? `${Math.round(earned * 10) / 10}/${max}` : "—"}</div><div className="mono-label mt-1">Marks earned</div></div>
-        <div className="card p-4"><div className="text-sm font-semibold text-[var(--color-ink)] capitalize pt-1">{row.status}</div><div className="mono-label mt-1">Status</div></div>
+      <div className="mb-6">
+        <div className="card p-4"><div className="stat-num text-[1.6rem]" style={{ color: "var(--brand)" }}>{row.score != null ? `${row.score}/100` : "—"}</div><div className="mono-label mt-1">Marks scored</div></div>
       </div>
 
       {q.isLoading ? (
@@ -276,7 +272,7 @@ function ObjectiveReview({ a }: { a: AnswerRow }) {
           </div>
         );
       })}
-      {!answered && <div className="text-[13px] italic text-[var(--color-muted)] mt-0.5">No answer submitted.</div>}
+      {!answered && <div className="text-[13px] font-semibold mt-1" style={{ color: "#c0453b", background: "#fdecea", border: "1px solid #f3c6c1", borderRadius: 8, padding: "8px 12px" }}>No answer submitted.</div>}
     </div>
   );
 }
@@ -295,7 +291,7 @@ function SubjectiveReview({ a }: { a: AnswerRow }) {
           padding: 12, borderRadius: 10, lineHeight: 1.6, border: "1px solid var(--color-line)", margin: 0,
         }}>{text}</pre>
       ) : (
-        <div className="text-[13px] italic text-[var(--color-muted)]">No answer submitted.</div>
+        <div className="text-[13px] font-semibold" style={{ color: "#c0453b", background: "#fdecea", border: "1px solid #f3c6c1", borderRadius: 8, padding: "8px 12px" }}>No answer submitted.</div>
       )}
     </div>
   );
