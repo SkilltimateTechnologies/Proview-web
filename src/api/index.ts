@@ -867,9 +867,10 @@ const app = new Hono<{ Variables: Vars }>()
     const stdin = b.stdin != null ? String(b.stdin) : "";
     if (!source.trim()) return c.json({ ok: false, message: "Write some code before running." }, 400);
 
-    // Resolve the Judge0 endpoint. Default = self-hosted instance (no auth required).
-    // A RapidAPI key is only needed when pointing at the RapidAPI-hosted judge0-ce.
-    const baseUrl = (process.env.JUDGE0_URL || "https://compiler.otomeyt.ai").replace(/\/+$/, "");
+    // Resolve the Judge0 endpoint. Default = RapidAPI-hosted Judge0 CE (pay-as-you-go).
+    // The RapidAPI host requires the account's X-RapidAPI-Key (stored in settings).
+    const baseUrl = (process.env.JUDGE0_URL || "https://judge0-ce.p.rapidapi.com").replace(/\/+$/, "");
+    const rapidHost = (baseUrl.match(/^https?:\/\/([^/]+)/i)?.[1] || "judge0-ce.p.rapidapi.com");
     const isRapidApi = /rapidapi\.com/i.test(baseUrl);
 
     let key: string | null = null;
@@ -889,35 +890,66 @@ const app = new Hono<{ Variables: Vars }>()
     const reqLangId = Number(b.languageId);
     const languageId = Number.isFinite(reqLangId) && reqLangId > 0 ? reqLangId : (LANG[language] ?? 71);
 
+    // Base64-encode source + stdin so newlines / unicode / special chars survive intact.
+    const enc = (s: string) => Buffer.from(s, "utf8").toString("base64");
+    const dec = (s: string | null | undefined) => (s ? Buffer.from(s, "base64").toString("utf8") : "");
+
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (isRapidApi) {
+      headers["X-RapidAPI-Key"] = key!;
+      headers["X-RapidAPI-Host"] = rapidHost;
+    } else if (key) {
+      // Self-hosted Judge0 with an optional auth token configured.
+      headers["X-Auth-Token"] = key;
+    }
+
+    type J0 = {
+      stdout?: string | null; stderr?: string | null; compile_output?: string | null; message?: string | null;
+      status?: { id?: number; description?: string }; time?: string | null; memory?: number | null; token?: string;
+    };
+
+    const submitBody = JSON.stringify({ source_code: enc(source), language_id: languageId, stdin: enc(stdin) });
+
     try {
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (isRapidApi) {
-        headers["X-RapidAPI-Key"] = key!;
-        headers["X-RapidAPI-Host"] = "judge0-ce.p.rapidapi.com";
-      } else if (key) {
-        // Self-hosted Judge0 with an optional auth token configured.
-        headers["X-Auth-Token"] = key;
-      }
-      const res = await fetch(`${baseUrl}/submissions?base64_encoded=false&wait=true`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ source_code: source, language_id: languageId, stdin }),
+      // Prefer synchronous wait=true. If the plan rejects it, fall back to create + poll.
+      let j: J0 | null = null;
+      const waitRes = await fetch(`${baseUrl}/submissions?base64_encoded=true&wait=true`, {
+        method: "POST", headers, body: submitBody,
       });
-      if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        return c.json({ ok: false, message: `Runner error (${res.status}). Try again in a moment.`, detail: t.slice(0, 200) }, 502);
+
+      if (waitRes.ok) {
+        j = await waitRes.json() as J0;
+      } else if (waitRes.status === 400 || waitRes.status === 422) {
+        // Some plans disable synchronous wait — create the submission, then poll for the result.
+        const createRes = await fetch(`${baseUrl}/submissions?base64_encoded=true&wait=false`, {
+          method: "POST", headers, body: submitBody,
+        });
+        if (!createRes.ok) {
+          const t = await createRes.text().catch(() => "");
+          return c.json({ ok: false, message: `Runner error (${createRes.status}). Try again in a moment.`, detail: t.slice(0, 200) }, 502);
+        }
+        const token = ((await createRes.json()) as J0).token;
+        if (!token) return c.json({ ok: false, message: "Runner did not return a submission token." }, 502);
+        for (let i = 0; i < 20; i++) {
+          await new Promise((r) => setTimeout(r, 700));
+          const pollRes = await fetch(`${baseUrl}/submissions/${token}?base64_encoded=true`, { headers });
+          if (!pollRes.ok) continue;
+          const pj = await pollRes.json() as J0;
+          if ((pj.status?.id ?? 0) > 2) { j = pj; break; } // >2 = finished (Accepted / error / etc.)
+        }
+        if (!j) return c.json({ ok: false, message: "Code execution timed out. Try again." }, 504);
+      } else {
+        const t = await waitRes.text().catch(() => "");
+        return c.json({ ok: false, message: `Runner error (${waitRes.status}). Try again in a moment.`, detail: t.slice(0, 200) }, 502);
       }
-      const j = await res.json() as {
-        stdout?: string | null; stderr?: string | null; compile_output?: string | null;
-        status?: { description?: string }; time?: string | null; memory?: number | null;
-      };
+
       // Best-effort usage counter.
       try { await db.update(schema.settings).set({ judge0Used: dsql`${schema.settings.judge0Used} + 1` }).where(eq(schema.settings.id, "global")); } catch { /* ignore */ }
       return c.json({
         ok: true,
-        stdout: j.stdout ?? "",
-        stderr: j.stderr ?? "",
-        compileOutput: j.compile_output ?? "",
+        stdout: dec(j.stdout),
+        stderr: dec(j.stderr),
+        compileOutput: dec(j.compile_output),
         status: j.status?.description ?? "Done",
         time: j.time ?? null,
         memory: j.memory ?? null,
