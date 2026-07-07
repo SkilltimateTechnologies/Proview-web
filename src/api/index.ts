@@ -22,6 +22,25 @@ async function getGlobalSettings() {
   return s;
 }
 
+/**
+ * Effective absolute deadline for an attempt, in ms.
+ * base = startedAt + duration, capped by the exam window (endAt),
+ * then extended by: student pausedMs (legacy) + admin extraMin + admin holdMs
+ * + the currently-running hold (now - heldAt) if the exam is held right now.
+ */
+function effectiveEndMs(
+  exam: { durationMin: number; endAt: Date | number | string | null; extraMin?: number | null; holdMs?: number | null; heldAt?: Date | number | string | null },
+  attempt: { startedAt: Date | number | string | null; pausedMs?: number | null },
+  now: number,
+) {
+  const startedMs = attempt.startedAt ? new Date(attempt.startedAt).getTime() : now;
+  let base = startedMs + exam.durationMin * 60_000;
+  if (exam.endAt) base = Math.min(base, new Date(exam.endAt).getTime());
+  let extra = (attempt.pausedMs ?? 0) + (exam.extraMin ?? 0) * 60_000 + (exam.holdMs ?? 0);
+  if (exam.heldAt) extra += Math.max(0, now - new Date(exam.heldAt).getTime());
+  return base + extra;
+}
+
 const app = new Hono<{ Variables: Vars }>()
   .use(cors({ origin: (origin) => origin ?? "*", credentials: true, exposeHeaders: ["set-auth-token"] }))
   .on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw))
@@ -601,16 +620,11 @@ const app = new Hono<{ Variables: Vars }>()
     } else if (attempt.status === "not_started") {
       [attempt] = await db.update(schema.attempts).set({ status: "in_progress", startedAt: new Date(now) }).where(eq(schema.attempts.id, attempt.id)).returning();
     }
-    // Absolute deadline = startedAt + duration + pausedMs (network-loss pauses),
-    // capped by exam.endAt. pausedMs freezes the clock while the exam is locked.
-    const startedMs = attempt.startedAt ? new Date(attempt.startedAt).getTime() : now;
-    // Base deadline = startedAt + duration, capped by the exam window (endAt).
-    // Then add pausedMs (network-outage time) so lost time is granted back and
-    // the deadline extends BEYOND the window cap by exactly the outage duration.
-    let base = startedMs + exam.durationMin * 60_000;
-    if (exam.endAt) base = Math.min(base, new Date(exam.endAt).getTime());
-    const endAtMs = base + (attempt.pausedMs ?? 0);
-    return c.json({ attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), serverNow: new Date(now), durationMin: exam.durationMin, pausedMs: attempt.pausedMs ?? 0 }, 200);
+    // Mark the student as seen (drives Live Monitor online/offline).
+    await db.update(schema.attempts).set({ lastSeenAt: new Date(now) }).where(eq(schema.attempts.id, attempt.id));
+    // Absolute deadline includes admin extra-minutes + global hold time.
+    const endAtMs = effectiveEndMs(exam, attempt, now);
+    return c.json({ attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), serverNow: new Date(now), durationMin: exam.durationMin, pausedMs: attempt.pausedMs ?? 0, held: !!exam.heldAt }, 200);
   })
 
   // Resume a locked exam after an internet drop. The client reports how long it
@@ -660,6 +674,24 @@ const app = new Hono<{ Variables: Vars }>()
       await db.update(schema.attempts).set({ lastPausedAt: new Date() }).where(eq(schema.attempts.id, attempt.id));
     }
     return c.json({ ok: true }, 200);
+  })
+
+  // Heartbeat: the running client pings this every ~15s. Records lastSeenAt (for
+  // the Live Monitor online/offline dot) and returns the current hold state +
+  // the up-to-date absolute deadline (so an admin hold/resume or extra-time grant
+  // is picked up by every student without a page reload).
+  .post("/student/heartbeat/:examId", async (c) => {
+    const sid = await verifyStudentToken(c.req.header("x-student-token"));
+    if (!sid) return c.json({ message: "Unauthorized" }, 401);
+    const eid = c.req.param("examId");
+    const [exam] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    if (!exam) return c.json({ message: "Not found" }, 404);
+    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid))).limit(1);
+    if (!attempt) return c.json({ message: "No attempt" }, 404);
+    const now = Date.now();
+    await db.update(schema.attempts).set({ lastSeenAt: new Date(now) }).where(eq(schema.attempts.id, attempt.id));
+    const endAtMs = effectiveEndMs(exam, attempt, now);
+    return c.json({ held: !!exam.heldAt, endAt: new Date(endAtMs), serverNow: new Date(now) }, 200);
   })
 
   // Submit an attempt: persist answers, auto-grade objective questions
@@ -1102,6 +1134,42 @@ const app = new Hono<{ Variables: Vars }>()
     return c.json({ exam: row }, 200);
   })
 
+  // ---- Admin exam controls: global hold / resume / extra time (outage handling) ----
+  // Hold the WHOLE exam (e.g. a venue-wide internet/power outage). Every running
+  // student's timer freezes; the held duration is added back to the deadline on resume.
+  .post("/exams/:id/hold", requireAuth, requirePermission("exams"), async (c) => {
+    const eid = c.req.param("id");
+    const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    if (!ex) return c.json({ message: "Not found" }, 404);
+    if (!ex.heldAt) await db.update(schema.exams).set({ heldAt: new Date() }).where(eq(schema.exams.id, eid));
+    return c.json({ ok: true, held: true }, 200);
+  })
+  // Resume a held exam: fold the elapsed hold into holdMs and clear heldAt so
+  // deadlines shift forward by exactly the outage duration.
+  .post("/exams/:id/unhold", requireAuth, requirePermission("exams"), async (c) => {
+    const eid = c.req.param("id");
+    const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    if (!ex) return c.json({ message: "Not found" }, 404);
+    if (ex.heldAt) {
+      const elapsed = Math.max(0, Date.now() - new Date(ex.heldAt).getTime());
+      await db.update(schema.exams).set({ heldAt: null, holdMs: (ex.holdMs ?? 0) + elapsed }).where(eq(schema.exams.id, eid));
+    }
+    return c.json({ ok: true, held: false }, 200);
+  })
+  // Grant extra minutes to the whole exam (shifts every deadline forward).
+  .post("/exams/:id/extra-time", requireAuth, requirePermission("exams"), async (c) => {
+    const eid = c.req.param("id");
+    const b = await c.req.json().catch(() => ({}));
+    let minutes = Number(b.minutes);
+    if (!Number.isFinite(minutes)) minutes = 0;
+    minutes = Math.round(minutes);
+    const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    if (!ex) return c.json({ message: "Not found" }, 404);
+    const next = Math.max(0, (ex.extraMin ?? 0) + minutes);
+    const [row] = await db.update(schema.exams).set({ extraMin: next }).where(eq(schema.exams.id, eid)).returning();
+    return c.json({ ok: true, extraMin: row.extraMin }, 200);
+  })
+
   // =================== LIVE MONITOR ===================
   .get("/monitor", requireAuth, requirePermission("liveMonitor"), async (c) => {
     const p = c.get("profile")!;
@@ -1162,12 +1230,16 @@ const app = new Hono<{ Variables: Vars }>()
           engaged.map(async (a) => {
             const [stu] = await db.select().from(schema.students).where(eq(schema.students.id, a.studentId));
             const status = a.status === "in_progress" ? "in_progress" : "finished";
+            // Online = a heartbeat within the last 40s (heartbeat interval is ~15s).
+            const online = a.status === "in_progress" && !!a.lastSeenAt && now - new Date(a.lastSeenAt).getTime() < 40_000;
             return {
               attemptId: a.id,
               examId: ex.id,
               student: stu?.name ?? "—",
               rollNo: stu?.rollNo ?? "",
               status,
+              online,
+              lastSeenAt: a.lastSeenAt,
               startedAt: a.startedAt,
               submittedAt: a.submittedAt,
               snapshot: null as string | null,
@@ -1188,6 +1260,8 @@ const app = new Hono<{ Variables: Vars }>()
             student: stu.name ?? "—",
             rollNo: stu.rollNo ?? "",
             status: (windowClosed ? "absent" : "not_started") as "absent" | "not_started",
+            online: false,
+            lastSeenAt: null as string | null,
             startedAt: null as string | null,
             submittedAt: null as string | null,
             snapshot: null as string | null,
@@ -1196,7 +1270,11 @@ const app = new Hono<{ Variables: Vars }>()
         return {
           examId: ex.id,
           title: ex.title,
+          held: !!ex.heldAt,
+          heldAt: ex.heldAt,
+          extraMin: ex.extraMin ?? 0,
           active: engaged.filter((a) => a.status === "in_progress").length,
+          online: enriched.filter((s) => s.online).length,
           submitted: engaged.filter((a) => a.status !== "in_progress").length,
           notStarted: windowClosed ? 0 : notStarted.length,
           absent: absentCount,

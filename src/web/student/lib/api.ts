@@ -73,8 +73,9 @@ export type Bundle = {
   proctoring?: ProctorConfig;
 };
 
-export type StartInfo = { attemptId: string; startedAt: string; endAt: string; serverNow: string; durationMin: number; pausedMs?: number };
+export type StartInfo = { attemptId: string; startedAt: string; endAt: string; serverNow: string; durationMin: number; pausedMs?: number; held?: boolean };
 export type ResumeInfo = { attemptId: string; endAt: string; serverNow: string; pausedMs: number };
+export type HeartbeatInfo = { held: boolean; endAt: string; serverNow: string };
 
 export type ReviewQuestion = {
   id: string;
@@ -128,6 +129,8 @@ export const api = {
     req<ResumeInfo>(`/student/attempts/${examId}/resume`, { method: "POST", body: JSON.stringify({ offlineMs }) }),
   pause: (examId: string) =>
     req<{ ok: boolean }>(`/student/attempts/${examId}/pause`, { method: "POST", body: JSON.stringify({}) }),
+  heartbeat: (examId: string) =>
+    req<HeartbeatInfo>(`/student/heartbeat/${examId}`, { method: "POST" }),
   exams: () => req<{ exams: ExamListItem[]; student: { id: string; name: string; rollNo: string; email: string | null } }>("/student/exams"),
   bundle: (examId: string) => req<Bundle>(`/student/exams/${examId}/bundle`),
   start: (examId: string) => req<StartInfo>(`/student/attempts/${examId}/start`, { method: "POST" }),

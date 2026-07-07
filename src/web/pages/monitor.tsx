@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, UserX } from "lucide-react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, UserX, Pause, Play, Plus, Wifi, WifiOff } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Drawer } from "../components/ui";
@@ -11,6 +11,8 @@ type LiveStudent = {
   student: string;
   rollNo: string;
   status: "in_progress" | "finished" | "not_started" | "absent";
+  online?: boolean;
+  lastSeenAt?: string | number | null;
   startedAt: string | number | null;
   submittedAt?: string | number | null;
   snapshot: string | null;
@@ -39,6 +41,57 @@ function fmtDateTime(t: number | null) {
 
 function initials(name: string) {
   return name.split(" ").filter(Boolean).slice(0, 2).map((w) => w[0]).join("").toUpperCase() || "?";
+}
+
+/** Admin outage controls for one live exam: global hold/resume + grant extra minutes. */
+function ExamControls({ examId, held, extraMin }: { examId: string; held: boolean; extraMin: number }) {
+  const qc = useQueryClient();
+  const [mins, setMins] = useState(5);
+  const refresh = () => qc.invalidateQueries({ queryKey: ["monitor"] });
+
+  const hold = useMutation({
+    mutationFn: async () => (held ? api.exams[":id"].unhold.$post({ param: { id: examId } }) : api.exams[":id"].hold.$post({ param: { id: examId } })),
+    onSuccess: refresh,
+  });
+  const addTime = useMutation({
+    mutationFn: async () => api.exams[":id"]["extra-time"].$post({ param: { id: examId }, json: { minutes: mins } }),
+    onSuccess: refresh,
+  });
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {extraMin > 0 && <Pill label={`+${extraMin} MIN GRANTED`} color="#2e7d5b" />}
+      {held && <Pill label="PAUSED" color="#b7791f" />}
+      <button
+        onClick={() => hold.mutate()}
+        disabled={hold.isPending}
+        className={`inline-flex items-center gap-1.5 text-xs font-semibold rounded-lg px-3 py-1.5 border transition disabled:opacity-50 ${
+          held ? "bg-[var(--color-success)] text-white border-[var(--color-success)]" : "bg-[#b7791f] text-white border-[#b7791f]"
+        }`}
+        title={held ? "Resume the exam for everyone" : "Pause the whole exam (venue outage) — freezes everyone's timer"}
+      >
+        {held ? <><Play size={13} /> Resume exam</> : <><Pause size={13} /> Hold exam</>}
+      </button>
+      <div className="inline-flex items-center gap-1 rounded-lg border border-[var(--color-line)] px-1.5 py-0.5">
+        <input
+          type="number"
+          min={1}
+          value={mins}
+          onChange={(e) => setMins(Math.max(1, Number(e.target.value) || 1))}
+          className="w-12 bg-transparent text-sm text-[var(--color-ink)] outline-none text-center"
+        />
+        <span className="mono-label pr-1">min</span>
+        <button
+          onClick={() => addTime.mutate()}
+          disabled={addTime.isPending}
+          className="inline-flex items-center gap-1 text-xs font-semibold rounded-md px-2 py-1 bg-[var(--brand)] text-white disabled:opacity-50"
+          title="Add extra minutes to this exam for everyone"
+        >
+          <Plus size={12} /> Add time
+        </button>
+      </div>
+    </div>
+  );
 }
 
 export default function Monitor() {
@@ -94,6 +147,7 @@ export default function Monitor() {
             const done = (ex.students as LiveStudent[]).filter((s) => s.status === "finished").length;
             const notStarted = (ex.students as LiveStudent[]).filter((s) => s.status === "not_started").length;
             const absent = (ex.students as LiveStudent[]).filter((s) => s.status === "absent").length;
+            const online = (ex.students as LiveStudent[]).filter((s) => s.status === "in_progress" && s.online).length;
             return (
               <div key={ex.examId} className="card p-5">
                 <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
@@ -103,9 +157,12 @@ export default function Monitor() {
                       <Pill label="LIVE" color="#c0453b" />
                     </div>
                     <div className="mono-label mt-1">
-                      {inProg} in progress · {done} finished · {notStarted} not started{absent > 0 ? ` · ${absent} absent` : ""}
+                      {inProg} in progress · {online} online · {done} finished · {notStarted} not started{absent > 0 ? ` · ${absent} absent` : ""}
                     </div>
                   </div>
+                  <ExamControls examId={ex.examId} held={!!(ex as any).held} extraMin={(ex as any).extraMin ?? 0} />
+                </div>
+                <div className="flex flex-wrap items-center justify-end gap-1.5 mb-4">
                   <div className="flex flex-wrap gap-1.5">
                     {FILTERS.map((f) => {
                       const count = f.k === "all" ? total : f.k === "in_progress" ? inProg : f.k === "finished" ? done : f.k === "absent" ? absent : notStarted;
@@ -156,7 +213,14 @@ export default function Monitor() {
                               <td><span className="mono-label whitespace-nowrap">{s.rollNo || "—"}</span></td>
                               <td>
                                 {s.status === "in_progress" ? (
-                                  <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--brand)]"><Loader2 size={14} className="animate-spin" /> In progress</span>
+                                  <span className="inline-flex items-center gap-2">
+                                    <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--brand)]"><Loader2 size={14} className="animate-spin" /> In progress</span>
+                                    {s.online ? (
+                                      <span className="inline-flex items-center gap-1 text-xs font-medium text-[var(--color-success)]"><Wifi size={12} /> Online</span>
+                                    ) : (
+                                      <span className="inline-flex items-center gap-1 text-xs font-medium text-[#b7791f]"><WifiOff size={12} /> Offline</span>
+                                    )}
+                                  </span>
                                 ) : s.status === "finished" ? (
                                   <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--color-success)]"><CheckCircle2 size={14} /> Finished</span>
                                 ) : s.status === "absent" ? (

@@ -124,6 +124,11 @@ export const exams = sqliteTable(
     endAt: integer("end_at", { mode: "timestamp_ms" }),
     durationMin: integer("duration_min").notNull().default(60),
     totalPoints: integer("total_points").notNull().default(0),
+    // Admin global hold (outage). heldAt set = currently held; holdMs = total ms already held.
+    heldAt: integer("held_at", { mode: "timestamp_ms" }),
+    holdMs: integer("hold_ms").notNull().default(0),
+    // Extra minutes granted by admin for the whole exam.
+    extraMin: integer("extra_min").notNull().default(0),
     createdBy: text("created_by"),
     createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
   },
@@ -157,6 +162,8 @@ export const attempts = sqliteTable(
     // the student is not penalised for a network drop — timer freezes while paused.
     pausedMs: integer("paused_ms").notNull().default(0),
     lastPausedAt: integer("last_paused_at", { mode: "timestamp_ms" }),
+    // Last heartbeat from the student client — drives Live Monitor online/offline.
+    lastSeenAt: integer("last_seen_at", { mode: "timestamp_ms" }),
     submittedAt: integer("submitted_at", { mode: "timestamp_ms" }),
     createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
   },

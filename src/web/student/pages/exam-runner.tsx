@@ -69,11 +69,14 @@ export function ExamRunner() {
   const proctoringRef = useRef(proctoring);
   proctoringRef.current = proctoring;
 
-  // Network-outage overlay (in-exam). When the internet drops we freeze the exam
-  // behind an overlay instead of logging the student out; on reconnect the lost
-  // time is granted back and the deadline is extended.
-  const [netLost, setNetLost] = useState(false);
-  const offlineSinceRef = useRef<number | null>(null);
+  // Offline-first: when the internet drops we KEEP the exam running (answers are
+  // saved locally and sync on reconnect). We only show a single toast on drop and
+  // flip the network badge — no freeze, no logout. Time credit for a real outage
+  // comes only from an admin GLOBAL hold, never from a single student's drop.
+  const notifiedOfflineRef = useRef(false);
+  // Admin global hold: when the whole exam is held (venue outage) the heartbeat
+  // reports held=true and we freeze behind an overlay until the admin resumes.
+  const [held, setHeld] = useState(false);
 
   // Alerts (violation banners)
   const [alerts, setAlerts] = useState<Alert[]>([]);
@@ -184,17 +187,11 @@ export function ExamRunner() {
     }
     try {
       const start = await api.start(examId);
-      // Restore any answers saved locally before a forced logout (network drop).
+      // Restore any answers saved locally (offline-first: survives a crash/reload).
       const saved = loadProgress(examId);
-      let endAt = new Date(start.endAt).getTime();
-      // If this exam was interrupted (saved progress exists), commit the outage
-      // to the server so the deadline shifts by however long we were offline.
-      if (saved) {
-        try {
-          const res = await api.resume(examId, 0);
-          endAt = new Date(res.endAt).getTime();
-        } catch { /* keep the start endAt */ }
-      }
+      // /start returns the server-anchored deadline already folding in any admin
+      // hold time + extra minutes, so we use it directly.
+      const endAt = new Date(start.endAt).getTime();
       setSession({
         attemptId: start.attemptId,
         endAt,
@@ -202,6 +199,7 @@ export function ExamRunner() {
         flags: saved?.flags ?? {},
         integrityEvents: [],
       });
+      setHeld(!!start.held);
       enterRunning();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Could not start exam");
@@ -247,40 +245,50 @@ export function ExamRunner() {
     }
   }, [locked, lockLeft, tryRestoreCamera, pushAlert]);
 
-  // ---- Network-loss handling: freeze behind an overlay, resume on reconnect ----
-  // When the internet drops mid-exam we DON'T log the student out. Instead we
-  // pause the attempt (server freezes the clock), show a blocking overlay, and
-  // measure how long we were offline. On reconnect we tell the server the outage
-  // duration so it grants that time back and pushes the deadline out, then we
-  // update the local countdown to the new server-anchored endAt.
+  // ---- Offline-first network handling (no freeze, no logout) ----
+  // On the FIRST drop we save progress locally + show ONE toast, then stay quiet.
+  // The exam keeps running; answers buffer on this device and sync on reconnect.
   useEffect(() => {
     if (phase !== "running" || submittedRef.current || !examId) return;
     if (!online) {
-      if (offlineSinceRef.current == null) {
-        offlineSinceRef.current = Date.now();
-        setNetLost(true);
+      if (!notifiedOfflineRef.current) {
+        notifiedOfflineRef.current = true;
         const s = sessionRef.current;
         if (s) saveProgress(examId, { answers: s.answers, flags: s.flags });
         try { localStorage.setItem(ACTIVE_EXAM_KEY, examId); } catch { /* ignore */ }
-        // Tell the server the outage started (freezes the clock server-side too).
-        void api.pause(examId).catch(() => {});
+        pushAlert("You're offline — keep going, your answers are saved on this device and will sync when the connection returns.", "warn");
       }
-    } else if (offlineSinceRef.current != null) {
-      const offlineMs = Date.now() - offlineSinceRef.current;
-      offlineSinceRef.current = null;
-      void api
-        .resume(examId, offlineMs)
-        .then((info) => {
-          const newEnd = new Date(info.endAt).getTime();
-          if (Number.isFinite(newEnd)) setSession((prev) => (prev ? { ...prev, endAt: newEnd } : prev));
-          pushAlert("Connection restored — exam resumed. The time lost while offline has been added back.", "warn");
-        })
-        .catch(() => {
-          pushAlert("Connection restored — exam resumed.", "warn");
-        })
-        .finally(() => setNetLost(false));
+    } else if (notifiedOfflineRef.current) {
+      // Reconnected: sync buffered answers quietly (no toast), reset the flag.
+      notifiedOfflineRef.current = false;
+      const s = sessionRef.current;
+      if (s) saveProgress(examId, { answers: s.answers, flags: s.flags });
     }
   }, [online, phase, examId, pushAlert]);
+
+  // ---- Heartbeat + admin hold poll ----
+  // Every ~15s while running + online: ping the server (drives the Live Monitor
+  // online dot) and read back the current hold state + up-to-date deadline. This
+  // is how an admin GLOBAL hold / resume / extra-time reaches every student
+  // without a reload.
+  useEffect(() => {
+    if (phase !== "running" || !examId) return;
+    let stopped = false;
+    const beat = () => {
+      if (stopped || submittedRef.current || !navigator.onLine) return;
+      void api.heartbeat(examId)
+        .then((info) => {
+          if (stopped) return;
+          setHeld(!!info.held);
+          const newEnd = new Date(info.endAt).getTime();
+          if (Number.isFinite(newEnd)) setSession((prev) => (prev && newEnd !== prev.endAt ? { ...prev, endAt: newEnd } : prev));
+        })
+        .catch(() => {});
+    };
+    beat();
+    const t = setInterval(beat, 15_000);
+    return () => { stopped = true; clearInterval(t); };
+  }, [phase, examId]);
 
   // ---- Proctoring while running ----
   // DISABLED on web: real proctored exams run inside Safe Exam Browser (SEB),
@@ -366,9 +374,10 @@ export function ExamRunner() {
   doSubmitRef.current = doSubmit;
 
   useEffect(() => {
-    // Auto-submit on timeout — only when the admin left the grace toggle on, online and not network-locked.
-    if (phase === "running" && session && online && remaining <= 0 && proctoringRef.current.autoSubmitOnTimeout) void doSubmit();
-  }, [phase, session, remaining, online, doSubmit]);
+    // Auto-submit on timeout — only when the admin left the grace toggle on,
+    // online, and NOT during an admin global hold (timer is frozen while held).
+    if (phase === "running" && session && online && !held && remaining <= 0 && proctoringRef.current.autoSubmitOnTimeout) void doSubmit();
+  }, [phase, session, remaining, online, held, doSubmit]);
 
   // Persist answers/flags locally on every change while running, so a forced
   // logout (internet drop) never loses work.
@@ -592,15 +601,16 @@ export function ExamRunner() {
         </div>
       )}
 
-      {/* Internet-loss overlay — freezes the exam until the connection returns */}
-      {netLost && (
+      {/* Admin global-hold overlay — freezes the exam for everyone during a
+          venue-wide outage until the administrator resumes it. Held time is
+          added back to the deadline automatically. */}
+      {held && (
         <div style={{ position: "fixed", inset: 0, zIndex: 90, background: "rgba(8,12,20,.94)", display: "flex", alignItems: "center", justifyContent: "center", backdropFilter: "blur(4px)" }}>
           <div className="card" style={{ padding: 34, maxWidth: 440, textAlign: "center" }}>
-            <div style={{ width: 58, height: 58, borderRadius: 999, background: "var(--color-danger-bg)", color: "var(--color-danger)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}><Icon name="wifi-off" size={28} /></div>
-            <h2 style={{ fontFamily: "var(--font-serif)", fontSize: 22, marginBottom: 6 }}>Internet disconnected</h2>
-            <p style={{ color: "var(--color-ink2)", fontSize: 14, marginBottom: 18 }}>Your exam is paused and your answers are saved on this device. The timer is frozen — the time lost while offline will be added back automatically once you reconnect. Do not close this window.</p>
-            <div className="timer-big timer-danger" style={{ justifyContent: "center", marginBottom: 6 }}><Icon name="loader-circle" size={20} className="animate-spin" /> Waiting for connection…</div>
-            <p style={{ marginTop: 14, fontSize: 12, color: "#8ba0bd" }}>The exam resumes the moment your internet is back.</p>
+            <div style={{ width: 58, height: 58, borderRadius: 999, background: "var(--color-warn-bg, #3a2c0a)", color: "var(--color-warn, #f0b429)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}><Icon name="pause" size={28} /></div>
+            <h2 style={{ fontFamily: "var(--font-serif)", fontSize: 22, marginBottom: 6 }}>Exam paused by the administrator</h2>
+            <p style={{ color: "var(--color-ink2)", fontSize: 14, marginBottom: 18 }}>The exam has been paused for everyone. Your answers are saved and the timer is frozen — the paused time will be added back automatically. Please wait, do not close this window.</p>
+            <div className="timer-big" style={{ justifyContent: "center", marginBottom: 6 }}><Icon name="loader-circle" size={20} className="animate-spin" /> Waiting for the administrator to resume…</div>
           </div>
         </div>
       )}
