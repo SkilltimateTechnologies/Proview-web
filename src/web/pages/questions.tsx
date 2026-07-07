@@ -63,6 +63,40 @@ const CODE_LANGS: { id: number; hl: string; label: string }[] = [
   { id: 84, hl: "csharp", label: "Visual Basic .NET" },
 ];
 
+// Ready-made input-reading boilerplate so students don't hit EOF errors on
+// programs that read from stdin. Keyed by the highlight language (hl).
+function starterTemplate(hl: string): string {
+  switch (hl) {
+    case "python":
+      return "# Read input from the user\nn = int(input())\n\n# Write your solution below\n";
+    case "java":
+      return "import java.util.Scanner;\n\npublic class Main {\n    public static void main(String[] args) {\n        Scanner sc = new Scanner(System.in);\n        int n = sc.nextInt();\n\n        // Write your solution below\n\n    }\n}\n";
+    case "cpp":
+      return "#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n    int n;\n    cin >> n;\n\n    // Write your solution below\n\n    return 0;\n}\n";
+    case "c":
+      return "#include <stdio.h>\n\nint main() {\n    int n;\n    scanf(\"%d\", &n);\n\n    /* Write your solution below */\n\n    return 0;\n}\n";
+    case "csharp":
+      return "using System;\n\nclass Program {\n    static void Main() {\n        int n = int.Parse(Console.ReadLine());\n\n        // Write your solution below\n\n    }\n}\n";
+    case "javascript":
+    case "typescript":
+      return "const lines = require('fs').readFileSync(0, 'utf8').split('\\n');\nconst n = parseInt(lines[0], 10);\n\n// Write your solution below\n";
+    case "go":
+      return "package main\n\nimport \"fmt\"\n\nfunc main() {\n    var n int\n    fmt.Scan(&n)\n\n    // Write your solution below\n\n}\n";
+    case "ruby":
+      return "n = gets.to_i\n\n# Write your solution below\n";
+    case "php":
+      return "<?php\n$n = intval(trim(fgets(STDIN)));\n\n// Write your solution below\n";
+    case "swift":
+      return "let n = Int(readLine()!)!\n\n// Write your solution below\n";
+    case "rust":
+      return "use std::io::*;\n\nfn main() {\n    let mut s = String::new();\n    stdin().read_line(&mut s).unwrap();\n    let n: i32 = s.trim().parse().unwrap();\n\n    // Write your solution below\n\n}\n";
+    case "bash":
+      return "read n\n\n# Write your solution below\n";
+    default:
+      return "// Read input from the user here, then write your solution below\n";
+  }
+}
+
 type Gen = { type: string; prompt: string; options?: string[]; correct?: unknown; points?: number; difficulty?: string; meta?: Record<string, unknown> };
 type Cat = { id: string; name: string; description?: string | null; questionCount: number };
 
@@ -460,9 +494,20 @@ function ManualForm({ categoryId, initial, onClose }: { categoryId: string; init
             </Field>
           </div>
           <Field label="Starter code (loaded into the student's editor, optional)">
+            <div className="flex items-center justify-between mb-1.5">
+              <div className="mono-label">Loaded into the {codeLang.label} editor as a starting point</div>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={() => setStarter((prev) => (prev.trim() ? prev : starterTemplate(codeLang.hl)))}
+                title="Fill the editor with input-reading boilerplate so students only write the logic"
+              >
+                <Sparkles size={13} /> Insert input template
+              </button>
+            </div>
             <textarea
               className="input font-mono text-[13px]"
-              rows={6}
+              rows={8}
               value={starter}
               onChange={(e) => setStarter(e.target.value)}
               placeholder={`# Students see this in the ${codeLang.label} editor as a starting point…`}
@@ -470,7 +515,7 @@ function ManualForm({ categoryId, initial, onClose }: { categoryId: string; init
             />
           </Field>
           <div className="text-sm text-[var(--color-ink2)] bg-[var(--color-brand-soft)] rounded-lg px-3 py-2">
-            The student's IDE loads in <b>{codeLang.label}</b> and runs against Judge0.
+            The student's IDE loads in <b>{codeLang.label}</b> and runs against Judge0. Tip: add starter code that reads the input (e.g. <code className="font-mono">input()</code>) so students only write the logic — click <b>Insert input template</b> above.
           </div>
         </div>
       )}
