@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed } from "lucide-react";
+import { Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, UserX } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Drawer } from "../components/ui";
@@ -10,19 +10,20 @@ type LiveStudent = {
   examId?: string;
   student: string;
   rollNo: string;
-  status: "in_progress" | "finished" | "not_started";
+  status: "in_progress" | "finished" | "not_started" | "absent";
   startedAt: string | number | null;
   submittedAt?: string | number | null;
   snapshot: string | null;
   examTitle?: string;
 };
 
-type FilterKey = "all" | "in_progress" | "finished" | "not_started";
+type FilterKey = "all" | "in_progress" | "finished" | "not_started" | "absent";
 const FILTERS: { k: FilterKey; label: string }[] = [
   { k: "all", label: "All" },
   { k: "in_progress", label: "In progress" },
   { k: "finished", label: "Finished" },
   { k: "not_started", label: "Not started" },
+  { k: "absent", label: "Absent" },
 ];
 
 function fmtTime(t: string | number | null | undefined) {
@@ -59,6 +60,7 @@ export default function Monitor() {
     if (filter === "in_progress") return s.status === "in_progress";
     if (filter === "finished") return s.status === "finished";
     if (filter === "not_started") return s.status === "not_started";
+    if (filter === "absent") return s.status === "absent";
     return true;
   }
 
@@ -91,6 +93,7 @@ export default function Monitor() {
             const inProg = (ex.students as LiveStudent[]).filter((s) => s.status === "in_progress").length;
             const done = (ex.students as LiveStudent[]).filter((s) => s.status === "finished").length;
             const notStarted = (ex.students as LiveStudent[]).filter((s) => s.status === "not_started").length;
+            const absent = (ex.students as LiveStudent[]).filter((s) => s.status === "absent").length;
             return (
               <div key={ex.examId} className="card p-5">
                 <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
@@ -100,12 +103,12 @@ export default function Monitor() {
                       <Pill label="LIVE" color="#c0453b" />
                     </div>
                     <div className="mono-label mt-1">
-                      {inProg} in progress · {done} finished · {notStarted} not started
+                      {inProg} in progress · {done} finished · {notStarted} not started{absent > 0 ? ` · ${absent} absent` : ""}
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
                     {FILTERS.map((f) => {
-                      const count = f.k === "all" ? total : f.k === "in_progress" ? inProg : f.k === "finished" ? done : notStarted;
+                      const count = f.k === "all" ? total : f.k === "in_progress" ? inProg : f.k === "finished" ? done : f.k === "absent" ? absent : notStarted;
                       return (
                         <button
                           key={f.k}
@@ -156,6 +159,8 @@ export default function Monitor() {
                                   <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--brand)]"><Loader2 size={14} className="animate-spin" /> In progress</span>
                                 ) : s.status === "finished" ? (
                                   <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--color-success)]"><CheckCircle2 size={14} /> Finished</span>
+                                ) : s.status === "absent" ? (
+                                  <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[#c0453b]"><UserX size={14} /> Absent</span>
                                 ) : (
                                   <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--color-muted)]"><CircleDashed size={14} /> Not started</span>
                                 )}
@@ -222,15 +227,21 @@ function StudentDrawer({ s, onClose }: { s: LiveStudent; onClose: () => void }) 
           <Pill label="IN PROGRESS" color="#1e3a5f" />
         ) : s.status === "finished" ? (
           <Pill label="FINISHED" color="#2e7d5b" />
+        ) : s.status === "absent" ? (
+          <Pill label="ABSENT" color="#c0453b" />
         ) : (
           <Pill label="NOT STARTED" color="#8a8f98" />
         )}
-        {s.status !== "not_started" && (
+        {s.status !== "not_started" && s.status !== "absent" && (
           <span className="inline-flex items-center gap-1.5 text-sm text-[var(--color-ink2)]"><Clock size={14} /> Started {fmtTime(s.startedAt)}</span>
         )}
       </div>
 
-      {s.status === "not_started" ? (
+      {s.status === "absent" ? (
+        <div className="card p-6 text-center text-sm text-[var(--color-ink2)]">
+          This candidate did not appear — the exam window has closed and they never started.
+        </div>
+      ) : s.status === "not_started" ? (
         <div className="card p-6 text-center text-sm text-[var(--color-ink2)]">
           This candidate has not started the exam yet.
         </div>

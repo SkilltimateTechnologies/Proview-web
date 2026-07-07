@@ -48,7 +48,7 @@ function clearProgress(examId: string) {
 export function ExamRunner() {
   const { examId } = useParams();
   const [, navigate] = useLocation();
-  const { student, logout } = useSession();
+  const { student } = useSession();
   const online = useOnline();
 
   const [phase, setPhase] = useState<Phase>("brief");
@@ -68,6 +68,12 @@ export function ExamRunner() {
   const proctoring: ProctorConfig = bundle?.proctoring ? { ...DEFAULT_PROCTORING, ...bundle.proctoring } : DEFAULT_PROCTORING;
   const proctoringRef = useRef(proctoring);
   proctoringRef.current = proctoring;
+
+  // Network-outage overlay (in-exam). When the internet drops we freeze the exam
+  // behind an overlay instead of logging the student out; on reconnect the lost
+  // time is granted back and the deadline is extended.
+  const [netLost, setNetLost] = useState(false);
+  const offlineSinceRef = useRef<number | null>(null);
 
   // Alerts (violation banners)
   const [alerts, setAlerts] = useState<Alert[]>([]);
@@ -241,29 +247,40 @@ export function ExamRunner() {
     }
   }, [locked, lockLeft, tryRestoreCamera, pushAlert]);
 
-  // ---- Network-loss handling: save progress, sign out, bounce to login ----
-  // When the internet drops mid-exam we push the student back to the login
-  // page. The server freezes the timer (lastPausedAt); their answers are saved
-  // locally so they resume exactly where they left off after signing back in.
+  // ---- Network-loss handling: freeze behind an overlay, resume on reconnect ----
+  // When the internet drops mid-exam we DON'T log the student out. Instead we
+  // pause the attempt (server freezes the clock), show a blocking overlay, and
+  // measure how long we were offline. On reconnect we tell the server the outage
+  // duration so it grants that time back and pushes the deadline out, then we
+  // update the local countdown to the new server-anchored endAt.
   useEffect(() => {
-    if (phase !== "running") return;
-    if (!online && !submittedRef.current) {
-      const s = sessionRef.current;
-      if (examId) {
-        // Persist answers/flags locally so they survive the logout.
+    if (phase !== "running" || submittedRef.current || !examId) return;
+    if (!online) {
+      if (offlineSinceRef.current == null) {
+        offlineSinceRef.current = Date.now();
+        setNetLost(true);
+        const s = sessionRef.current;
         if (s) saveProgress(examId, { answers: s.answers, flags: s.flags });
         try { localStorage.setItem(ACTIVE_EXAM_KEY, examId); } catch { /* ignore */ }
-        // Best-effort: tell the server the outage started (freezes the clock).
+        // Tell the server the outage started (freezes the clock server-side too).
         void api.pause(examId).catch(() => {});
       }
-      // Sign out and send to login via client-side routing (a full page
-      // navigation would fail while offline). Clearing the session makes the
-      // router render the login screen; after re-login only "Resume exam" is
-      // allowed (see index.tsx activeExam guard).
-      logout();
-      navigate("/login");
+    } else if (offlineSinceRef.current != null) {
+      const offlineMs = Date.now() - offlineSinceRef.current;
+      offlineSinceRef.current = null;
+      void api
+        .resume(examId, offlineMs)
+        .then((info) => {
+          const newEnd = new Date(info.endAt).getTime();
+          if (Number.isFinite(newEnd)) setSession((prev) => (prev ? { ...prev, endAt: newEnd } : prev));
+          pushAlert("Connection restored — exam resumed. The time lost while offline has been added back.", "warn");
+        })
+        .catch(() => {
+          pushAlert("Connection restored — exam resumed.", "warn");
+        })
+        .finally(() => setNetLost(false));
     }
-  }, [online, phase, examId, logout, navigate]);
+  }, [online, phase, examId, pushAlert]);
 
   // ---- Proctoring while running ----
   // DISABLED on web: real proctored exams run inside Safe Exam Browser (SEB),
@@ -481,23 +498,36 @@ export function ExamRunner() {
   }
 
   // ===== DONE =====
-  // We deliberately do NOT show the score here. Results stay locked until the
-  // exam window closes, so early finishers can't leak the answer key to
-  // students who are still writing.
+  // Show the score immediately as marks out of 100 (the server returns a
+  // percentage on a 0–100 scale, so "X/100" is the same number framed as marks).
+  // The detailed answer report is NOT available to students — only the score.
   if (phase === "done" && result) {
-    const endTs = bundle?.exam.endAt ? new Date(bundle.exam.endAt).getTime() : null;
-    const checkBack = endTs
-      ? `after this exam closes on ${new Date(endTs).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}`
-      : "once this exam is closed by your instructor";
+    const marks = result.score != null ? Math.round(result.score) : null;
     return (
       <div className="runner" style={{ alignItems: "center", justifyContent: "center" }}>
         <div className="card" style={{ padding: 36, maxWidth: 480, width: "100%", textAlign: "center" }}>
           <div style={{ width: 58, height: 58, borderRadius: 999, background: "#e7f5ee", color: "var(--color-success)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}><Icon name="check" size={30} /></div>
-          <h1 style={{ fontFamily: "var(--font-serif)", fontSize: 26, marginBottom: 8 }}>You have successfully finished your exam</h1>
-          <p style={{ color: "var(--color-ink2)", marginBottom: 20, lineHeight: 1.6 }}>Your responses have been submitted. Results are not available yet — please check back {checkBack} to view your results.</p>
-          <div style={{ display: "flex", gap: 8, justifyContent: "center", alignItems: "center", color: "var(--color-ink2)", background: "var(--color-brand-soft)", borderRadius: 12, padding: "12px 14px", marginBottom: 22, fontSize: 13.5 }}>
-            <Icon name="lock" size={15} /> Results unlock after the exam closes for everyone.
+          <h1 style={{ fontFamily: "var(--font-serif)", fontSize: 26, marginBottom: 6 }}>Exam submitted</h1>
+          <p style={{ color: "var(--color-ink2)", marginBottom: 20, lineHeight: 1.6 }}>Your answers were submitted and scored successfully.</p>
+
+          {marks != null && (
+            <div style={{ background: "var(--color-brand-soft)", borderRadius: 14, padding: "16px 14px", marginBottom: 12 }}>
+              <div className="mono-label" style={{ marginBottom: 4 }}>Your score</div>
+              <div className="stat-num" style={{ fontSize: 38, lineHeight: 1 }}>{marks}<span style={{ fontSize: 20, color: "var(--color-ink2)" }}>/100</span></div>
+            </div>
+          )}
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 22 }}>
+            <div style={{ background: "#e7f5ee", borderRadius: 12, padding: "14px 10px" }}>
+              <div className="stat-num" style={{ fontSize: 22, color: "var(--color-success)" }}>{result.answered}</div>
+              <div className="mono-label">Answered</div>
+            </div>
+            <div style={{ background: "#fdf3e7", borderRadius: 12, padding: "14px 10px" }}>
+              <div className="stat-num" style={{ fontSize: 22, color: "var(--color-warn)" }}>{result.skipped}</div>
+              <div className="mono-label">Skipped</div>
+            </div>
           </div>
+
           <button className="btn btn-primary" style={{ width: "100%", padding: 12 }} onClick={() => { if (examId) clearProgress(examId); navigate("/"); }}>
             <Icon name="layout-dashboard" /> Back to dashboard
           </button>
@@ -558,6 +588,19 @@ export function ExamRunner() {
             <button className="btn btn-primary" style={{ width: "100%", padding: 11 }} onClick={() => void tryRestoreCamera()}><Icon name="video" /> Re-enable camera now</button>
             {camError && <div style={{ marginTop: 12, fontSize: 12.5, color: "var(--color-danger)" }}>{camError}</div>}
             <p style={{ marginTop: 14, fontSize: 12, color: "#8ba0bd" }}>The exam timer keeps running while locked.</p>
+          </div>
+        </div>
+      )}
+
+      {/* Internet-loss overlay — freezes the exam until the connection returns */}
+      {netLost && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 90, background: "rgba(8,12,20,.94)", display: "flex", alignItems: "center", justifyContent: "center", backdropFilter: "blur(4px)" }}>
+          <div className="card" style={{ padding: 34, maxWidth: 440, textAlign: "center" }}>
+            <div style={{ width: 58, height: 58, borderRadius: 999, background: "var(--color-danger-bg)", color: "var(--color-danger)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}><Icon name="wifi-off" size={28} /></div>
+            <h2 style={{ fontFamily: "var(--font-serif)", fontSize: 22, marginBottom: 6 }}>Internet disconnected</h2>
+            <p style={{ color: "var(--color-ink2)", fontSize: 14, marginBottom: 18 }}>Your exam is paused and your answers are saved on this device. The timer is frozen — the time lost while offline will be added back automatically once you reconnect. Do not close this window.</p>
+            <div className="timer-big timer-danger" style={{ justifyContent: "center", marginBottom: 6 }}><Icon name="loader-circle" size={20} className="animate-spin" /> Waiting for connection…</div>
+            <p style={{ marginTop: 14, fontSize: 12, color: "#8ba0bd" }}>The exam resumes the moment your internet is back.</p>
           </div>
         </div>
       )}

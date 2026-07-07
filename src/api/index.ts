@@ -604,8 +604,12 @@ const app = new Hono<{ Variables: Vars }>()
     // Absolute deadline = startedAt + duration + pausedMs (network-loss pauses),
     // capped by exam.endAt. pausedMs freezes the clock while the exam is locked.
     const startedMs = attempt.startedAt ? new Date(attempt.startedAt).getTime() : now;
-    let endAtMs = startedMs + exam.durationMin * 60_000 + (attempt.pausedMs ?? 0);
-    if (exam.endAt) endAtMs = Math.min(endAtMs, new Date(exam.endAt).getTime());
+    // Base deadline = startedAt + duration, capped by the exam window (endAt).
+    // Then add pausedMs (network-outage time) so lost time is granted back and
+    // the deadline extends BEYOND the window cap by exactly the outage duration.
+    let base = startedMs + exam.durationMin * 60_000;
+    if (exam.endAt) base = Math.min(base, new Date(exam.endAt).getTime());
+    const endAtMs = base + (attempt.pausedMs ?? 0);
     return c.json({ attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), serverNow: new Date(now), durationMin: exam.durationMin, pausedMs: attempt.pausedMs ?? 0 }, 200);
   })
 
@@ -635,8 +639,11 @@ const app = new Hono<{ Variables: Vars }>()
     const newPaused = (attempt.pausedMs ?? 0) + Math.round(offlineMs);
     await db.update(schema.attempts).set({ pausedMs: newPaused, lastPausedAt: null }).where(eq(schema.attempts.id, attempt.id));
     const startedMs = attempt.startedAt ? new Date(attempt.startedAt).getTime() : now;
-    let endAtMs = startedMs + exam.durationMin * 60_000 + newPaused;
-    if (exam.endAt) endAtMs = Math.min(endAtMs, new Date(exam.endAt).getTime());
+    // Base = startedAt + duration capped by the window; add pausedMs on top so the
+    // outage time extends the deadline beyond the window cap.
+    let base = startedMs + exam.durationMin * 60_000;
+    if (exam.endAt) base = Math.min(base, new Date(exam.endAt).getTime());
+    const endAtMs = base + newPaused;
     return c.json({ attemptId: attempt.id, endAt: new Date(endAtMs), serverNow: new Date(now), pausedMs: newPaused }, 200);
   })
 
@@ -1043,9 +1050,10 @@ const app = new Hono<{ Variables: Vars }>()
         sectionIds: Array.isArray(b.sectionIds) && b.sectionIds.length ? b.sectionIds : null,
         status: b.status ?? "scheduled",
         startAt: b.startAt ? new Date(b.startAt) : null,
-        // Fixed 2-hour window: after start + 2h the exam window closes and
-        // any student who hasn't submitted is marked absent.
-        endAt: b.startAt ? new Date(new Date(b.startAt).getTime() + 2 * 60 * 60 * 1000) : null,
+        // The exam window closes at startAt + duration. After that the window is
+        // closed and any student who never showed up is marked absent. (Offline
+        // lost time is added back per-attempt beyond this cap at /start & /resume.)
+        endAt: b.startAt ? new Date(new Date(b.startAt).getTime() + (b.durationMin ?? 60) * 60_000) : null,
         durationMin: b.durationMin ?? 60,
         totalPoints: total,
         createdBy: p.userId,
@@ -1066,8 +1074,14 @@ const app = new Hono<{ Variables: Vars }>()
     if (b.sectionIds !== undefined) patch.sectionIds = Array.isArray(b.sectionIds) && b.sectionIds.length ? b.sectionIds : null;
     if (b.startAt !== undefined) {
       patch.startAt = b.startAt ? new Date(b.startAt) : null;
-      // Keep the fixed 2-hour window in sync with the start time.
-      patch.endAt = b.startAt ? new Date(new Date(b.startAt).getTime() + 2 * 60 * 60 * 1000) : null;
+      // Keep the window (startAt + duration) in sync with the start time. Use the
+      // incoming duration when provided, otherwise the exam's current duration.
+      let durMin = b.durationMin;
+      if (durMin === undefined) {
+        const [ex] = await db.select({ durationMin: schema.exams.durationMin }).from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+        durMin = ex?.durationMin ?? 60;
+      }
+      patch.endAt = b.startAt ? new Date(new Date(b.startAt).getTime() + durMin * 60_000) : null;
     } else if (b.endAt !== undefined) {
       patch.endAt = b.endAt ? new Date(b.endAt) : null;
     }
@@ -1159,8 +1173,11 @@ const app = new Hono<{ Variables: Vars }>()
             };
           }),
         );
-        // Assigned students who have not started yet — no attempt, or an attempt
-        // still in the "not_started" state. Lets teachers see who's yet to begin.
+        // Assigned students who have not started. If the exam window has closed
+        // (now > endAt) they never showed up → "absent"; otherwise they can still
+        // begin → "not_started".
+        const endMs = ex.endAt ? new Date(ex.endAt).getTime() : null;
+        const windowClosed = endMs !== null && !Number.isNaN(endMs) && now > endMs;
         const engagedIds = new Set(engaged.map((a) => a.studentId));
         const notStarted = assignedStudents(ex)
           .filter((stu) => !engagedIds.has(stu.id))
@@ -1169,17 +1186,19 @@ const app = new Hono<{ Variables: Vars }>()
             examId: ex.id,
             student: stu.name ?? "—",
             rollNo: stu.rollNo ?? "",
-            status: "not_started" as const,
+            status: (windowClosed ? "absent" : "not_started") as "absent" | "not_started",
             startedAt: null as string | null,
             submittedAt: null as string | null,
             snapshot: null as string | null,
           }));
+        const absentCount = windowClosed ? notStarted.length : 0;
         return {
           examId: ex.id,
           title: ex.title,
           active: engaged.filter((a) => a.status === "in_progress").length,
           submitted: engaged.filter((a) => a.status !== "in_progress").length,
-          notStarted: notStarted.length,
+          notStarted: windowClosed ? 0 : notStarted.length,
+          absent: absentCount,
           students: [...enriched, ...notStarted],
         };
       }),
