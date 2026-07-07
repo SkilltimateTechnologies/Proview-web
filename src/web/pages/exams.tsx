@@ -38,18 +38,6 @@ function toLocalInput(ts: number | string | null | undefined): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-// Fixed IST time slots (09:00 AM → 10:00 PM, every 15 min).
-const TIME_SLOTS: string[] = (() => {
-  const out: string[] = [];
-  for (let m = 9 * 60; m <= 22 * 60; m += 15) out.push(`${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`);
-  return out;
-})();
-function slotLabel(hhmm: string): string {
-  const [h, m] = hhmm.split(":").map(Number);
-  const ap = h >= 12 ? "PM" : "AM";
-  const h12 = h % 12 === 0 ? 12 : h % 12;
-  return `${String(h12).padStart(2, "0")}:${String(m).padStart(2, "0")} ${ap}`;
-}
 // Combine a date (YYYY-MM-DD) + slot (HH:mm) into an IST wall-clock ISO string
 // that carries the +05:30 offset so the server stores the correct instant.
 function combineIST(dateStr: string, slot: string): number | null {
@@ -294,11 +282,8 @@ export function EditExam() {
           <Field label="Title"><input className="input" value={title} onChange={(e) => setTitle(e.target.value)} /></Field>
           <Field label="Duration (min)"><input className="input" type="number" value={durationMin} onChange={(e) => setDurationMin(Number(e.target.value))} /></Field>
           <Field label="Start date"><input className="input" type="date" value={date} onChange={(e) => setDate(e.target.value)} /></Field>
-          <Field label="Time slot (IST)">
-            <select className="input" value={slot} onChange={(e) => setSlot(e.target.value)}>
-              <option value="">Select a slot</option>
-              {TIME_SLOTS.map((s) => <option key={s} value={s}>{slotLabel(s)}</option>)}
-            </select>
+          <Field label="Time (IST)">
+            <input type="time" className="input" value={slot} onChange={(e) => setSlot(e.target.value)} />
           </Field>
         </div>
         {scheduled && (
@@ -436,11 +421,8 @@ export function NewExam() {
           <Field label="Title"><input className="input" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Mid-Sem Test" /></Field>
           <Field label="Duration (min)"><input className="input" type="number" value={durationMin} onChange={(e) => setDurationMin(Number(e.target.value))} /></Field>
           <Field label="Start date"><input className="input" type="date" value={date} onChange={(e) => setDate(e.target.value)} /></Field>
-          <Field label="Time slot (IST)">
-            <select className="input" value={slot} onChange={(e) => setSlot(e.target.value)}>
-              <option value="">Select a slot</option>
-              {TIME_SLOTS.map((s) => <option key={s} value={s}>{slotLabel(s)}</option>)}
-            </select>
+          <Field label="Time (IST)">
+            <input type="time" className="input" value={slot} onChange={(e) => setSlot(e.target.value)} />
           </Field>
         </div>
         {date && slot && (
