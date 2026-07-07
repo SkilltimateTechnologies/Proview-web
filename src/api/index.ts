@@ -1256,22 +1256,46 @@ const app = new Hono<{ Variables: Vars }>()
       const ms = startMs(e);
       return ms !== null && now >= ms;
     };
+    const endMs = (e: { endAt: number | string | null }) => {
+      if (e.endAt == null) return null;
+      const ms = typeof e.endAt === "number" ? e.endAt : new Date(e.endAt).getTime();
+      return Number.isNaN(ms) ? null : ms;
+    };
+    // A scheduled exam whose start time has passed is effectively LIVE.
+    const effStatus = (e: { status: string; startAt: number | string | null }) =>
+      e.status === "scheduled" && isStarted(e) ? "live" : e.status;
     const allExams = await db.select().from(schema.exams).where(eq(schema.exams.tenantId, tid)).orderBy(desc(schema.exams.createdAt));
     const rows =
       p.role === "tpo"
         ? allExams.filter((e) => e.status === "finished")
         : allExams.filter((e) => e.status === "finished" || e.status === "live" || (e.status === "scheduled" && isStarted(e)));
+    // All students in the tenant — used to size the "assigned" cohort per exam.
+    const allStudents = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, tid), eq(schema.students.enabled, true)));
+    const assignedFor = (e: { classId: string | null; sectionIds: string[] | null }) =>
+      allStudents.filter((stu) => {
+        if (e.classId && stu.classId && e.classId !== stu.classId) return false;
+        if (Array.isArray(e.sectionIds) && e.sectionIds.length && stu.classId && !e.sectionIds.includes(stu.classId)) return false;
+        return true;
+      }).length;
     const PASS_MARK = 40; // percentage
     const withStats = await Promise.all(
       rows.map(async (e) => {
         const atts = await db.select().from(schema.attempts).where(eq(schema.attempts.examId, e.id));
-        // "wrote" = students who actually attempted (submitted or graded)
-        const wrote = atts.filter((a) => a.status === "submitted" || a.status === "graded").length;
+        const assigned = assignedFor(e);
+        // finished = submitted/graded; inProgress = actively taking it
+        const finished = atts.filter((a) => a.status === "submitted" || a.status === "graded").length;
+        const inProgress = atts.filter((a) => a.status === "in_progress").length;
+        // absent = assigned students who never finished nor are in progress, but ONLY
+        // once the exam deadline has passed (before that they may still show up).
+        const deadline = endMs(e);
+        const deadlineOver = e.status === "finished" || (deadline !== null && now >= deadline);
+        const absent = deadlineOver ? Math.max(0, assigned - finished - inProgress) : 0;
         const graded = atts.filter((a) => a.score != null);
         const passed = graded.filter((a) => (a.score ?? 0) >= PASS_MARK).length;
         const failed = graded.filter((a) => (a.score ?? 0) < PASS_MARK).length;
         const avg = graded.length ? Math.round((graded.reduce((s, a) => s + (a.score ?? 0), 0) / graded.length) * 10) / 10 : 0;
-        return { ...e, attempts: atts.length, wrote, graded: graded.length, passed, failed, avg };
+        // "wrote" retained for backward compat (== finished).
+        return { ...e, status: effStatus(e), attempts: atts.length, assigned, finished, inProgress, absent, wrote: finished, graded: graded.length, passed, failed, avg };
       }),
     );
     // Newest assessment date first (startAt if set, else createdAt).

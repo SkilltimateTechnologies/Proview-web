@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useLocation } from "wouter";
-import { ChevronRight, Search, Users, CheckCircle2, XCircle } from "lucide-react";
+import { ChevronRight, Search, Users, CheckCircle2, Clock, UserX } from "lucide-react";
 import { api } from "../lib/api";
 import { useSession } from "../lib/session";
 import { PageHeader } from "../components/shell";
@@ -26,6 +26,10 @@ type Report = {
   title: string;
   status: string;
   attempts: number;
+  assigned: number;
+  finished: number;
+  inProgress: number;
+  absent: number;
   wrote: number;
   graded: number;
   passed: number;
@@ -63,12 +67,13 @@ export default function Reports() {
   const totals = useMemo(() => {
     return all.reduce(
       (acc, e) => {
-        acc.wrote += e.wrote;
-        acc.passed += e.passed;
-        acc.failed += e.failed;
+        acc.assigned += e.assigned;
+        acc.finished += e.finished;
+        acc.inProgress += e.inProgress;
+        acc.absent += e.absent;
         return acc;
       },
-      { wrote: 0, passed: 0, failed: 0 },
+      { assigned: 0, finished: 0, inProgress: 0, absent: 0 },
     );
   }, [all]);
 
@@ -86,10 +91,10 @@ export default function Reports() {
         <>
           {/* Summary stats across all conducted assessments */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-            <StatCard label="Assessments" value={all.length} icon={<Search size={18} />} />
-            <StatCard label="Students Wrote" value={totals.wrote} icon={<Users size={18} />} />
-            <StatCard label="Passed" value={totals.passed} icon={<CheckCircle2 size={18} />} tone="#2e7d5b" />
-            <StatCard label="Failed" value={totals.failed} icon={<XCircle size={18} />} tone="#c0453b" />
+            <StatCard label="Assigned" value={totals.assigned} icon={<Users size={18} />} />
+            <StatCard label="Finished" value={totals.finished} icon={<CheckCircle2 size={18} />} tone="#2e7d5b" />
+            <StatCard label="In Progress" value={totals.inProgress} icon={<Clock size={18} />} tone="#b7791f" />
+            <StatCard label="Absent" value={totals.absent} icon={<UserX size={18} />} tone="#c0453b" />
           </div>
 
           <div className="card p-3 mb-4 flex flex-wrap items-center gap-2">
@@ -121,17 +126,17 @@ export default function Reports() {
                     <tr>
                       <th className="text-left">Assessment</th>
                       <th className="text-left">Date Conducted</th>
-                      <th className="text-center">Wrote</th>
-                      <th className="text-center">Passed</th>
-                      <th className="text-center">Failed</th>
-                      <th className="text-center">Avg %</th>
+                      <th className="text-center">Assigned</th>
+                      <th className="text-center">Finished</th>
+                      <th className="text-center">In Progress</th>
+                      <th className="text-center">Absent</th>
                       <th className="text-left">Status</th>
                       <th className="w-10"></th>
                     </tr>
                   </thead>
                   <tbody>
                     {pg.pageItems.map((e) => {
-                      const passPct = e.graded ? Math.round((e.passed / e.graded) * 100) : 0;
+                      const donePct = e.assigned ? Math.round((e.finished / e.assigned) * 100) : 0;
                       return (
                         <tr
                           key={e.id}
@@ -140,17 +145,19 @@ export default function Reports() {
                         >
                           <td>
                             <div className="font-medium text-[var(--color-ink)]">{e.title}</div>
-                            <div className="mono-label mt-0.5">{passPct}% pass rate</div>
+                            <div className="mono-label mt-0.5">{donePct}% completed</div>
                           </td>
                           <td className="text-left text-[var(--color-ink)]">{fmtConducted(e.startAt ?? e.createdAt)}</td>
-                          <td className="text-center font-medium text-[var(--color-ink)]">{e.wrote}</td>
+                          <td className="text-center font-medium text-[var(--color-ink)]">{e.assigned}</td>
                           <td className="text-center">
-                            <span className="font-semibold" style={{ color: "#2e7d5b" }}>{e.passed}</span>
+                            <span className="font-semibold" style={{ color: "#2e7d5b" }}>{e.finished}</span>
                           </td>
                           <td className="text-center">
-                            <span className="font-semibold" style={{ color: "#c0453b" }}>{e.failed}</span>
+                            <span className="font-semibold" style={{ color: "#b7791f" }}>{e.inProgress}</span>
                           </td>
-                          <td className="text-center font-medium text-[var(--color-ink)]">{e.avg}</td>
+                          <td className="text-center">
+                            <span className="font-semibold" style={{ color: "#c0453b" }}>{e.absent}</span>
+                          </td>
                           <td>
                             <Pill label={e.status.toUpperCase()} color={STATUS_COLOR[e.status]} />
                           </td>
