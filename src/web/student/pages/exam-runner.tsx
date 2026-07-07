@@ -1160,7 +1160,7 @@ function CodingInput({ q, value, onChange, online }: { q: BundleQuestion; value:
           </div>
         </div>
       )}
-      {out && (
+      {out && !needsInput && (
         <div style={{ marginTop: 12 }}>
           <div className="mono-label" style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
             <Icon name={out.ok ? "terminal" : "triangle-alert"} size={13} /> Output{out.status ? ` · ${out.status}` : ""}
