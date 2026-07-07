@@ -1059,6 +1059,14 @@ function CodingInput({ q, value, onChange, online }: { q: BundleQuestion; value:
     }
   }
 
+  // Program tried to read input but the stdin box was empty → surface a clear hint
+  // instead of the cryptic EOFError / NoSuchElementException from the runner.
+  const needsInput =
+    !!out &&
+    !out.ok &&
+    !stdin.trim() &&
+    /EOFError|EOF when reading|NoSuchElementException|InputMismatchException|unexpected end of input|end of file|Scanner|no line found/i.test(out.text);
+
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
@@ -1069,10 +1077,21 @@ function CodingInput({ q, value, onChange, online }: { q: BundleQuestion; value:
       </div>
       <CodeEditor code={code} language={language} onChange={(v) => onChange(v)} />
       <div style={{ marginTop: 12 }}>
-        <div className="mono-label" style={{ marginBottom: 6 }}>Custom input (stdin) — optional</div>
-        <textarea className="code-area" style={{ minHeight: 60 }} value={stdin} spellCheck={false} onChange={(e) => setStdin(e.target.value)} placeholder="Input passed to your program when you press Run" />
+        <div className="mono-label" style={{ marginBottom: 4 }}>Custom input (stdin)</div>
+        <div style={{ fontSize: 12, color: "var(--color-text-dim, #8ba0b8)", marginBottom: 6, lineHeight: 1.5 }}>
+          If your program reads input (e.g. <code style={{ fontFamily: "var(--font-mono)" }}>input()</code>, <code style={{ fontFamily: "var(--font-mono)" }}>Scanner</code>, <code style={{ fontFamily: "var(--font-mono)" }}>scanf</code>), type the values here — one per line — before you press Run.
+        </div>
+        <textarea className="code-area" style={{ minHeight: 60 }} value={stdin} spellCheck={false} onChange={(e) => setStdin(e.target.value)} placeholder={"Type the input your program expects, e.g.\n5"} />
       </div>
       {!online && <div style={{ marginTop: 8, fontSize: 12.5, color: "var(--color-warn)" }}>Reconnect to run your code.</div>}
+      {needsInput && (
+        <div style={{ marginTop: 12, display: "flex", gap: 9, alignItems: "flex-start", background: "rgba(245,183,66,.12)", border: "1px solid rgba(245,183,66,.4)", borderRadius: 11, padding: "11px 13px" }}>
+          <Icon name="info" size={15} style={{ marginTop: 1, color: "var(--color-warn, #f5b742)", flexShrink: 0 }} />
+          <div style={{ fontSize: 12.8, lineHeight: 1.55 }}>
+            Your program is waiting for input but none was provided. Type the value(s) it expects in the <b>Custom input (stdin)</b> box above, then press <b>Run code</b> again.
+          </div>
+        </div>
+      )}
       {out && (
         <div style={{ marginTop: 12 }}>
           <div className="mono-label" style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
