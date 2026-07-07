@@ -30,10 +30,19 @@ function fmtClock(ms: number): string {
 // localStorage bridge so an in-progress exam survives a forced logout/relogin
 // (used when the internet drops mid-exam and we bounce the student to login).
 const ACTIVE_EXAM_KEY = "examly:activeExam";
-type SavedProgress = { answers: Record<string, unknown>; flags: Record<string, boolean>; cur?: number };
+// We persist attemptId + the server-anchored absolute endAt alongside answers so
+// that a REFRESH WHILE OFFLINE can rebuild the running session without hitting the
+// network. endAt is an absolute wall-clock deadline (not a countdown), so it stays
+// honest across a reload; the online heartbeat re-reads the authoritative server
+// endAt on reconnect and corrects any drift (admin hold / extra time).
+type SavedProgress = { answers: Record<string, unknown>; flags: Record<string, boolean>; cur?: number; attemptId?: string; endAt?: number };
 function progressKey(examId: string) { return `examly:progress:${examId}`; }
 function saveProgress(examId: string, p: SavedProgress) {
-  try { localStorage.setItem(progressKey(examId), JSON.stringify(p)); } catch { /* ignore */ }
+  try {
+    // Merge so a partial save (e.g. answers only) never wipes attemptId/endAt.
+    const prev = loadProgress(examId) ?? {};
+    localStorage.setItem(progressKey(examId), JSON.stringify({ ...prev, ...p }));
+  } catch { /* ignore */ }
 }
 function loadProgress(examId: string): SavedProgress | null {
   try {
@@ -42,7 +51,20 @@ function loadProgress(examId: string): SavedProgress | null {
   } catch { return null; }
 }
 function clearProgress(examId: string) {
-  try { localStorage.removeItem(progressKey(examId)); localStorage.removeItem(ACTIVE_EXAM_KEY); } catch { /* ignore */ }
+  try { localStorage.removeItem(progressKey(examId)); localStorage.removeItem(ACTIVE_EXAM_KEY); localStorage.removeItem(bundleKey(examId)); } catch { /* ignore */ }
+}
+
+// Cache the exam bundle locally so a mid-exam refresh works even with no internet
+// (the bundle is otherwise fetched fresh from the server on every mount).
+function bundleKey(examId: string) { return `examly:bundle:${examId}`; }
+function cacheBundle(examId: string, b: Bundle) {
+  try { localStorage.setItem(bundleKey(examId), JSON.stringify(b)); } catch { /* ignore */ }
+}
+function loadCachedBundle(examId: string): Bundle | null {
+  try {
+    const raw = localStorage.getItem(bundleKey(examId));
+    return raw ? (JSON.parse(raw) as Bundle) : null;
+  } catch { return null; }
 }
 
 export function ExamRunner() {
@@ -114,10 +136,18 @@ export function ExamRunner() {
   }, []);
 
   // ---- Load bundle for the brief (title/meta + question data) ----
+  // Offline-first: hydrate immediately from the local cache (so a refresh works
+  // with no internet), then refresh from the server in the background and re-cache.
   useEffect(() => {
     if (!examId) return;
-    api.bundle(examId).then(setBundle).catch(() => {
-      setErr("Couldn't load the exam. Check your connection and try again.");
+    const cached = loadCachedBundle(examId);
+    if (cached) setBundle(cached);
+    api.bundle(examId).then((b) => {
+      setBundle(b);
+      cacheBundle(examId, b);
+    }).catch(() => {
+      // Only surface the error if we have nothing cached to fall back to.
+      if (!loadCachedBundle(examId)) setErr("Couldn't load the exam. Check your connection and try again.");
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [examId]);
@@ -203,6 +233,8 @@ export function ExamRunner() {
         flags: saved?.flags ?? {},
         integrityEvents: [],
       });
+      // Persist attemptId + absolute deadline so an offline refresh can resume.
+      saveProgress(examId, { attemptId: start.attemptId, endAt, answers: saved?.answers ?? {}, flags: saved?.flags ?? {}, cur: curRef.current });
       setHeld(!!start.held);
       enterRunning();
     } catch (e) {
@@ -228,6 +260,31 @@ export function ExamRunner() {
   useEffect(() => {
     if (!examId || !bundle || resumeCheckedRef.current) return;
     resumeCheckedRef.current = true;
+    // OFFLINE refresh: the server is unreachable, so rebuild the running session
+    // purely from local storage (attemptId + saved absolute endAt + answers). The
+    // heartbeat will re-read the authoritative server endAt once we're back online.
+    const resumeOffline = () => {
+      const saved = loadProgress(examId);
+      if (!saved?.attemptId || !saved.endAt) return false;
+      setSession({
+        attemptId: saved.attemptId,
+        endAt: saved.endAt,
+        answers: saved.answers ?? {},
+        flags: saved.flags ?? {},
+        integrityEvents: [],
+      });
+      if (typeof saved.cur === "number" && Number.isFinite(saved.cur)) setCur(saved.cur);
+      const cfg = proctoringRef.current;
+      if (cfg.requireWebcam || cfg.fullscreenRequired || cfg.requireSingleScreen) {
+        setPhase("resume");
+        if (cfg.requireWebcam) void enableCamera();
+        if (cfg.requireSingleScreen) void getDisplayCount().then(setDisplayCount).catch(() => {});
+      } else {
+        enterRunning();
+      }
+      return true;
+    };
+    if (!navigator.onLine) { resumeOffline(); return; }
     void (async () => {
       try {
         const st = await api.status(examId);
@@ -248,6 +305,8 @@ export function ExamRunner() {
           flags: saved?.flags ?? {},
           integrityEvents: [],
         });
+        // Refresh the persisted attemptId + deadline from the authoritative server.
+        saveProgress(examId, { attemptId: st.attemptId, endAt, answers: saved?.answers ?? {}, flags: saved?.flags ?? {}, cur: saved?.cur });
         if (typeof saved?.cur === "number" && Number.isFinite(saved.cur)) setCur(saved.cur);
         setHeld(!!st.held);
         const cfg = proctoringRef.current;
@@ -261,7 +320,11 @@ export function ExamRunner() {
         } else {
           enterRunning();
         }
-      } catch { /* leave on brief — student can start normally */ }
+      } catch {
+        // Network died during the probe — try rebuilding from local storage so a
+        // refresh mid-outage still resumes; otherwise leave on brief.
+        resumeOffline();
+      }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [examId, bundle]);
@@ -332,7 +395,12 @@ export function ExamRunner() {
           if (stopped) return;
           setHeld(!!info.held);
           const newEnd = new Date(info.endAt).getTime();
-          if (Number.isFinite(newEnd)) setSession((prev) => (prev && newEnd !== prev.endAt ? { ...prev, endAt: newEnd } : prev));
+          if (Number.isFinite(newEnd)) {
+            setSession((prev) => (prev && newEnd !== prev.endAt ? { ...prev, endAt: newEnd } : prev));
+            // Persist the latest server deadline so an offline refresh honours
+            // any admin extra-time / hold that landed earlier.
+            saveProgress(examId, { endAt: newEnd });
+          }
         })
         .catch(() => {});
     };
