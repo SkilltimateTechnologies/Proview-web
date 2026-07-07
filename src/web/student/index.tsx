@@ -1,4 +1,4 @@
-import { Route, Switch, Redirect, Router } from "wouter";
+import { Route, Switch, Redirect, Router, useLocation } from "wouter";
 import { SessionProvider, useSession } from "./lib/session";
 import { Login } from "./pages/login";
 import { Shell } from "./pages/shell";
@@ -28,6 +28,11 @@ function Exit() {
 
 function Routes() {
   const { student } = useSession();
+  // Subscribe to location so this component re-evaluates the activeExam guard on
+  // every navigation. Without this, Routes only re-renders on session changes, so
+  // after an exam is submitted (which clears "examly:activeExam") the stale guard
+  // branch below would keep redirecting "Back to dashboard" straight to the exam.
+  useLocation();
 
   if (!student) {
     return (

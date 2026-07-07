@@ -498,7 +498,7 @@ export function ExamRunner() {
           <div style={{ display: "flex", gap: 8, justifyContent: "center", alignItems: "center", color: "var(--color-ink2)", background: "var(--color-brand-soft)", borderRadius: 12, padding: "12px 14px", marginBottom: 22, fontSize: 13.5 }}>
             <Icon name="lock" size={15} /> Results unlock after the exam closes for everyone.
           </div>
-          <button className="btn btn-primary" style={{ width: "100%", padding: 12 }} onClick={() => navigate("/")}>
+          <button className="btn btn-primary" style={{ width: "100%", padding: 12 }} onClick={() => { if (examId) clearProgress(examId); navigate("/"); }}>
             <Icon name="layout-dashboard" /> Back to dashboard
           </button>
         </div>
