@@ -29,7 +29,7 @@ export function Review() {
             <div style={{ fontWeight: 700, fontSize: 16 }}>{data.exam?.title}</div>
           </div>
         </div>
-        <div style={{ textAlign: "right" }}><div className="mono-label">Score</div><div className="stat-num" style={{ fontSize: 20 }}>{data.attempt.score ?? 0}%</div></div>
+        <div style={{ textAlign: "right" }}><div className="mono-label">Score</div><div className="stat-num" style={{ fontSize: 20 }}>{data.attempt.score ?? 0}/100</div></div>
       </header>
 
       <main className="content">
@@ -49,7 +49,7 @@ export function ReviewBody({ data }: { data: ReviewData }) {
       <div className="card" style={{ padding: 18, marginBottom: 20, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
         <div>
           <div className="mono-label">Score</div>
-          <div className="stat-num" style={{ fontSize: 26, color: "var(--brand)" }}>{data.attempt.score ?? 0}%</div>
+          <div className="stat-num" style={{ fontSize: 26, color: "var(--brand)" }}>{data.attempt.score ?? 0}/100</div>
         </div>
         <div style={{ textAlign: "right" }}>
           <div className="mono-label">Marks earned</div>

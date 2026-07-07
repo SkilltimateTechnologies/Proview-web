@@ -234,7 +234,7 @@ export default function Monitor() {
                               </td>
                               <td className="text-right">
                                 {s.status === "finished" && s.graded && s.score != null ? (
-                                  <span className="stat-num text-sm" style={{ color: s.score >= 100 ? "#2e7d5b" : s.score <= 0 ? "#c0453b" : "#b7791f" }}>{s.score}%</span>
+                                  <span className="stat-num text-sm" style={{ color: s.score >= 100 ? "#2e7d5b" : s.score <= 0 ? "#c0453b" : "#b7791f" }}>{s.score}/100</span>
                                 ) : s.status === "finished" ? (
                                   <span className="mono-label text-[var(--color-muted)]">Grading…</span>
                                 ) : (
@@ -309,7 +309,7 @@ function StudentDrawer({ s, onClose }: { s: LiveStudent; onClose: () => void }) 
           <Pill label="NOT STARTED" color="#8a8f98" />
         )}
         {s.status === "finished" && s.graded && s.score != null && (
-          <Pill label={`SCORE ${s.score}%`} color={s.score >= 100 ? "#2e7d5b" : s.score <= 0 ? "#c0453b" : "#b7791f"} />
+          <Pill label={`SCORE ${s.score}/100`} color={s.score >= 100 ? "#2e7d5b" : s.score <= 0 ? "#c0453b" : "#b7791f"} />
         )}
         {s.status !== "not_started" && s.status !== "absent" && (
           <span className="inline-flex items-center gap-1.5 text-sm text-[var(--color-ink2)]"><Clock size={14} /> Started {fmtTime(s.startedAt)}</span>

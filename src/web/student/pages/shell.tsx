@@ -254,7 +254,9 @@ function ExamCard({ e, children }: { e: ExamListItem; children: React.ReactNode 
       <div className="exam-meta">
         <div className="m"><span className="mono-label">Questions</span><span className="m-v">{e.questionCount}</span></div>
         <div className="m"><span className="mono-label">Duration</span><span className="m-v">{e.durationMin} min</span></div>
-        <div className="m"><span className="mono-label">Points</span><span className="m-v">{e.totalPoints}</span></div>
+        {e.attempt?.status === "graded" && e.attempt?.score != null
+          ? <div className="m"><span className="mono-label">Score</span><span className="m-v">{e.attempt.score}/100</span></div>
+          : <div className="m"><span className="mono-label">Points</span><span className="m-v">{e.totalPoints}</span></div>}
         {e.startAt && <div className="m"><span className="mono-label">Starts</span><span className="m-v" style={{ fontSize: 14 }}>{fmtDate(e.startAt)}</span></div>}
       </div>
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>{children}</div>
@@ -278,7 +280,6 @@ function FinishedList({ exams, onOpen }: { exams: ExamListItem[]; onOpen: (attem
             </div>
           ) : (
             <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-              {e.attempt?.score != null && <div style={{ textAlign: "right" }}><div className="mono-label">Score</div><div className="stat-num" style={{ fontSize: 20 }}>{e.attempt.score}%</div></div>}
               {e.attempt && e.resultsReady && <button className="btn btn-ghost" onClick={() => onOpen(e.attempt!.id)}><Icon name="file-search" /> Review answers</button>}
             </div>
           )}
@@ -406,7 +407,6 @@ function Dashboard({ finished, onReview }: { finished: ExamListItem[]; onReview:
                   </div>
                 ) : (
                   <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-                    {e.attempt?.score != null && <div style={{ textAlign: "right" }}><div className="mono-label">Score</div><div className="stat-num" style={{ fontSize: 20 }}>{e.attempt.score}%</div></div>}
                     {e.attempt && e.resultsReady && <button className="btn btn-ghost" onClick={() => onReview(e.attempt!.id)}><Icon name="file-search" /> Review</button>}
                   </div>
                 )}
