@@ -1212,10 +1212,13 @@ const app = new Hono<{ Variables: Vars }>()
       if (!classScores.has(cid)) classScores.set(cid, []);
       classScores.get(cid)!.push(a.score ?? 0);
     }
-    const classAvg = classes.map((cl) => {
-      const arr = classScores.get(cl.id) ?? [];
-      return { code: cl.code, avg: arr.length ? Math.round((arr.reduce((s, v) => s + v, 0) / arr.length) * 10) / 10 : 0 };
-    });
+    const classAvg = classes
+      .map((cl) => {
+        const arr = classScores.get(cl.id) ?? [];
+        if (!arr.length) return null;
+        return { code: cl.code, avg: Math.round((arr.reduce((s, v) => s + v, 0) / arr.length) * 10) / 10 };
+      })
+      .filter((x): x is { code: string; avg: number } => x != null);
 
     // trend across finished exams (avg per exam)
     const trend = finishedExams.slice(-6).map((e) => {
@@ -1240,15 +1243,17 @@ const app = new Hono<{ Variables: Vars }>()
       .sort((a, b) => b.avg - a.avg)
       .slice(0, 8);
 
-    // class toppers
-    const classToppers = classes.map((cl) => {
-      const inClass = topStudents.filter((s) => s.classCode === cl.code);
-      const best = [...stuScores.entries()]
-        .map(([sid, arr]) => ({ s: smap.get(sid), avg: arr.reduce((a, b) => a + b, 0) / arr.length }))
-        .filter((x) => x.s?.classId === cl.id)
-        .sort((a, b) => b.avg - a.avg)[0];
-      return { code: cl.code, name: best?.s?.name ?? "—", score: best ? Math.round(best.avg * 10) / 10 : 0 };
-    });
+    // class toppers (only classes that actually have a graded student)
+    const classToppers = classes
+      .map((cl) => {
+        const best = [...stuScores.entries()]
+          .map(([sid, arr]) => ({ s: smap.get(sid), avg: arr.reduce((a, b) => a + b, 0) / arr.length }))
+          .filter((x) => x.s?.classId === cl.id)
+          .sort((a, b) => b.avg - a.avg)[0];
+        if (!best?.s) return null;
+        return { code: cl.code, name: best.s.name, score: Math.round(best.avg * 10) / 10 };
+      })
+      .filter((t): t is { code: string; name: string; score: number } => t != null);
 
     // settings for limit alert (platform-global)
     const s = await getGlobalSettings();
