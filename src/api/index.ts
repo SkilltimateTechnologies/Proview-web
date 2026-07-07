@@ -821,7 +821,8 @@ const app = new Hono<{ Variables: Vars }>()
       java: 62, c: 50, cpp: 54, "c++": 54, csharp: 51, "c#": 51,
       go: 60, ruby: 72, php: 68, typescript: 74, ts: 74, kotlin: 78, swift: 83, rust: 73,
     };
-    const languageId = LANG[language] ?? 71;
+    const reqLangId = Number(b.languageId);
+    const languageId = Number.isFinite(reqLangId) && reqLangId > 0 ? reqLangId : (LANG[language] ?? 71);
 
     try {
       const res = await fetch("https://judge0-ce.p.rapidapi.com/submissions?base64_encoded=false&wait=true", {

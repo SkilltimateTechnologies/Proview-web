@@ -41,7 +41,7 @@ export type BundleQuestion = {
   options: string[] | null;
   difficulty: string;
   topic: string | null;
-  meta: { language?: string; starter?: string };
+  meta: { language?: string; starter?: string; languageId?: number; languageLabel?: string };
 };
 
 export type ProctorConfig = {
@@ -137,9 +137,9 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   review: (attemptId: string) => req<Review>(`/student/attempts/${attemptId}/review`),
-  runCode: (source: string, language: string, stdin?: string) =>
+  runCode: (source: string, language: string, stdin?: string, languageId?: number) =>
     req<{ ok: boolean; stdout: string; stderr: string; compileOutput: string; status: string; time: string | null; memory: number | null }>("/student/run-code", {
       method: "POST",
-      body: JSON.stringify({ source, language, stdin: stdin ?? "" }),
+      body: JSON.stringify({ source, language, languageId, stdin: stdin ?? "" }),
     }),
 };

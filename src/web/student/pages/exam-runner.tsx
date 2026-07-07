@@ -886,6 +886,8 @@ function CodeEditor({ code, language, onChange }: { code: string; language: stri
 function CodingInput({ q, value, onChange, online }: { q: BundleQuestion; value: unknown; onChange: (v: unknown) => void; online: boolean }) {
   const code = (value as string) ?? q.meta.starter ?? "";
   const language = q.meta.language || "python";
+  const languageId = q.meta.languageId;
+  const languageLabel = q.meta.languageLabel || language;
   const [stdin, setStdin] = useState("");
   const [running, setRunning] = useState(false);
   const [out, setOut] = useState<{ ok: boolean; text: string; status?: string } | null>(null);
@@ -894,7 +896,7 @@ function CodingInput({ q, value, onChange, online }: { q: BundleQuestion; value:
     setRunning(true);
     setOut(null);
     try {
-      const res = await api.runCode(code, language, stdin);
+      const res = await api.runCode(code, language, stdin, languageId);
       const parts = [res.compileOutput, res.stderr, res.stdout].map((x) => (x || "").trim()).filter(Boolean);
       setOut({ ok: !(res.stderr || res.compileOutput), text: parts.join("\n\n") || "(no output)", status: res.status });
     } catch (e) {
@@ -907,7 +909,7 @@ function CodingInput({ q, value, onChange, online }: { q: BundleQuestion; value:
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-        <div className="mono-label">{language} · your solution</div>
+        <div className="mono-label">{languageLabel} · your solution</div>
         <button className="btn btn-ghost btn-sm" onClick={() => void run()} disabled={running || !online || !code.trim()}>
           {running ? <Icon name="loader-circle" className="animate-spin" size={14} /> : <Icon name="play" size={14} />} {running ? "Running…" : "Run code"}
         </button>

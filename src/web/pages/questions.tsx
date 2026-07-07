@@ -16,21 +16,51 @@ const TYPES = [
 ];
 const TYPE_LABEL: Record<string, string> = Object.fromEntries(TYPES.map((t) => [t.v, t.label]));
 
-// Languages supported by the Judge0 runner + student IDE highlighter.
-const CODE_LANGS = [
-  { v: "python", label: "Python 3" },
-  { v: "java", label: "Java" },
-  { v: "cpp", label: "C++" },
-  { v: "c", label: "C" },
-  { v: "csharp", label: "C#" },
-  { v: "javascript", label: "JavaScript (Node)" },
-  { v: "typescript", label: "TypeScript" },
-  { v: "go", label: "Go" },
-  { v: "ruby", label: "Ruby" },
-  { v: "php", label: "PHP" },
-  { v: "kotlin", label: "Kotlin" },
-  { v: "swift", label: "Swift" },
-  { v: "rust", label: "Rust" },
+// Full Judge0 CE language catalog (RapidAPI). id = Judge0 language_id used by the runner;
+// hl = syntax-highlight family for the student IDE; label = shown in the picker.
+const CODE_LANGS: { id: number; hl: string; label: string }[] = [
+  // Most-used first
+  { id: 71, hl: "python", label: "Python (3.8)" },
+  { id: 62, hl: "java", label: "Java (OpenJDK 13)" },
+  { id: 54, hl: "cpp", label: "C++ (GCC 9.2)" },
+  { id: 50, hl: "c", label: "C (GCC 9.2)" },
+  { id: 51, hl: "csharp", label: "C# (Mono 6.6)" },
+  { id: 63, hl: "javascript", label: "JavaScript (Node 12)" },
+  { id: 74, hl: "typescript", label: "TypeScript (3.7)" },
+  { id: 60, hl: "go", label: "Go (1.13)" },
+  { id: 72, hl: "ruby", label: "Ruby (2.7)" },
+  { id: 68, hl: "php", label: "PHP (7.4)" },
+  { id: 78, hl: "java", label: "Kotlin (1.3)" },
+  { id: 83, hl: "swift", label: "Swift (5.2)" },
+  { id: 73, hl: "rust", label: "Rust (1.40)" },
+  { id: 70, hl: "python", label: "Python (2.7)" },
+  // Everything else Judge0 CE supports
+  { id: 45, hl: "c", label: "Assembly (NASM 2.14)" },
+  { id: 46, hl: "bash", label: "Bash (5.0)" },
+  { id: 47, hl: "c", label: "Basic (FBC 1.07)" },
+  { id: 48, hl: "c", label: "C (GCC 7.4)" },
+  { id: 49, hl: "c", label: "C (GCC 8.3)" },
+  { id: 52, hl: "cpp", label: "C++ (GCC 7.4)" },
+  { id: 53, hl: "cpp", label: "C++ (GCC 8.3)" },
+  { id: 77, hl: "c", label: "COBOL (GnuCOBOL 2.2)" },
+  { id: 55, hl: "python", label: "Common Lisp (SBCL 2.0)" },
+  { id: 56, hl: "c", label: "D (DMD 2.089)" },
+  { id: 57, hl: "python", label: "Elixir (1.9)" },
+  { id: 58, hl: "python", label: "Erlang (OTP 22)" },
+  { id: 59, hl: "c", label: "Fortran (GFortran 9.2)" },
+  { id: 88, hl: "java", label: "Groovy (3.0)" },
+  { id: 61, hl: "python", label: "Haskell (GHC 8.8)" },
+  { id: 64, hl: "python", label: "Lua (5.3)" },
+  { id: 79, hl: "c", label: "Objective-C (Clang 7)" },
+  { id: 65, hl: "python", label: "OCaml (4.09)" },
+  { id: 66, hl: "python", label: "Octave (5.1)" },
+  { id: 67, hl: "c", label: "Pascal (FPC 3.0)" },
+  { id: 85, hl: "c", label: "Perl (5.28)" },
+  { id: 69, hl: "python", label: "Prolog (GNU 1.4)" },
+  { id: 80, hl: "python", label: "R (4.0)" },
+  { id: 81, hl: "java", label: "Scala (2.13)" },
+  { id: 82, hl: "python", label: "SQL (SQLite 3.27)" },
+  { id: 84, hl: "csharp", label: "Visual Basic .NET" },
 ];
 
 type Gen = { type: string; prompt: string; options?: string[]; correct?: unknown; points?: number; difficulty?: string; meta?: Record<string, unknown> };
@@ -316,7 +346,8 @@ function ManualForm({ categoryId, initial, onClose }: { categoryId: string; init
   const [difficulty, setDifficulty] = useState(initial?.difficulty ?? "medium");
   const [isGlobal, setIsGlobal] = useState(initial ? initial.isGlobal !== false : true);
   const [explanation, setExplanation] = useState<string>((initial?.meta as any)?.explanation ?? "");
-  const [codeLang, setCodeLang] = useState<string>((initial?.meta as any)?.language ?? "python");
+  const [codeLangId, setCodeLangId] = useState<number>((initial?.meta as any)?.languageId ?? 71);
+  const codeLang = CODE_LANGS.find((l) => l.id === codeLangId) ?? CODE_LANGS[0];
   const [starter, setStarter] = useState<string>((initial?.meta as any)?.starter ?? "");
 
   const hasOptions = ["mcq", "multi", "fillblank"].includes(type);
@@ -340,7 +371,7 @@ function ManualForm({ categoryId, initial, onClose }: { categoryId: string; init
         meta: {
           ...(initial?.meta ?? {}),
           explanation: explanation.trim() || undefined,
-          ...(type === "coding" ? { language: codeLang, starter: starter || undefined } : {}),
+          ...(type === "coding" ? { language: codeLang.hl, languageId: codeLang.id, languageLabel: codeLang.label, starter: starter || undefined } : {}),
         },
       };
       if (initial) return (await api.questions[":id"].$patch({ param: { id: initial.id }, json })).json();
@@ -423,8 +454,8 @@ function ManualForm({ categoryId, initial, onClose }: { categoryId: string; init
         <div className="mt-4 space-y-4">
           <div className="grid sm:grid-cols-2 gap-4">
             <Field label="Programming language">
-              <select className="input" value={codeLang} onChange={(e) => setCodeLang(e.target.value)}>
-                {CODE_LANGS.map((l) => <option key={l.v} value={l.v}>{l.label}</option>)}
+              <select className="input" value={codeLangId} onChange={(e) => setCodeLangId(Number(e.target.value))}>
+                {CODE_LANGS.map((l) => <option key={l.id} value={l.id}>{l.label}</option>)}
               </select>
             </Field>
           </div>
@@ -434,12 +465,12 @@ function ManualForm({ categoryId, initial, onClose }: { categoryId: string; init
               rows={6}
               value={starter}
               onChange={(e) => setStarter(e.target.value)}
-              placeholder={`# Students see this in the ${codeLang} editor as a starting point…`}
+              placeholder={`# Students see this in the ${codeLang.label} editor as a starting point…`}
               spellCheck={false}
             />
           </Field>
           <div className="text-sm text-[var(--color-ink2)] bg-[var(--color-brand-soft)] rounded-lg px-3 py-2">
-            The student's IDE loads in <b>{CODE_LANGS.find((l) => l.v === codeLang)?.label ?? codeLang}</b> and runs against Judge0. Graded by AI at submission time.
+            The student's IDE loads in <b>{codeLang.label}</b> and runs against Judge0.
           </div>
         </div>
       )}
