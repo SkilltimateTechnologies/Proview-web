@@ -1082,20 +1082,40 @@ const app = new Hono<{ Variables: Vars }>()
     const p = c.get("profile")!;
     const tid = p.tenantId;
     if (!tid) return c.json({ live: [], nextScheduled: null }, 200);
-    const liveExams = await db.select().from(schema.exams).where(and(eq(schema.exams.tenantId, tid), eq(schema.exams.status, "live")));
+    const now = Date.now();
+    // An exam is effectively live when its DB status is "live", OR when it is
+    // still "scheduled" but its start time has already passed (students can start
+    // it at that point). This mirrors the "LIVE / In progress" badge on the
+    // Schedule Assessment list, which is derived the same way. Without this, a
+    // scheduled exam whose start time passed would show as live on the list but
+    // never appear in the Live Monitor.
+    const startMs = (e: { startAt: number | string | null }) => {
+      if (e.startAt == null) return null;
+      const ms = typeof e.startAt === "number" ? e.startAt : new Date(e.startAt).getTime();
+      return Number.isNaN(ms) ? null : ms;
+    };
+    const dbLive = await db.select().from(schema.exams).where(and(eq(schema.exams.tenantId, tid), eq(schema.exams.status, "live")));
+    const scheduled = await db
+      .select()
+      .from(schema.exams)
+      .where(and(eq(schema.exams.tenantId, tid), eq(schema.exams.status, "scheduled")))
+      .orderBy(schema.exams.startAt);
+    const startedScheduled = scheduled.filter((e) => {
+      const ms = startMs(e);
+      return ms !== null && now >= ms;
+    });
+    const liveExams = [...dbLive, ...startedScheduled];
 
     // Next scheduled exam (for empty-state messaging when nothing is live).
     let nextScheduled: { examId: string; title: string; startAt: number | null } | null = null;
     if (!liveExams.length) {
-      const scheduled = await db
-        .select()
-        .from(schema.exams)
-        .where(and(eq(schema.exams.tenantId, tid), eq(schema.exams.status, "scheduled")))
-        .orderBy(schema.exams.startAt);
       const upcoming = scheduled
-        .filter((e) => e.startAt && new Date(e.startAt).getTime() >= Date.now())
-        .sort((a, b) => new Date(a.startAt!).getTime() - new Date(b.startAt!).getTime())[0];
-      if (upcoming) nextScheduled = { examId: upcoming.id, title: upcoming.title, startAt: upcoming.startAt ? new Date(upcoming.startAt).getTime() : null };
+        .filter((e) => {
+          const ms = startMs(e);
+          return ms !== null && ms >= now;
+        })
+        .sort((a, b) => startMs(a)! - startMs(b)!)[0];
+      if (upcoming) nextScheduled = { examId: upcoming.id, title: upcoming.title, startAt: startMs(upcoming) };
     }
 
     const out = await Promise.all(
