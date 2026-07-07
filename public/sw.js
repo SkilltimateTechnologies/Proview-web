@@ -7,7 +7,7 @@
  * hashed JS/CSS bundles, leaving a blank page. This worker caches the app
  * shell so the SPA always loads offline; the app then restores exam state.
  */
-const CACHE = "proview-shell-v1";
+const CACHE = "proview-shell-v2";
 
 self.addEventListener("install", (event) => {
   // Pre-cache the app shell so the very first offline refresh has index.html.
@@ -24,6 +24,26 @@ self.addEventListener("activate", (event) => {
       await Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)));
       await self.clients.claim();
     })(),
+  );
+});
+
+// The client hands us the exact set of app-shell assets it loaded (index.html
+// + hashed JS/CSS/fonts). We pre-cache them while online so an offline refresh
+// can boot the SPA. Those initial requests never hit our fetch handler because
+// the worker was not yet controlling the page, so this warm-up is essential.
+self.addEventListener("message", (event) => {
+  const data = event.data;
+  if (!data || data.type !== "CACHE_ASSETS" || !Array.isArray(data.urls)) return;
+  event.waitUntil(
+    caches.open(CACHE).then((cache) =>
+      Promise.all(
+        data.urls.map((u) =>
+          fetch(u, { cache: "no-cache" })
+            .then((res) => (res && res.ok ? cache.put(u, res.clone()) : undefined))
+            .catch(() => {}),
+        ),
+      ),
+    ),
   );
 });
 
