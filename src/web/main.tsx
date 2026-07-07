@@ -12,6 +12,14 @@ const queryClient = new QueryClient();
 // Any other URL falls through to the admin app (which shows the admin login).
 const isStudent = window.location.pathname.startsWith("/px9k2m7");
 
+// Register the offline app-shell worker so an exam survives an internet drop
+// plus a page refresh (the SPA boots from cache, then resumes from localStorage).
+if ("serviceWorker" in navigator) {
+	window.addEventListener("load", () => {
+		navigator.serviceWorker.register("/sw.js").catch(() => {});
+	});
+}
+
 createRoot(document.getElementById("root")!).render(
 	<StrictMode>
 		{isStudent ? (

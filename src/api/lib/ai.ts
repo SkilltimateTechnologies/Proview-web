@@ -63,17 +63,42 @@ export async function gradeSubjective(opts: {
   provider?: string | null;
 }): Promise<{ score: number; notes: string }> {
   const { question, rubric, studentAnswer, maxPoints, isCode, language, provider } = opts;
-  const prompt = `You are grading a student's ${isCode ? `code (${language})` : "answer"} for an engineering exam.
+
+  const prompt = isCode
+    ? `You are grading a student's code (${language || "unknown language"}) written in a browser-based exam IDE.
+
+READ THIS GRADING CONTEXT CAREFULLY — IT OVERRIDES YOUR DEFAULT INSTINCTS:
+- The exam IDE has NO standard input (stdin). Students are REQUIRED to hardcode / declare their own sample values (e.g. n = 121) to demonstrate their logic. This is correct, expected exam practice.
+  * NEVER deduct marks for hardcoded values, a declared variable instead of input(), or "not taking user input / not being general / reusability". Treat a hardcoded value EXACTLY as if it were valid user input.
+- Grade ONLY on whether the core algorithm / logic is CORRECT and would produce the right result for the problem.
+- If the logic correctly solves what the question asks, award FULL marks (${maxPoints} out of ${maxPoints}) — even if it does not handle uncommon edge cases (negative numbers, empty input, zero, very large values, etc.). Do NOT invent edge-case requirements. Only require an edge case if the QUESTION TEXT explicitly demands it.
+- Do NOT deduct for style, variable naming, missing comments, missing error handling, print wording, or "could be cleaner".
+- Deduct marks ONLY for genuine defects: incorrect logic, wrong output, or code that fails to run / does not address what the question actually asks.
 
 QUESTION:
 ${question}
+${rubric ? `\nREFERENCE SOLUTION / RUBRIC (guidance only, student's approach may differ and still be fully correct):\n${rubric}\n` : ""}
+STUDENT CODE:
+${studentAnswer}
 
-${rubric ? `RUBRIC / EXPECTED:\n${rubric}\n` : ""}
+Scoring guide:
+- Correct working logic that solves the problem => FULL ${maxPoints}.
+- Correct approach with one real logical flaw => partial.
+- Wrong approach / does not solve the problem / does not run => low or 0.
+
+Feedback rules for "notes": 2-3 sentences. If you award full marks, simply confirm what is correct — do NOT list any "however"/"but" shortcomings. NEVER mention hardcoding, user input, input(), reusability, or a missing edge case as a negative unless it actually caused a deduction that the QUESTION explicitly required.
+
+Return ONLY JSON: { "score": <number 0-${maxPoints}>, "notes": "<feedback>" }.`
+    : `You are grading a student's answer for an engineering exam.
+
+QUESTION:
+${question}
+${rubric ? `\nRUBRIC / EXPECTED:\n${rubric}\n` : ""}
 STUDENT ANSWER:
 ${studentAnswer}
 
 Max points: ${maxPoints}.
-Evaluate correctness, logic, ${isCode ? "edge cases and code quality" : "completeness and clarity"}.
+Evaluate correctness, completeness and clarity. If the answer is correct and complete, award full marks. Deduct only for genuine errors or missing required content — not for phrasing or brevity.
 Return ONLY JSON: { "score": <number 0-${maxPoints}>, "notes": "<2-3 sentence feedback>" }.`;
 
   const { text } = await generateText({ model: gateway(modelFor(provider)), prompt });
