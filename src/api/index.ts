@@ -867,11 +867,19 @@ const app = new Hono<{ Variables: Vars }>()
     const stdin = b.stdin != null ? String(b.stdin) : "";
     if (!source.trim()) return c.json({ ok: false, message: "Write some code before running." }, 400);
 
+    // Resolve the Judge0 endpoint. Default = self-hosted instance (no auth required).
+    // A RapidAPI key is only needed when pointing at the RapidAPI-hosted judge0-ce.
+    const baseUrl = (process.env.JUDGE0_URL || "https://compiler.otomeyt.ai").replace(/\/+$/, "");
+    const isRapidApi = /rapidapi\.com/i.test(baseUrl);
+
     let key: string | null = null;
     try { key = (await getGlobalSettings())?.judge0Key ?? null; } catch { /* ignore */ }
-    if (!key) return c.json({ ok: false, message: "Code execution is not configured. Contact your administrator." }, 503);
+    if (!key) key = process.env.JUDGE0_KEY || null;
+    if (isRapidApi && !key) {
+      return c.json({ ok: false, message: "Code execution is not configured. Contact your administrator." }, 503);
+    }
 
-    // Judge0 CE language IDs (RapidAPI).
+    // Judge0 CE language IDs (compatible across RapidAPI CE and self-hosted CE).
     const LANG: Record<string, number> = {
       python: 71, python3: 71, py: 71,
       javascript: 63, js: 63, node: 63,
@@ -882,13 +890,17 @@ const app = new Hono<{ Variables: Vars }>()
     const languageId = Number.isFinite(reqLangId) && reqLangId > 0 ? reqLangId : (LANG[language] ?? 71);
 
     try {
-      const res = await fetch("https://judge0-ce.p.rapidapi.com/submissions?base64_encoded=false&wait=true", {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (isRapidApi) {
+        headers["X-RapidAPI-Key"] = key!;
+        headers["X-RapidAPI-Host"] = "judge0-ce.p.rapidapi.com";
+      } else if (key) {
+        // Self-hosted Judge0 with an optional auth token configured.
+        headers["X-Auth-Token"] = key;
+      }
+      const res = await fetch(`${baseUrl}/submissions?base64_encoded=false&wait=true`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-RapidAPI-Key": key,
-          "X-RapidAPI-Host": "judge0-ce.p.rapidapi.com",
-        },
+        headers,
         body: JSON.stringify({ source_code: source, language_id: languageId, stdin }),
       });
       if (!res.ok) {
