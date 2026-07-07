@@ -5,7 +5,7 @@ import { useSession } from "../lib/session";
 import { requestFullscreen, exitFullscreen, startWebcam, getDisplayCount, type ProctorEvent, type WebcamHandle } from "../lib/proctor";
 import { Icon, NetBadge, useOnline } from "../components/ui";
 
-type Phase = "brief" | "preflight" | "running" | "validating" | "done";
+type Phase = "brief" | "preflight" | "resume" | "running" | "validating" | "done";
 
 type Alert = { id: number; text: string; tone: "danger" | "warn" };
 
@@ -30,7 +30,7 @@ function fmtClock(ms: number): string {
 // localStorage bridge so an in-progress exam survives a forced logout/relogin
 // (used when the internet drops mid-exam and we bounce the student to login).
 const ACTIVE_EXAM_KEY = "examly:activeExam";
-type SavedProgress = { answers: Record<string, unknown>; flags: Record<string, boolean> };
+type SavedProgress = { answers: Record<string, unknown>; flags: Record<string, boolean>; cur?: number };
 function progressKey(examId: string) { return `examly:progress:${examId}`; }
 function saveProgress(examId: string, p: SavedProgress) {
   try { localStorage.setItem(progressKey(examId), JSON.stringify(p)); } catch { /* ignore */ }
@@ -63,6 +63,10 @@ export function ExamRunner() {
   const sessionRef = useRef<RunSession | null>(null);
   sessionRef.current = session;
   const submittedRef = useRef(false);
+  const curRef = useRef(0);
+  curRef.current = cur;
+  // Guards the run-once resume-on-mount probe.
+  const resumeCheckedRef = useRef(false);
 
   // Proctoring config comes from the exam bundle (admin-configured); fall back to defaults.
   const proctoring: ProctorConfig = bundle?.proctoring ? { ...DEFAULT_PROCTORING, ...bundle.proctoring } : DEFAULT_PROCTORING;
@@ -215,6 +219,53 @@ export function ExamRunner() {
     if (proctoringRef.current.fullscreenRequired) void requestFullscreen();
   }
 
+  // ---- Refresh-resume: detect an already-running attempt on mount ----
+  // A mid-exam browser refresh must land the student back in the running exam
+  // (same question, answers, server-anchored timer) — not on the brief/start
+  // page. We probe the READ-ONLY status endpoint (never /start, which would
+  // wrongly transition a not_started attempt to in_progress). Runs once, after
+  // the bundle loads so the proctoring config is known.
+  useEffect(() => {
+    if (!examId || !bundle || resumeCheckedRef.current) return;
+    resumeCheckedRef.current = true;
+    void (async () => {
+      try {
+        const st = await api.status(examId);
+        if (st.status === "submitted" || st.status === "graded") {
+          // Already finished elsewhere — clear any stale local progress + go home.
+          clearProgress(examId);
+          return;
+        }
+        if (st.status !== "in_progress" || !st.endAt || !st.attemptId) return;
+        // Rebuild the running session from server (attemptId + deadline) + local
+        // progress (answers/flags/current question).
+        const saved = loadProgress(examId);
+        const endAt = new Date(st.endAt).getTime();
+        setSession({
+          attemptId: st.attemptId,
+          endAt,
+          answers: saved?.answers ?? {},
+          flags: saved?.flags ?? {},
+          integrityEvents: [],
+        });
+        if (typeof saved?.cur === "number" && Number.isFinite(saved.cur)) setCur(saved.cur);
+        setHeld(!!st.held);
+        const cfg = proctoringRef.current;
+        // Fullscreen re-entry (and camera) need a user gesture on reload, so if any
+        // lockdown gate is on we show a one-click "Resume exam" screen. Otherwise
+        // drop straight back into the running exam.
+        if (cfg.requireWebcam || cfg.fullscreenRequired || cfg.requireSingleScreen) {
+          setPhase("resume");
+          if (cfg.requireWebcam) void enableCamera();
+          if (cfg.requireSingleScreen) void getDisplayCount().then(setDisplayCount).catch(() => {});
+        } else {
+          enterRunning();
+        }
+      } catch { /* leave on brief — student can start normally */ }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [examId, bundle]);
+
   // Try to restore the camera while locked, and auto-unlock once the lock time
   // has elapsed AND the camera is back.
   const tryRestoreCamera = useCallback(async () => {
@@ -254,7 +305,7 @@ export function ExamRunner() {
       if (!notifiedOfflineRef.current) {
         notifiedOfflineRef.current = true;
         const s = sessionRef.current;
-        if (s) saveProgress(examId, { answers: s.answers, flags: s.flags });
+        if (s) saveProgress(examId, { answers: s.answers, flags: s.flags, cur: curRef.current });
         try { localStorage.setItem(ACTIVE_EXAM_KEY, examId); } catch { /* ignore */ }
         pushAlert("You're offline — keep going, your answers are saved on this device and will sync when the connection returns.", "warn");
       }
@@ -262,7 +313,7 @@ export function ExamRunner() {
       // Reconnected: sync buffered answers quietly (no toast), reset the flag.
       notifiedOfflineRef.current = false;
       const s = sessionRef.current;
-      if (s) saveProgress(examId, { answers: s.answers, flags: s.flags });
+      if (s) saveProgress(examId, { answers: s.answers, flags: s.flags, cur: curRef.current });
     }
   }, [online, phase, examId, pushAlert]);
 
@@ -383,7 +434,7 @@ export function ExamRunner() {
   // logout (internet drop) never loses work.
   useEffect(() => {
     if (phase === "running" && examId && session) {
-      saveProgress(examId, { answers: session.answers, flags: session.flags });
+      saveProgress(examId, { answers: session.answers, flags: session.flags, cur: curRef.current });
     }
   }, [phase, examId, session]);
 
@@ -438,6 +489,55 @@ export function ExamRunner() {
               <Icon name="play" /> Start exam
             </button>
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ===== RESUME (after a mid-exam refresh) =====
+  // The attempt is already running server-side; we just need a user gesture to
+  // re-enter fullscreen / confirm the camera before dropping back in. The timer
+  // keeps counting from the server-anchored deadline (no reset, no /start call).
+  if (phase === "resume" && session) {
+    const needCam = proctoring.requireWebcam;
+    const needSingle = proctoring.requireSingleScreen;
+    const camOk = !needCam || camReady;
+    const screenOk = !needSingle || displayCount <= 1;
+    const canResume = camOk && screenOk;
+    return (
+      <div className="runner" style={{ alignItems: "center", justifyContent: "center" }}>
+        <div className="card" style={{ padding: 32, maxWidth: 520, width: "100%" }}>
+          <div style={{ textAlign: "center", marginBottom: 20 }}>
+            <div style={{ width: 52, height: 52, borderRadius: 14, background: "var(--color-brand-soft)", color: "var(--brand)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 14px" }}><Icon name="rotate-ccw" size={26} /></div>
+            <h2 style={{ fontFamily: "var(--font-serif)", fontSize: 22, marginBottom: 4 }}>Resume your exam</h2>
+            <p style={{ color: "var(--color-ink2)", fontSize: 14 }}>Your exam is still in progress. Your answers were saved on this device.</p>
+            <div style={{ marginTop: 14, fontFamily: "var(--font-mono, monospace)", fontSize: 30, fontWeight: 700, color: remaining < 60_000 ? "var(--color-danger)" : "var(--color-ink)" }}>{fmtClock(remaining)}</div>
+            <p style={{ color: "var(--color-ink2)", fontSize: 12 }}>time remaining</p>
+          </div>
+
+          {needCam && (
+            <div style={{ marginBottom: 16 }}>
+              <video ref={videoRef} autoPlay playsInline muted style={{ width: "100%", maxHeight: 200, borderRadius: 12, background: "#0b1220", objectFit: "cover", transform: "scaleX(-1)" }} />
+            </div>
+          )}
+
+          <div style={{ display: "grid", gap: 10, marginBottom: 20 }}>
+            {needCam && <CheckRow ok={camOk} label="Webcam" detail={camOk ? "Camera active" : camError || "Camera not detected — click Enable camera"} />}
+            {needSingle && <CheckRow ok={screenOk} label="Single display" detail={screenOk ? "One monitor detected" : `${displayCount} monitors detected — disconnect extra displays`} />}
+          </div>
+
+          {camError && needCam && (
+            <div style={{ display: "flex", gap: 8, color: "var(--color-danger)", background: "var(--color-danger-bg)", padding: "10px 12px", borderRadius: 10, fontSize: 13, marginBottom: 14 }}><Icon name="triangle-alert" size={15} /> {camError}</div>
+          )}
+
+          {needCam && !camReady && (
+            <button className="btn btn-ghost" style={{ width: "100%", padding: 11, marginBottom: 10 }} onClick={() => void enableCamera()}>
+              <Icon name="video" /> Enable camera
+            </button>
+          )}
+          <button className="btn btn-primary" style={{ width: "100%", padding: 13 }} disabled={!canResume} onClick={() => { if (proctoringRef.current.fullscreenRequired) void requestFullscreen(); enterRunning(); }}>
+            <Icon name="play" /> {canResume ? "Resume exam" : needCam && !camOk ? "Enable your camera to resume" : "Disconnect extra monitors to resume"}
+          </button>
         </div>
       </div>
     );

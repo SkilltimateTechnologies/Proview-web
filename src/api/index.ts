@@ -627,6 +627,31 @@ const app = new Hono<{ Variables: Vars }>()
     return c.json({ attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), serverNow: new Date(now), durationMin: exam.durationMin, pausedMs: attempt.pausedMs ?? 0, held: !!exam.heldAt }, 200);
   })
 
+  // Read-only status probe. Used by the client on mount to detect an in-progress
+  // attempt after a page refresh WITHOUT mutating state (never transitions
+  // not_started -> in_progress like /start does). Returns the server-anchored
+  // endAt when the attempt is already running, so the timer stays un-cheatable.
+  .get("/student/attempts/:examId/status", async (c) => {
+    const sid = await verifyStudentToken(c.req.header("x-student-token"));
+    if (!sid) return c.json({ message: "Unauthorized" }, 401);
+    const eid = c.req.param("examId");
+    const [exam] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    if (!exam) return c.json({ message: "Not found" }, 404);
+    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid))).limit(1);
+    const now = Date.now();
+    if (!attempt) {
+      return c.json({ status: "not_started", attemptId: null, startedAt: null, endAt: null, serverNow: new Date(now), held: false }, 200);
+    }
+    if (attempt.status === "in_progress") {
+      // Refresh the seen timestamp (drives the Live Monitor online dot) and
+      // return the live deadline. This is the only side effect here.
+      await db.update(schema.attempts).set({ lastSeenAt: new Date(now) }).where(eq(schema.attempts.id, attempt.id));
+      const endAtMs = effectiveEndMs(exam, attempt, now);
+      return c.json({ status: "in_progress", attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), serverNow: new Date(now), held: !!exam.heldAt }, 200);
+    }
+    return c.json({ status: attempt.status, attemptId: attempt.id, startedAt: attempt.startedAt, endAt: null, serverNow: new Date(now), held: false }, 200);
+  })
+
   // Resume a locked exam after an internet drop. The client reports how long it
   // was offline (offlineMs); we add that to pausedMs so the deadline shifts by the
   // same amount (timer effectively froze during the outage). Returns the new endAt.
