@@ -1222,7 +1222,18 @@ const app = new Hono<{ Variables: Vars }>()
       const ms = startMs(e);
       return ms !== null && now >= ms;
     });
-    const liveExams = [...dbLive, ...startedScheduled];
+    // An exam is OVER once its window (endAt + any admin extra time + total hold
+    // time) has fully elapsed. A currently-held exam is paused, not over. Over
+    // exams must drop off the Live Monitor entirely — there is nothing live.
+    const isOver = (e: { endAt: number | string | Date | null; extraMin?: number | null; holdMs?: number | null; heldAt?: number | string | Date | null }) => {
+      if (e.heldAt) return false;
+      if (e.endAt == null) return false;
+      const end = e.endAt instanceof Date ? e.endAt.getTime() : typeof e.endAt === "number" ? e.endAt : new Date(e.endAt).getTime();
+      if (Number.isNaN(end)) return false;
+      const extra = (e.extraMin ?? 0) * 60_000 + (e.holdMs ?? 0);
+      return now > end + extra;
+    };
+    const liveExams = [...dbLive, ...startedScheduled].filter((e) => !isOver(e));
 
     // Next scheduled exam (for empty-state messaging when nothing is live).
     let nextScheduled: { examId: string; title: string; startAt: number | null } | null = null;
@@ -1425,9 +1436,19 @@ const app = new Hono<{ Variables: Vars }>()
       const ms = typeof e.endAt === "number" ? e.endAt : new Date(e.endAt).getTime();
       return Number.isNaN(ms) ? null : ms;
     };
-    // A scheduled exam whose start time has passed is effectively LIVE.
-    const effStatus = (e: { status: string; startAt: number | string | null }) =>
-      e.status === "scheduled" && isStarted(e) ? "live" : e.status;
+    // A scheduled exam whose start time has passed is effectively LIVE — until its
+    // window (endAt + admin extra time + hold time) closes, after which it has ENDED.
+    const effStatus = (e: { status: string; startAt: number | string | null; endAt: number | string | null; extraMin?: number | null; holdMs?: number | null; heldAt?: number | string | Date | null }) => {
+      if (e.status === "draft" || e.status === "finished") return e.status;
+      const end = endMs(e);
+      if (!e.heldAt && end !== null) {
+        const extra = (e.extraMin ?? 0) * 60_000 + (e.holdMs ?? 0);
+        if (now > end + extra) return "ended";
+      }
+      if (e.status === "live") return "live";
+      if (e.status === "scheduled" && isStarted(e)) return "live";
+      return e.status;
+    };
     const allExams = await db.select().from(schema.exams).where(eq(schema.exams.tenantId, tid)).orderBy(desc(schema.exams.createdAt));
     const rows =
       p.role === "tpo"

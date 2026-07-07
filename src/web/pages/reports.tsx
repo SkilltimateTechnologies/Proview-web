@@ -12,6 +12,7 @@ const STATUS_COLOR: Record<string, string> = {
   live: "#c0453b",
   scheduled: "#b7791f",
   draft: "#8a929c",
+  ended: "#5b6472",
 };
 
 function fmtConducted(v: number | string | null | undefined): string {

@@ -72,13 +72,27 @@ function splitIST(ts: number | string | null | undefined): { date: string; slot:
   return { date: `${g("year")}-${g("month")}-${g("day")}`, slot: `${hh}:${g("minute")}` };
 }
 
-type ExamRow = { id: string; title: string; status: string; startAt: number | string | null; durationMin: number; totalPoints: number; sectionIds?: string[] | null };
+type ExamRow = { id: string; title: string; status: string; startAt: number | string | null; endAt?: number | string | null; extraMin?: number | null; holdMs?: number | null; heldAt?: number | string | null; durationMin: number; totalPoints: number; sectionIds?: string[] | null };
 
-const STATUS_COLOR: Record<string, string> = { finished: "#2e7d5b", live: "#c0453b", scheduled: "#b7791f", draft: "#8a929c" };
+const STATUS_COLOR: Record<string, string> = { finished: "#2e7d5b", live: "#c0453b", scheduled: "#b7791f", draft: "#8a929c", ended: "#5b6472" };
+
+// An exam window is fully closed once endAt (+ any admin extra time + total hold
+// time) has elapsed. A currently-held exam is paused, not over.
+function isOver(e: { endAt?: number | string | null; extraMin?: number | null; holdMs?: number | null; heldAt?: number | string | null }): boolean {
+  if (e.heldAt) return false;
+  const end = toMs(e.endAt ?? null);
+  if (end === null) return false;
+  const extra = (e.extraMin ?? 0) * 60_000 + (e.holdMs ?? 0);
+  return Date.now() > end + extra;
+}
 
 // A scheduled assessment becomes LIVE automatically once its start time passes
-// (students can already start it at that point), so reflect that in the badge.
-function displayStatus(e: { status: string; startAt: number | string | null }): string {
+// (students can already start it at that point). Once its window closes it is
+// no longer live — it has ENDED — so it must stop showing "In progress".
+function displayStatus(e: { status: string; startAt: number | string | null; endAt?: number | string | null; extraMin?: number | null; holdMs?: number | null; heldAt?: number | string | null }): string {
+  if (e.status === "draft" || e.status === "finished") return e.status;
+  if (isOver(e)) return "ended";
+  if (e.status === "live") return "live";
   if (e.status === "scheduled") {
     const ms = toMs(e.startAt);
     if (ms !== null && Date.now() >= ms) return "live";
@@ -144,12 +158,17 @@ export default function Exams() {
                     <Clock size={14} /> In progress
                   </span>
                 )}
+                {ds === "ended" && (
+                  <span className="inline-flex items-center gap-1.5 text-sm text-[var(--color-ink2)]">
+                    <Clock size={14} /> Ended{e.startAt ? ` · ${fmtDate(e.startAt)}` : ""}
+                  </span>
+                )}
                 {(ds === "scheduled" || ds === "live" || e.status === "draft") && (
                   <button className="btn btn-ghost py-1.5 text-sm" onClick={() => navigate(`/exams/${e.id}/edit`)}>
                     <Pencil size={15} /> {e.status === "draft" ? "Edit & schedule" : "Edit"}
                   </button>
                 )}
-                {e.status === "finished" ? (
+                {e.status === "finished" || ds === "ended" ? (
                   <button className="btn btn-primary py-1.5 text-sm" onClick={() => navigate(`/reports/${e.id}`)}>
                     <BarChart3 size={15} /> Reports
                   </button>
