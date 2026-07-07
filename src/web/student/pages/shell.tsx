@@ -27,6 +27,20 @@ function countdown(startAt: string | null): string {
   if (h > 0) return `in ${h}h ${m}m`;
   return `in ${m}m`;
 }
+// A ticking HH:MM:SS clock for the waiting-room gate (prefixes days when >= 24h).
+function clock(ms: number): string {
+  if (ms <= 0) return "00:00:00";
+  const total = Math.floor(ms / 1000);
+  const d = Math.floor(total / 86400);
+  const h = Math.floor((total % 86400) / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (d > 0 ? `${d}d ` : "") + `${pad(h)}:${pad(m)}:${pad(s)}`;
+}
+// How close an upcoming exam must be to take over the whole screen with a live
+// countdown. Exams further out than this stay on the dashboard as normal cards.
+const WAIT_WINDOW_MS = 12 * 60 * 60 * 1000;
 
 export function Shell() {
   const params = useParams();
@@ -84,6 +98,21 @@ export function Shell() {
   }, [exams]);
 
   const live = useMemo(() => (exams || []).filter((e) => e.phase === "available" || e.phase === "in_progress"), [exams]);
+  // Soonest imminent upcoming exam (within WAIT_WINDOW_MS). It takes over the
+  // whole screen as a waiting room with a live countdown, so the student just
+  // waits for the Start button to unlock — no manual refresh needed. Far-future
+  // exams stay on the dashboard as cards.
+  const waiting = useMemo(() => {
+    const now = Date.now();
+    return (exams || [])
+      .filter((e) => e.phase === "upcoming" && e.startAt)
+      .map((e) => ({ e, t: new Date(e.startAt as string).getTime() }))
+      .filter(({ t }) => t - now <= WAIT_WINDOW_MS)
+      .sort((a, b) => a.t - b.t)
+      .map(({ e }) => e)[0] ?? null;
+  }, [exams]);
+  // A live/in-progress exam always wins; otherwise show the imminent waiting room.
+  const gateExam = live[0] ?? waiting;
   // "Finished Exams" shows completed attempts and any missed (absent) exams —
   // latest submission on top.
   const finished = useMemo(() => {
@@ -104,10 +133,11 @@ export function Shell() {
     );
   }
 
-  // When an exam is live/in-progress, strip ALL chrome (no sidebar, no nav) and
-  // show only a centered, focused gate. This keeps the student locked to the
-  // one action that matters: start / resume the exam.
-  if (!(err && exams.length === 0) && live.length > 0) {
+  // When an exam is live/in-progress — OR an imminent scheduled exam is due soon
+  // — strip ALL chrome (no sidebar, no nav) and show only a centered, focused
+  // gate. For a live exam that's the Start/Resume button; for a scheduled exam
+  // it's a waiting room with a live countdown that unlocks Start at start time.
+  if (!(err && exams.length === 0) && gateExam) {
     return (
       <div className="exam-focus">
         <header className="exam-focus-top">
@@ -123,7 +153,7 @@ export function Shell() {
           </div>
         </header>
         <div className="exam-focus-body">
-          <LiveExamGate live={live} onStart={(id) => navigate(`/exam/${id}`)} />
+          <ExamGate exam={gateExam} onStart={(id) => navigate(`/exam/${id}`)} onElapsed={() => void loadRef.current()} />
         </div>
       </div>
     );
@@ -254,28 +284,85 @@ function FinishedList({ exams, onOpen }: { exams: ExamListItem[]; onOpen: (attem
   );
 }
 
-// Full-screen focused gate shown when an exam is live — the ONLY thing the
-// student sees is the exam brief + a single big "Start exam" button.
-function LiveExamGate({ live, onStart }: { live: ExamListItem[]; onStart: (id: string) => void }) {
-  const e = live[0];
+// Full-screen focused gate. Two states:
+//  • Ready (exam live / in progress, or the scheduled start time has passed) —
+//    shows a big Start / Resume button.
+//  • Waiting (scheduled exam not started yet) — shows a live ticking countdown
+//    and a disabled Start button that unlocks automatically at the start time.
+//    No polling: the client tick flips the gate to Ready the instant it hits 0.
+function ExamGate({ exam, onStart, onElapsed }: { exam: ExamListItem; onStart: (id: string) => void; onElapsed: () => void }) {
+  const started = exam.phase === "available" || exam.phase === "in_progress";
+  const startMs = exam.startAt ? new Date(exam.startAt).getTime() : null;
+  const [now, setNow] = useState(Date.now());
+
+  // Tick every second only while we're waiting on a future start time.
+  useEffect(() => {
+    if (started || startMs == null) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [started, startMs]);
+
+  // The moment the countdown crosses the start time, refresh the exam list once
+  // so the server phase flips to "available" (label + list stay in sync).
+  const firedRef = useRef(false);
+  const reached = started || (startMs != null && now >= startMs);
+  useEffect(() => {
+    if (!started && startMs != null && now >= startMs && !firedRef.current) {
+      firedRef.current = true;
+      onElapsed();
+    }
+  }, [now, started, startMs, onElapsed]);
+
+  const remaining = startMs != null ? startMs - now : 0;
+  const resume = exam.phase === "in_progress";
+
   return (
     <div style={{ width: "100%", maxWidth: 620, margin: "0 auto", display: "grid", gap: 20 }}>
       <div style={{ textAlign: "center" }}>
-        <div className="mono-label" style={{ display: "inline-flex", alignItems: "center", gap: 8, color: "var(--color-danger)" }}>
-          <span className="pill-dot" style={{ background: "var(--color-danger)" }} /> Live now
-        </div>
-        <h1 className="page-title" style={{ marginTop: 8 }}>{e.title}</h1>
-        <p style={{ color: "var(--color-ink2)", marginTop: 4 }}>Your exam is ready. Review the details below, then start when you are.</p>
+        {reached ? (
+          <div className="mono-label" style={{ display: "inline-flex", alignItems: "center", gap: 8, color: "var(--color-danger)" }}>
+            <span className="pill-dot" style={{ background: "var(--color-danger)" }} /> Live now
+          </div>
+        ) : (
+          <div className="mono-label" style={{ display: "inline-flex", alignItems: "center", gap: 8, color: "var(--color-warn)" }}>
+            <Icon name="clock" size={13} /> Scheduled
+          </div>
+        )}
+        <h1 className="page-title" style={{ marginTop: 8 }}>{exam.title}</h1>
+        <p style={{ color: "var(--color-ink2)", marginTop: 4 }}>
+          {reached
+            ? "Your exam is ready. Review the details below, then start when you are."
+            : "Your exam hasn't started yet. This screen will unlock the moment it begins — no need to refresh."}
+        </p>
       </div>
       <div className="exam-card rise">
         <div className="exam-meta">
-          <div className="m"><span className="mono-label">Questions</span><span className="m-v">{e.questionCount}</span></div>
-          <div className="m"><span className="mono-label">Duration</span><span className="m-v">{e.durationMin} min</span></div>
-          <div className="m"><span className="mono-label">Points</span><span className="m-v">{e.totalPoints}</span></div>
+          <div className="m"><span className="mono-label">Questions</span><span className="m-v">{exam.questionCount}</span></div>
+          <div className="m"><span className="mono-label">Duration</span><span className="m-v">{exam.durationMin} min</span></div>
+          <div className="m"><span className="mono-label">Points</span><span className="m-v">{exam.totalPoints}</span></div>
         </div>
-        <button className="btn btn-primary" style={{ width: "100%", padding: 14, fontSize: 15 }} onClick={() => onStart(e.id)}>
-          <Icon name="play" /> {e.phase === "in_progress" ? "Resume exam" : "Start exam"}
-        </button>
+
+        {!reached && (
+          <div style={{ textAlign: "center", margin: "4px 0 18px" }}>
+            <div className="mono-label">Starts in</div>
+            <div style={{ fontFamily: "var(--font-mono)", fontSize: 40, fontWeight: 700, letterSpacing: 1, color: "var(--color-ink)", marginTop: 4, fontVariantNumeric: "tabular-nums" }}>
+              {clock(remaining)}
+            </div>
+            {exam.startAt && (
+              <div style={{ color: "var(--color-muted)", fontSize: 13, marginTop: 4 }}>Scheduled for {fmtDate(exam.startAt)}</div>
+            )}
+          </div>
+        )}
+
+        {reached ? (
+          <button className="btn btn-primary" style={{ width: "100%", padding: 14, fontSize: 15 }} onClick={() => onStart(exam.id)}>
+            <Icon name="play" /> {resume ? "Resume exam" : "Start exam"}
+          </button>
+        ) : (
+          <button className="btn btn-primary" style={{ width: "100%", padding: 14, fontSize: 15, opacity: 0.55, cursor: "not-allowed" }} disabled>
+            <Icon name="lock" size={15} /> Start exam
+          </button>
+        )}
       </div>
     </div>
   );
