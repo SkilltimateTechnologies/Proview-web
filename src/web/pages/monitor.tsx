@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Clock, CheckCircle2, Loader2, CalendarClock } from "lucide-react";
+import { Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Drawer } from "../components/ui";
@@ -10,18 +10,19 @@ type LiveStudent = {
   examId?: string;
   student: string;
   rollNo: string;
-  status: "in_progress" | "finished";
+  status: "in_progress" | "finished" | "not_started";
   startedAt: string | number | null;
   submittedAt?: string | number | null;
   snapshot: string | null;
   examTitle?: string;
 };
 
-type FilterKey = "all" | "in_progress" | "finished";
+type FilterKey = "all" | "in_progress" | "finished" | "not_started";
 const FILTERS: { k: FilterKey; label: string }[] = [
   { k: "all", label: "All" },
   { k: "in_progress", label: "In progress" },
   { k: "finished", label: "Finished" },
+  { k: "not_started", label: "Not started" },
 ];
 
 function fmtTime(t: string | number | null | undefined) {
@@ -57,6 +58,7 @@ export default function Monitor() {
   function matchFilter(s: LiveStudent) {
     if (filter === "in_progress") return s.status === "in_progress";
     if (filter === "finished") return s.status === "finished";
+    if (filter === "not_started") return s.status === "not_started";
     return true;
   }
 
@@ -88,6 +90,7 @@ export default function Monitor() {
             const total = ex.students.length;
             const inProg = (ex.students as LiveStudent[]).filter((s) => s.status === "in_progress").length;
             const done = (ex.students as LiveStudent[]).filter((s) => s.status === "finished").length;
+            const notStarted = (ex.students as LiveStudent[]).filter((s) => s.status === "not_started").length;
             return (
               <div key={ex.examId} className="card p-5">
                 <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
@@ -97,12 +100,12 @@ export default function Monitor() {
                       <Pill label="LIVE" color="#c0453b" />
                     </div>
                     <div className="mono-label mt-1">
-                      {inProg} in progress · {done} finished
+                      {inProg} in progress · {done} finished · {notStarted} not started
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
                     {FILTERS.map((f) => {
-                      const count = f.k === "all" ? total : f.k === "in_progress" ? inProg : done;
+                      const count = f.k === "all" ? total : f.k === "in_progress" ? inProg : f.k === "finished" ? done : notStarted;
                       return (
                         <button
                           key={f.k}
@@ -151,8 +154,10 @@ export default function Monitor() {
                               <td>
                                 {s.status === "in_progress" ? (
                                   <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--brand)]"><Loader2 size={14} className="animate-spin" /> In progress</span>
-                                ) : (
+                                ) : s.status === "finished" ? (
                                   <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--color-success)]"><CheckCircle2 size={14} /> Finished</span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--color-muted)]"><CircleDashed size={14} /> Not started</span>
                                 )}
                               </td>
                               <td className="text-right"><span className="mono-label">{fmtTime(s.startedAt)}</span></td>
@@ -215,13 +220,21 @@ function StudentDrawer({ s, onClose }: { s: LiveStudent; onClose: () => void }) 
       <div className="flex flex-wrap items-center gap-3 mb-5">
         {s.status === "in_progress" ? (
           <Pill label="IN PROGRESS" color="#1e3a5f" />
-        ) : (
+        ) : s.status === "finished" ? (
           <Pill label="FINISHED" color="#2e7d5b" />
+        ) : (
+          <Pill label="NOT STARTED" color="#8a8f98" />
         )}
-        <span className="inline-flex items-center gap-1.5 text-sm text-[var(--color-ink2)]"><Clock size={14} /> Started {fmtTime(s.startedAt)}</span>
+        {s.status !== "not_started" && (
+          <span className="inline-flex items-center gap-1.5 text-sm text-[var(--color-ink2)]"><Clock size={14} /> Started {fmtTime(s.startedAt)}</span>
+        )}
       </div>
 
-      {s.status === "in_progress" ? (
+      {s.status === "not_started" ? (
+        <div className="card p-6 text-center text-sm text-[var(--color-ink2)]">
+          This candidate has not started the exam yet.
+        </div>
+      ) : s.status === "in_progress" ? (
         <div className="card p-6 text-center text-sm text-[var(--color-ink2)]">
           This candidate is still writing the exam. The answer sheet will be available once they submit.
         </div>

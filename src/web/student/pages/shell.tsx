@@ -272,6 +272,10 @@ function FinishedList({ exams, onOpen }: { exams: ExamListItem[]; onOpen: (attem
             <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--color-danger)", fontSize: 13, fontWeight: 600 }}>
               <Icon name="user-x" size={15} /> Marked absent — exam window closed
             </div>
+          ) : !e.resultsReady ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--color-ink2)", fontSize: 13, fontWeight: 600 }}>
+              <Icon name="lock" size={15} /> Results locked — available after the exam closes
+            </div>
           ) : (
             <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
               {e.attempt?.score != null && <div style={{ textAlign: "right" }}><div className="mono-label">Score</div><div className="stat-num" style={{ fontSize: 20 }}>{e.attempt.score}%</div></div>}
@@ -373,7 +377,9 @@ function Dashboard({ finished, onReview }: { finished: ExamListItem[]; onReview:
   // Only truly-completed attempts count towards averages / completed count.
   // `finished` is already sorted latest-first upstream.
   const completed = useMemo(() => finished.filter((e) => e.phase === "finished"), [finished]);
-  const avg = completed.length ? Math.round((completed.reduce((s, e) => s + (e.attempt?.score || 0), 0) / completed.length) * 10) / 10 : null;
+  // Scores stay hidden until the exam closes — only count released results in the average.
+  const revealed = useMemo(() => completed.filter((e) => e.resultsReady), [completed]);
+  const avg = revealed.length ? Math.round((revealed.reduce((s, e) => s + (e.attempt?.score || 0), 0) / revealed.length) * 10) / 10 : null;
   return (
     <div style={{ display: "grid", gap: 24 }}>
       <div>
@@ -392,8 +398,16 @@ function Dashboard({ finished, onReview }: { finished: ExamListItem[]; onReview:
           <div style={{ display: "grid", gap: 16 }}>
             {completed.slice(0, 3).map((e) => (
               <ExamCard key={e.id} e={e}>
-                {e.attempt?.score != null && <div style={{ textAlign: "right", marginRight: 12 }}><div className="mono-label">Score</div><div className="stat-num" style={{ fontSize: 20 }}>{e.attempt.score}%</div></div>}
-                {e.attempt && <button className="btn btn-ghost" onClick={() => onReview(e.attempt!.id)}><Icon name="file-search" /> Review</button>}
+                {!e.resultsReady ? (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--color-ink2)", fontSize: 13, fontWeight: 600 }}>
+                    <Icon name="lock" size={15} /> Results locked
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                    {e.attempt?.score != null && <div style={{ textAlign: "right" }}><div className="mono-label">Score</div><div className="stat-num" style={{ fontSize: 20 }}>{e.attempt.score}%</div></div>}
+                    {e.attempt && <button className="btn btn-ghost" onClick={() => onReview(e.attempt!.id)}><Icon name="file-search" /> Review</button>}
+                  </div>
+                )}
               </ExamCard>
             ))}
           </div>

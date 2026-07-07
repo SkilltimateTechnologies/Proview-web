@@ -28,6 +28,7 @@ export type ExamListItem = {
   startAt: string | null;
   endAt: string | null;
   phase: "available" | "in_progress" | "finished" | "upcoming" | "closed" | "absent";
+  resultsReady?: boolean;
   attempt: { id: string; status: string; score: number | null; submittedAt: string | null } | null;
 };
 

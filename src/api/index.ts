@@ -504,6 +504,10 @@ const app = new Hono<{ Variables: Vars }>()
       // start) is still just upcoming — never auto-treated as live.
       else if (e.status === "live" || (startMs && now >= startMs)) phase = "available";
       else phase = "upcoming";
+      // Results stay locked until the exam closes for everyone — either the
+      // admin flipped it to "finished", or its deadline has passed. This stops
+      // early finishers from leaking the answer key to students still writing.
+      const resultsReady = e.status === "finished" || (endMs != null && now > endMs);
       return {
         id: e.id,
         title: e.title,
@@ -514,6 +518,7 @@ const app = new Hono<{ Variables: Vars }>()
         startAt: e.startAt,
         endAt: e.endAt,
         phase,
+        resultsReady,
         attempt: a ? { id: a.id, status: a.status, score: a.score, submittedAt: a.submittedAt } : null,
       };
     });
@@ -751,6 +756,11 @@ const app = new Hono<{ Variables: Vars }>()
     const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.id, aid), eq(schema.attempts.studentId, sid))).limit(1);
     if (!attempt) return c.json({ message: "Not found" }, 404);
     const [exam] = await db.select().from(schema.exams).where(eq(schema.exams.id, attempt.examId)).limit(1);
+    // Gate results until the exam closes for everyone (admin finished it, or the
+    // deadline passed) — prevents early finishers leaking the answer key.
+    const endMs = exam?.endAt ? new Date(exam.endAt).getTime() : null;
+    const resultsReady = exam?.status === "finished" || (endMs != null && Date.now() > endMs);
+    if (!resultsReady) return c.json({ message: "Results are locked until this exam closes. Please check back later." }, 403);
     const ans = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, aid));
     const aMap = new Map(ans.map((a) => [a.questionId, a]));
     const eqs = await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, attempt.examId)).orderBy(schema.examQuestions.order);
@@ -1118,6 +1128,16 @@ const app = new Hono<{ Variables: Vars }>()
       if (upcoming) nextScheduled = { examId: upcoming.id, title: upcoming.title, startAt: startMs(upcoming) };
     }
 
+    // All enabled students in the tenant — used to compute the assigned cohort
+    // per exam so we can surface who hasn't started yet.
+    const allStudents = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, tid), eq(schema.students.enabled, true)));
+    const assignedStudents = (e: { classId: string | null; sectionIds: string[] | null }) =>
+      allStudents.filter((stu) => {
+        if (e.classId && stu.classId && e.classId !== stu.classId) return false;
+        if (Array.isArray(e.sectionIds) && e.sectionIds.length && stu.classId && !e.sectionIds.includes(stu.classId)) return false;
+        return true;
+      });
+
     const out = await Promise.all(
       liveExams.map(async (ex) => {
         const atts = await db.select().from(schema.attempts).where(eq(schema.attempts.examId, ex.id));
@@ -1139,12 +1159,28 @@ const app = new Hono<{ Variables: Vars }>()
             };
           }),
         );
+        // Assigned students who have not started yet — no attempt, or an attempt
+        // still in the "not_started" state. Lets teachers see who's yet to begin.
+        const engagedIds = new Set(engaged.map((a) => a.studentId));
+        const notStarted = assignedStudents(ex)
+          .filter((stu) => !engagedIds.has(stu.id))
+          .map((stu) => ({
+            attemptId: `ns-${stu.id}`,
+            examId: ex.id,
+            student: stu.name ?? "—",
+            rollNo: stu.rollNo ?? "",
+            status: "not_started" as const,
+            startedAt: null as string | null,
+            submittedAt: null as string | null,
+            snapshot: null as string | null,
+          }));
         return {
           examId: ex.id,
           title: ex.title,
           active: engaged.filter((a) => a.status === "in_progress").length,
           submitted: engaged.filter((a) => a.status !== "in_progress").length,
-          students: enriched,
+          notStarted: notStarted.length,
+          students: [...enriched, ...notStarted],
         };
       }),
     );

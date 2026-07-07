@@ -467,36 +467,36 @@ export function ExamRunner() {
     );
   }
 
-  // ===== VALIDATING (AI grading in progress) =====
+  // ===== VALIDATING (submitting) =====
   if (phase === "validating") {
     return (
       <div className="runner" style={{ alignItems: "center", justifyContent: "center" }}>
         <div className="card" style={{ padding: 36, maxWidth: 440, width: "100%", textAlign: "center" }}>
           <div style={{ width: 58, height: 58, borderRadius: 999, background: "var(--color-brand-soft)", color: "var(--brand)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}><Icon name="loader-circle" size={28} className="animate-spin" /></div>
-          <h1 style={{ fontFamily: "var(--font-serif)", fontSize: 24, marginBottom: 6 }}>Validation in progress</h1>
-          <p style={{ color: "var(--color-ink2)" }}>Your answers were received. We're checking and scoring your responses — this only takes a moment. Please don't close this window.</p>
+          <h1 style={{ fontFamily: "var(--font-serif)", fontSize: 24, marginBottom: 6 }}>Submitting your exam</h1>
+          <p style={{ color: "var(--color-ink2)" }}>Your answers are being submitted. This only takes a moment — please don't close this window.</p>
         </div>
       </div>
     );
   }
 
   // ===== DONE =====
+  // We deliberately do NOT show the score here. Results stay locked until the
+  // exam window closes, so early finishers can't leak the answer key to
+  // students who are still writing.
   if (phase === "done" && result) {
+    const endTs = bundle?.exam.endAt ? new Date(bundle.exam.endAt).getTime() : null;
+    const checkBack = endTs
+      ? `after this exam closes on ${new Date(endTs).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}`
+      : "once this exam is closed by your instructor";
     return (
       <div className="runner" style={{ alignItems: "center", justifyContent: "center" }}>
-        <div className="card" style={{ padding: 36, maxWidth: 460, width: "100%", textAlign: "center" }}>
+        <div className="card" style={{ padding: 36, maxWidth: 480, width: "100%", textAlign: "center" }}>
           <div style={{ width: 58, height: 58, borderRadius: 999, background: "#e7f5ee", color: "var(--color-success)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}><Icon name="check" size={30} /></div>
-          <h1 style={{ fontFamily: "var(--font-serif)", fontSize: 26, marginBottom: 4 }}>Exam submitted</h1>
-          <p style={{ color: "var(--color-ink2)", marginBottom: 22 }}>Your answers were submitted and scored successfully.</p>
-          {result.score != null && (
-            <div style={{ background: "var(--color-brand-soft)", borderRadius: 14, padding: "20px 12px", marginBottom: 20 }}>
-              <div className="mono-label">Your score</div>
-              <div className="stat-num" style={{ fontSize: 40, color: "var(--brand)", lineHeight: 1.1 }}>{result.score}%</div>
-            </div>
-          )}
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 12, marginBottom: 24 }}>
-            <Tile label="Answered" value={String(result.answered)} tone="success" />
-            <Tile label="Skipped" value={String(result.skipped)} tone="warn" />
+          <h1 style={{ fontFamily: "var(--font-serif)", fontSize: 26, marginBottom: 8 }}>You have successfully finished your exam</h1>
+          <p style={{ color: "var(--color-ink2)", marginBottom: 20, lineHeight: 1.6 }}>Your responses have been submitted. Results are not available yet — please check back {checkBack} to view your results.</p>
+          <div style={{ display: "flex", gap: 8, justifyContent: "center", alignItems: "center", color: "var(--color-ink2)", background: "var(--color-brand-soft)", borderRadius: 12, padding: "12px 14px", marginBottom: 22, fontSize: 13.5 }}>
+            <Icon name="lock" size={15} /> Results unlock after the exam closes for everyone.
           </div>
           <button className="btn btn-primary" style={{ width: "100%", padding: 12 }} onClick={() => navigate("/")}>
             <Icon name="layout-dashboard" /> Back to dashboard
@@ -677,17 +677,6 @@ function CheckRow({ ok, label, detail }: { ok: boolean; label: string; detail: s
         <div style={{ fontWeight: 600, fontSize: 14 }}>{label}</div>
         <div style={{ fontSize: 12.5, color: "var(--color-ink2)" }}>{detail}</div>
       </div>
-    </div>
-  );
-}
-
-function Tile({ label, value, tone }: { label: string; value: string; tone: "success" | "warn" | "danger" | "default" }) {
-  const bg = tone === "success" ? "#e7f5ee" : tone === "warn" ? "#fdf3e2" : tone === "danger" ? "var(--color-danger-bg)" : "#f4f6f8";
-  const col = tone === "success" ? "var(--color-success)" : tone === "warn" ? "var(--color-warn)" : tone === "danger" ? "var(--color-danger)" : "var(--color-ink)";
-  return (
-    <div style={{ background: bg, borderRadius: 12, padding: "14px 10px" }}>
-      <div className="stat-num" style={{ fontSize: 24, color: col }}>{value}</div>
-      <div className="mono-label">{label}</div>
     </div>
   );
 }
