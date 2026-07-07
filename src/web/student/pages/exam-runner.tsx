@@ -384,6 +384,27 @@ export function ExamRunner() {
   // Live server-anchored countdown.
   const remaining = session ? session.endAt - now : 0;
 
+  // ---- Timed "minutes left" warnings (10 min + 5 min) ----
+  // A big blinking banner appears below the question when the countdown crosses
+  // each threshold, then auto-hides after 10 seconds. Fires exactly once on the
+  // downward crossing (a baseline is established on the first sample so resuming
+  // an exam already below a threshold never triggers a false warning).
+  const [timeAlert, setTimeAlert] = useState<number | null>(null);
+  const prevRemRef = useRef<number>(Infinity);
+  useEffect(() => {
+    if (phase !== "running" || submittedRef.current) return;
+    const prev = prevRemRef.current;
+    prevRemRef.current = remaining;
+    if (!Number.isFinite(prev)) return; // first sample: establish baseline only
+    for (const th of [10, 5]) {
+      const mark = th * 60_000;
+      if (prev > mark && remaining <= mark) {
+        setTimeAlert(th);
+        window.setTimeout(() => setTimeAlert((v) => (v === th ? null : v)), 10_000);
+      }
+    }
+  }, [remaining, phase]);
+
   // ---- Submit ----
   const doSubmit = useCallback(async () => {
     const s = sessionRef.current;
@@ -449,6 +470,20 @@ export function ExamRunner() {
   const questions = bundle?.questions ?? [];
   const answeredCount = useMemo(() => (session ? questions.filter((q) => session.answers[q.id] != null && String(session.answers[q.id]).length > 0).length : 0), [session, questions]);
   const flagCount = useMemo(() => (session ? questions.filter((q) => session.flags[q.id]).length : 0), [session, questions]);
+
+  // Manual submit — warn if questions are still flagged for review so the
+  // student gets a chance to unflag/revisit before finishing. Auto-submit on
+  // timeout never runs through here (it calls doSubmit directly, silently).
+  function handleSubmitClick() {
+    if (flagCount > 0) {
+      const ok = window.confirm(
+        `You still have ${flagCount} question${flagCount > 1 ? "s" : ""} flagged for review.\n\n` +
+          `Press Cancel to go back and review them, or OK to submit anyway.`,
+      );
+      if (!ok) return;
+    }
+    void doSubmit();
+  }
 
   if (!examId) return null;
 
@@ -756,6 +791,14 @@ export function ExamRunner() {
               <button className="btn btn-ghost" disabled={cur === questions.length - 1} onClick={() => setCur((c) => Math.min(questions.length - 1, c + 1))}>Next <Icon name="arrow-right" /></button>
             </div>
 
+            {/* Big blinking "minutes left" alert (fires at 10 min + 5 min, auto-hides after 10s) */}
+            {timeAlert != null && (
+              <div className="time-alert-banner" role="alert">
+                <Icon name="alarm-clock" size={30} />
+                <span>{timeAlert} minute{timeAlert > 1 ? "s" : ""} left</span>
+              </div>
+            )}
+
             {/* End-of-exam actions — only on the last question so Submit sits at the very end */}
             {cur === questions.length - 1 && (
               <div style={{ marginTop: 36, paddingTop: 24, borderTop: "1px solid var(--color-line)", display: "grid", gap: 14 }}>
@@ -768,7 +811,7 @@ export function ExamRunner() {
                     <Icon name="flag" /> Review flagged questions
                   </button>
                 )}
-                <button className="btn btn-primary" style={{ padding: 14, fontSize: 15 }} onClick={() => void doSubmit()} disabled={submitting}>
+                <button className="btn btn-primary" style={{ padding: 14, fontSize: 15 }} onClick={handleSubmitClick} disabled={submitting}>
                   {submitting ? <Icon name="loader-circle" className="animate-spin" /> : <Icon name="send" />} Submit exam
                 </button>
               </div>
@@ -782,7 +825,7 @@ export function ExamRunner() {
               <span><strong>{answeredCount}</strong>/{questions.length} answered</span>
               {flagCount > 0 && <span style={{ color: "var(--color-warn)" }}><Icon name="flag" size={12} /> {flagCount} flagged</span>}
             </div>
-            <button className="btn btn-primary" onClick={() => void doSubmit()} disabled={submitting}>
+            <button className="btn btn-primary" onClick={handleSubmitClick} disabled={submitting}>
               {submitting ? <Icon name="loader-circle" className="animate-spin" /> : <Icon name="send" />} Finish exam
             </button>
           </div>

@@ -65,6 +65,30 @@
 }
 .timer-big { font-family: var(--font-mono); font-size: 26px; font-weight: 700; letter-spacing: .02em; font-variant-numeric: tabular-nums; }
 .timer-danger { color: #ff9b8f; }
+
+/* Big blinking "minutes left" alert below the question */
+.time-alert-banner {
+  margin-top: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 20px 26px;
+  border-radius: 14px;
+  background: #fdf3e2;
+  border: 2px solid #eccf9a;
+  color: var(--color-warn);
+  font-size: 30px;
+  font-weight: 800;
+  letter-spacing: .01em;
+  text-align: center;
+  animation: timeAlertBlink 0.85s steps(1, end) infinite;
+}
+@keyframes timeAlertBlink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.15; }
+}
+
 .runner-body { flex: 1; display: flex; min-height: 0; }
 .q-main { flex: 1; padding: 34px 44px; overflow-y: auto; }
 .q-side { width: 300px; flex: none; border-left: 1px solid var(--color-line); background: #fff; padding: 22px; overflow-y: auto; }
