@@ -41,9 +41,9 @@ export default function ReportDetail() {
   const to = Math.min(curPage * PS, results.length);
 
   function exportCsv() {
-    const header = ["#", "Name", "Roll No", "Email", "Section", "Score"];
-    const lines = results.map((r, i) => [
-      i + 1, r.name, r.rollNo, r.email ?? "", r.section ?? "", r.score ?? "",
+    const header = ["Name", "Roll No", "Section", "Score"];
+    const lines = results.map((r) => [
+      r.name, r.rollNo, r.section ?? "", r.score ?? "",
     ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(","));
     const csv = [header.join(","), ...lines].join("\r\n");
     const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" });
