@@ -38,10 +38,10 @@ function toLocalInput(ts: number | string | null | undefined): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-// Fixed IST time slots (09:00 AM → 04:00 PM, every 30 min).
+// Fixed IST time slots (09:00 AM → 10:00 PM, every 30 min).
 const TIME_SLOTS: string[] = (() => {
   const out: string[] = [];
-  for (let m = 9 * 60; m <= 16 * 60; m += 30) out.push(`${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`);
+  for (let m = 9 * 60; m <= 22 * 60; m += 30) out.push(`${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`);
   return out;
 })();
 function slotLabel(hhmm: string): string {
