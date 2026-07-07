@@ -1512,8 +1512,14 @@ const app = new Hono<{ Variables: Vars }>()
     const atts = await db.select().from(schema.attempts).where(eq(schema.attempts.examId, eid));
     const students = await db.select().from(schema.students).where(eq(schema.students.tenantId, p.tenantId!));
     const smap = new Map(students.map((s) => [s.id, s]));
+    const classes = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, p.tenantId!));
+    const clmap = new Map(classes.map((cl) => [cl.id, cl]));
+    const sectionOf = (sid: string) => {
+      const cid = smap.get(sid)?.classId;
+      return cid ? clmap.get(cid)?.code ?? "" : "";
+    };
     const rows = atts
-      .map((a) => ({ attemptId: a.id, studentId: a.studentId, name: smap.get(a.studentId)?.name ?? "—", rollNo: smap.get(a.studentId)?.rollNo ?? "", email: smap.get(a.studentId)?.email ?? null, score: a.score, status: a.status, submittedAt: a.submittedAt }))
+      .map((a) => ({ attemptId: a.id, studentId: a.studentId, name: smap.get(a.studentId)?.name ?? "—", rollNo: smap.get(a.studentId)?.rollNo ?? "", email: smap.get(a.studentId)?.email ?? null, section: sectionOf(a.studentId), score: a.score, status: a.status, submittedAt: a.submittedAt }))
       .sort((x, y) => (y.score ?? -1) - (x.score ?? -1));
     return c.json({ exam: ex, results: rows }, 200);
   })

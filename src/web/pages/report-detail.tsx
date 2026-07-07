@@ -6,7 +6,7 @@ import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, Pill, Drawer, usePagination, Pager } from "../components/ui";
 
-type Row = { attemptId: string; studentId: string; name: string; rollNo: string; email: string | null; score: number | null; status: string; submittedAt: string | number | null };
+type Row = { attemptId: string; studentId: string; name: string; rollNo: string; email: string | null; section: string; score: number | null; status: string; submittedAt: string | number | null };
 
 export default function ReportDetail() {
   const { examId } = useParams<{ examId: string }>();
@@ -41,9 +41,9 @@ export default function ReportDetail() {
   const to = Math.min(curPage * PS, results.length);
 
   function exportCsv() {
-    const header = ["#", "Name", "Roll No", "Email", "Score", "Status"];
+    const header = ["#", "Name", "Roll No", "Email", "Section", "Score"];
     const lines = results.map((r, i) => [
-      i + 1, r.name, r.rollNo, r.email ?? "", r.score ?? "", r.status,
+      i + 1, r.name, r.rollNo, r.email ?? "", r.section ?? "", r.score ?? "",
     ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(","));
     const csv = [header.join(","), ...lines].join("\r\n");
     const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" });
