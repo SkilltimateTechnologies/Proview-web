@@ -1257,6 +1257,125 @@ const app = new Hono<{ Variables: Vars }>()
     return c.json({ ok: true, extraMin: row.extraMin }, 200);
   })
 
+  // =================== SCHEDULE-ASSESSMENT ROSTER (add / remove students) ===================
+  // Manage the per-assessment student roster from the Schedule Assessment screen.
+  // Same override model as the reports roster, but gated by the "exams" permission
+  // so it lives with assessment scheduling. Works regardless of exam status.
+
+  // Current roster overrides for an exam: explicitly added + explicitly removed.
+  .get("/exams/:examId/roster", requireAuth, requirePermission("exams"), async (c) => {
+    const p = c.get("profile")!;
+    const eid = c.req.param("examId");
+    const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
+    const overrides = await db.select().from(schema.examRoster).where(eq(schema.examRoster.examId, eid));
+    const classes = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, p.tenantId!));
+    const clmap = new Map(classes.map((cl) => [cl.id, cl]));
+    const studs = await db.select().from(schema.students).where(eq(schema.students.tenantId, p.tenantId!));
+    const smap = new Map(studs.map((s) => [s.id, s]));
+    const shape = (o: typeof overrides[number]) => {
+      const s = smap.get(o.studentId);
+      return { id: o.studentId, name: s?.name ?? "—", rollNo: s?.rollNo ?? "", email: s?.email ?? null, section: s?.classId ? clmap.get(s.classId)?.code ?? "" : "" };
+    };
+    const added = overrides.filter((o) => o.mode === "add").map(shape);
+    const removed = overrides.filter((o) => o.mode === "remove").map(shape);
+    return c.json({ added, removed }, 200);
+  })
+
+  // Students NOT currently eligible for the exam — the "Add student" picker.
+  .get("/exams/:examId/roster/candidates", requireAuth, requirePermission("exams"), async (c) => {
+    const p = c.get("profile")!;
+    const eid = c.req.param("examId");
+    const q = (c.req.query("q") ?? "").trim().toLowerCase();
+    const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
+    const roster = await loadRoster(eid);
+    const allStudents = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, p.tenantId!), eq(schema.students.enabled, true)));
+    const classes = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, p.tenantId!));
+    const clmap = new Map(classes.map((cl) => [cl.id, cl]));
+    const candidates = allStudents
+      .filter((stu) => !isEligible(ex, stu, roster))
+      .filter((stu) => !q || (stu.name ?? "").toLowerCase().includes(q) || (stu.rollNo ?? "").toLowerCase().includes(q) || (stu.email ?? "").toLowerCase().includes(q))
+      .slice(0, 30)
+      .map((stu) => ({ id: stu.id, name: stu.name ?? "—", rollNo: stu.rollNo ?? "", email: stu.email ?? null, section: stu.classId ? clmap.get(stu.classId)?.code ?? "" : "" }));
+    return c.json({ candidates }, 200);
+  })
+
+  // Students CURRENTLY eligible for the exam — the "Remove student" picker.
+  .get("/exams/:examId/roster/eligible", requireAuth, requirePermission("exams"), async (c) => {
+    const p = c.get("profile")!;
+    const eid = c.req.param("examId");
+    const q = (c.req.query("q") ?? "").trim().toLowerCase();
+    const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
+    const roster = await loadRoster(eid);
+    const allStudents = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, p.tenantId!), eq(schema.students.enabled, true)));
+    const classes = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, p.tenantId!));
+    const clmap = new Map(classes.map((cl) => [cl.id, cl]));
+    const eligible = allStudents
+      .filter((stu) => isEligible(ex, stu, roster))
+      .filter((stu) => !q || (stu.name ?? "").toLowerCase().includes(q) || (stu.rollNo ?? "").toLowerCase().includes(q) || (stu.email ?? "").toLowerCase().includes(q))
+      .slice(0, 30)
+      .map((stu) => ({ id: stu.id, name: stu.name ?? "—", rollNo: stu.rollNo ?? "", email: stu.email ?? null, section: stu.classId ? clmap.get(stu.classId)?.code ?? "" : "" }));
+    return c.json({ eligible }, 200);
+  })
+
+  // Add a student to the assessment (idempotent). Clears any prior override.
+  .post("/exams/:examId/roster/add", requireAuth, requirePermission("exams"), async (c) => {
+    const p = c.get("profile")!;
+    const eid = c.req.param("examId");
+    const b = await c.req.json().catch(() => ({}));
+    const studentId = String(b.studentId ?? "");
+    if (!studentId) return c.json({ message: "studentId required" }, 400);
+    const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
+    const [stu] = await db.select().from(schema.students).where(eq(schema.students.id, studentId)).limit(1);
+    if (!stu || stu.tenantId !== p.tenantId) return c.json({ message: "Student not found" }, 404);
+    await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
+    if (!matchesCohort(ex, stu)) {
+      await db.insert(schema.examRoster).values({ id: id("rst"), examId: eid, studentId, mode: "add", createdBy: p.userId ?? null });
+    }
+    return c.json({ ok: true }, 200);
+  })
+
+  // Remove a student from the assessment: records a "remove" override and deletes
+  // any attempt/answers/events for this exam so they are not counted at all.
+  .post("/exams/:examId/roster/remove", requireAuth, requirePermission("exams"), async (c) => {
+    const p = c.get("profile")!;
+    const eid = c.req.param("examId");
+    const b = await c.req.json().catch(() => ({}));
+    const studentId = String(b.studentId ?? "");
+    if (!studentId) return c.json({ message: "studentId required" }, 400);
+    const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
+    const atts = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
+    for (const a of atts) {
+      await db.delete(schema.answers).where(eq(schema.answers.attemptId, a.id));
+      await db.delete(schema.integrityEvents).where(eq(schema.integrityEvents.attemptId, a.id));
+    }
+    if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
+    await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
+    // Only need a "remove" override if the student would otherwise be a cohort match.
+    const [stu] = await db.select().from(schema.students).where(eq(schema.students.id, studentId)).limit(1);
+    if (stu && matchesCohort(ex, stu)) {
+      await db.insert(schema.examRoster).values({ id: id("rst"), examId: eid, studentId, mode: "remove", createdBy: p.userId ?? null });
+    }
+    return c.json({ ok: true }, 200);
+  })
+
+  // Undo an override — restore a student to their default cohort eligibility.
+  .post("/exams/:examId/roster/reset", requireAuth, requirePermission("exams"), async (c) => {
+    const p = c.get("profile")!;
+    const eid = c.req.param("examId");
+    const b = await c.req.json().catch(() => ({}));
+    const studentId = String(b.studentId ?? "");
+    if (!studentId) return c.json({ message: "studentId required" }, 400);
+    const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
+    await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
+    return c.json({ ok: true }, 200);
+  })
+
   // Reopen a single accidentally-submitted attempt. Flips submitted/graded back
   // to in_progress WITHOUT wiping the student's work — their answers stay in the
   // DB and their timer resumes from the original startedAt (via effectiveEndMs).

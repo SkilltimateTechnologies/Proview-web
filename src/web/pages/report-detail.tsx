@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, type CSSProperties } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, Link } from "wouter";
-import { ArrowLeft, Download, ChevronRight, Check, X, Sparkles, Lightbulb, MoreVertical, UserPlus, UserX, Trash2, Search } from "lucide-react";
+import { ArrowLeft, Download, ChevronRight, Check, X, Sparkles, Lightbulb, MoreVertical, UserX, Trash2 } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, Pill, Drawer, usePagination, Pager } from "../components/ui";
@@ -18,7 +18,6 @@ export default function ReportDetail() {
   const qc = useQueryClient();
   const [openAttempt, setOpenAttempt] = useState<Row | null>(null);
   const [page, setPage] = useState(1);
-  const [addOpen, setAddOpen] = useState(false);
   const [confirm, setConfirm] = useState<{ row: Row; action: "absent" | "remove" } | null>(null);
   const q = useQuery({
     queryKey: ["report", examId],
@@ -88,7 +87,6 @@ export default function ReportDetail() {
         title={exam.title}
         action={
           <div className="flex items-center gap-2">
-            <button className="btn btn-ghost" onClick={() => setAddOpen(true)}><UserPlus size={16} /> Add student</button>
             <button className="btn btn-ghost" onClick={exportCsv}><Download size={16} /> Export CSV</button>
             <Pill label={exam.status.toUpperCase()} color="#2e7d5b" />
           </div>
@@ -155,8 +153,6 @@ export default function ReportDetail() {
       <Pager page={curPage} pageCount={pageCount} from={from} to={to} total={results.length} onChange={setPage} unit="students" />
 
       {openAttempt && <AttemptDrawer examId={examId} row={openAttempt} onClose={() => setOpenAttempt(null)} />}
-
-      {addOpen && <AddStudentDrawer examId={examId} onClose={() => setAddOpen(false)} onAdded={refresh} />}
 
       {confirm && (
         <ConfirmDialog
@@ -243,79 +239,6 @@ function ConfirmDialog({ row, action, busy, onCancel, onConfirm }: { row: Row; a
         </div>
       </div>
     </div>
-  );
-}
-
-type Candidate = { id: string; name: string; rollNo: string; email: string | null; section: string };
-
-function AddStudentDrawer({ examId, onClose, onAdded }: { examId: string; onClose: () => void; onAdded: () => void }) {
-  const [term, setTerm] = useState("");
-  const [debounced, setDebounced] = useState("");
-  const [addingId, setAddingId] = useState<string | null>(null);
-  useEffect(() => {
-    const t = setTimeout(() => setDebounced(term), 250);
-    return () => clearTimeout(t);
-  }, [term]);
-
-  const q = useQuery({
-    queryKey: ["roster-candidates", examId, debounced],
-    queryFn: async () => {
-      const res = await api.reports[":examId"].roster.candidates.$get({ param: { examId }, query: { q: debounced } });
-      if (!res.ok) throw new Error("failed");
-      return res.json();
-    },
-  });
-  const candidates = (q.data && !("message" in q.data) ? q.data.candidates : []) as Candidate[];
-
-  const add = useMutation({
-    mutationFn: async (studentId: string) => {
-      setAddingId(studentId);
-      const res = await api.reports[":examId"].roster.add.$post({ param: { examId }, json: { studentId } });
-      if (!res.ok) throw new Error("failed");
-      return res.json();
-    },
-    onSuccess: () => { onAdded(); q.refetch(); },
-    onSettled: () => setAddingId(null),
-  });
-
-  return (
-    <Drawer eyebrow="Roster" title="Add student to assessment" subtitle="Merge a student from another batch onto this assessment" onClose={onClose} width="max-w-lg">
-      <div className="relative mb-4">
-        <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--color-muted)]" />
-        <input
-          autoFocus
-          value={term}
-          onChange={(e) => setTerm(e.target.value)}
-          placeholder="Search by name, roll no, or email"
-          className="w-full pl-9 pr-3 py-2.5 rounded-lg border border-[var(--color-line)] text-sm bg-white text-[var(--color-ink)]"
-        />
-      </div>
-      {q.isLoading ? (
-        <Loader />
-      ) : candidates.length === 0 ? (
-        <div className="card p-6 text-center text-sm text-[var(--color-ink2)]">
-          {debounced ? "No matching students available to add." : "Start typing to find students from other batches."}
-        </div>
-      ) : (
-        <div className="space-y-2">
-          {candidates.map((s) => (
-            <div key={s.id} className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-[var(--color-line)]">
-              <div className="flex-1 min-w-0">
-                <div className="font-medium text-[var(--color-ink)] truncate">{s.name}</div>
-                <div className="text-xs text-[var(--color-muted)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{s.rollNo}{s.section ? ` · ${s.section}` : ""}{s.email ? ` · ${s.email}` : ""}</div>
-              </div>
-              <button
-                className="btn btn-ghost shrink-0"
-                onClick={() => add.mutate(s.id)}
-                disabled={addingId === s.id}
-              >
-                <UserPlus size={15} /> {addingId === s.id ? "Adding…" : "Add"}
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-    </Drawer>
   );
 }
 

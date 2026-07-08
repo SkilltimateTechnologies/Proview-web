@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import type { Dispatch, SetStateAction } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Lock, BarChart3, Clock, CalendarClock, ArrowLeft, Pencil, Ban } from "lucide-react";
+import { Plus, Lock, BarChart3, Clock, CalendarClock, ArrowLeft, Pencil, Ban, Search, UserPlus, UserX, Undo2, Users } from "lucide-react";
 import { useLocation, useParams } from "wouter";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
-import { Loader, EmptyState, Pill, Field, usePagination, Pager } from "../components/ui";
+import { Loader, EmptyState, Pill, Field, usePagination, Pager, Drawer } from "../components/ui";
 
 function toMs(ts: number | string | null | undefined): number | null {
   if (ts === null || ts === undefined) return null;
@@ -354,7 +354,205 @@ export function EditExam() {
           </div>
         )}
       </div>
+
+      <RosterPanel examId={examId} />
     </div>
+  );
+}
+
+type RCand = { id: string; name: string; rollNo: string; email: string | null; section: string };
+
+// Per-assessment roster overrides shown on the Schedule Assessment screen.
+// Admins can add a specific student onto this assessment or remove one from it,
+// independent of the section cohort. Works even after the exam window closes.
+function RosterPanel({ examId }: { examId: string }) {
+  const qc = useQueryClient();
+  const [addOpen, setAddOpen] = useState(false);
+  const [removeOpen, setRemoveOpen] = useState(false);
+
+  const rosterQ = useQuery({
+    queryKey: ["exam-roster", examId],
+    queryFn: async () => {
+      const res = await api.exams[":examId"].roster.$get({ param: { examId } });
+      if (!res.ok) throw new Error("failed");
+      return res.json();
+    },
+  });
+  const added = (rosterQ.data && !("message" in rosterQ.data) ? rosterQ.data.added : []) as RCand[];
+  const removed = (rosterQ.data && !("message" in rosterQ.data) ? rosterQ.data.removed : []) as RCand[];
+
+  const refresh = () => qc.invalidateQueries({ queryKey: ["exam-roster", examId] });
+
+  const reset = useMutation({
+    mutationFn: async (studentId: string) => {
+      const res = await api.exams[":examId"].roster.reset.$post({ param: { examId }, json: { studentId } });
+      if (!res.ok) throw new Error("failed");
+      return res.json();
+    },
+    onSuccess: refresh,
+  });
+
+  return (
+    <div className="card p-5 mt-5">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div>
+          <div className="mono-label mb-1">Roster overrides</div>
+          <p className="text-sm text-[var(--color-ink2)]">
+            Add a specific student onto this assessment, or remove one from it — beyond the section cohort.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button className="btn btn-ghost" onClick={() => setAddOpen(true)}><UserPlus size={16} /> Add student</button>
+          <button className="btn btn-ghost" onClick={() => setRemoveOpen(true)}><UserX size={16} /> Remove student</button>
+        </div>
+      </div>
+
+      {rosterQ.isLoading ? (
+        <div className="mt-4"><Loader /></div>
+      ) : (added.length === 0 && removed.length === 0) ? (
+        <div className="mt-4 text-sm text-[var(--color-ink2)] flex items-center gap-2">
+          <Users size={15} /> No overrides. This assessment uses the section cohort only.
+        </div>
+      ) : (
+        <div className="mt-4 grid sm:grid-cols-2 gap-4">
+          <div>
+            <div className="mono-label mb-2" style={{ color: "#2e7d5b" }}>Added ({added.length})</div>
+            {added.length === 0 ? (
+              <div className="text-sm text-[var(--color-ink2)]">None</div>
+            ) : (
+              <div className="space-y-2">
+                {added.map((s) => (
+                  <RosterRow key={s.id} s={s} onUndo={() => reset.mutate(s.id)} undoing={reset.isPending} label="Remove" />
+                ))}
+              </div>
+            )}
+          </div>
+          <div>
+            <div className="mono-label mb-2" style={{ color: "#c0453b" }}>Removed ({removed.length})</div>
+            {removed.length === 0 ? (
+              <div className="text-sm text-[var(--color-ink2)]">None</div>
+            ) : (
+              <div className="space-y-2">
+                {removed.map((s) => (
+                  <RosterRow key={s.id} s={s} onUndo={() => reset.mutate(s.id)} undoing={reset.isPending} label="Restore" />
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {addOpen && <RosterPickDrawer examId={examId} mode="add" onClose={() => setAddOpen(false)} onDone={refresh} />}
+      {removeOpen && <RosterPickDrawer examId={examId} mode="remove" onClose={() => setRemoveOpen(false)} onDone={refresh} />}
+    </div>
+  );
+}
+
+function RosterRow({ s, onUndo, undoing, label }: { s: RCand; onUndo: () => void; undoing: boolean; label: string }) {
+  return (
+    <div className="flex items-center gap-3 px-3 py-2 rounded-lg border border-[var(--color-line)]">
+      <div className="flex-1 min-w-0">
+        <div className="font-medium text-[var(--color-ink)] truncate text-sm">{s.name}</div>
+        <div className="text-xs text-[var(--color-muted)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{s.rollNo}{s.section ? ` · ${s.section}` : ""}</div>
+      </div>
+      <button className="btn btn-ghost shrink-0 py-1 text-xs" onClick={onUndo} disabled={undoing}>
+        <Undo2 size={14} /> {label}
+      </button>
+    </div>
+  );
+}
+
+// Search + pick drawer, reused for both "add" (searches non-eligible candidates)
+// and "remove" (searches currently-eligible students).
+function RosterPickDrawer({ examId, mode, onClose, onDone }: { examId: string; mode: "add" | "remove"; onClose: () => void; onDone: () => void }) {
+  const [term, setTerm] = useState("");
+  const [debounced, setDebounced] = useState("");
+  const [busyId, setBusyId] = useState<string | null>(null);
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(term), 250);
+    return () => clearTimeout(t);
+  }, [term]);
+
+  const q = useQuery({
+    queryKey: ["roster-pick", examId, mode, debounced],
+    queryFn: async () => {
+      const res = mode === "add"
+        ? await api.exams[":examId"].roster.candidates.$get({ param: { examId }, query: { q: debounced } })
+        : await api.exams[":examId"].roster.eligible.$get({ param: { examId }, query: { q: debounced } });
+      if (!res.ok) throw new Error("failed");
+      return res.json();
+    },
+  });
+  const rows = (q.data && !("message" in q.data)
+    ? (mode === "add" ? (q.data as { candidates: RCand[] }).candidates : (q.data as { eligible: RCand[] }).eligible)
+    : []) as RCand[];
+
+  const act = useMutation({
+    mutationFn: async (studentId: string) => {
+      setBusyId(studentId);
+      const res = mode === "add"
+        ? await api.exams[":examId"].roster.add.$post({ param: { examId }, json: { studentId } })
+        : await api.exams[":examId"].roster.remove.$post({ param: { examId }, json: { studentId } });
+      if (!res.ok) throw new Error("failed");
+      return res.json();
+    },
+    onSuccess: () => { onDone(); q.refetch(); },
+    onSettled: () => setBusyId(null),
+  });
+
+  const isAdd = mode === "add";
+  return (
+    <Drawer
+      eyebrow="Roster"
+      title={isAdd ? "Add student to assessment" : "Remove student from assessment"}
+      subtitle={isAdd ? "Search any student to add onto this assessment" : "Search students currently eligible for this assessment"}
+      onClose={onClose}
+      width="max-w-lg"
+    >
+      <div className="relative mb-4">
+        <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--color-muted)]" />
+        <input
+          autoFocus
+          value={term}
+          onChange={(e) => setTerm(e.target.value)}
+          placeholder="Search by name, roll no, or email"
+          className="w-full pl-9 pr-3 py-2.5 rounded-lg border border-[var(--color-line)] text-sm bg-white text-[var(--color-ink)]"
+        />
+      </div>
+      {isAdd ? null : (
+        <p className="text-xs text-[var(--color-ink2)] mb-3">
+          Removing a student excludes them from the roster, report and count, and deletes any attempt they had for this assessment.
+        </p>
+      )}
+      {q.isLoading ? (
+        <Loader />
+      ) : rows.length === 0 ? (
+        <div className="card p-6 text-center text-sm text-[var(--color-ink2)]">
+          {debounced
+            ? "No matching students."
+            : isAdd ? "Start typing to find students to add." : "Start typing to find students to remove."}
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {rows.map((s) => (
+            <div key={s.id} className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-[var(--color-line)]">
+              <div className="flex-1 min-w-0">
+                <div className="font-medium text-[var(--color-ink)] truncate">{s.name}</div>
+                <div className="text-xs text-[var(--color-muted)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{s.rollNo}{s.section ? ` · ${s.section}` : ""}{s.email ? ` · ${s.email}` : ""}</div>
+              </div>
+              <button
+                className="btn btn-ghost shrink-0"
+                onClick={() => act.mutate(s.id)}
+                disabled={busyId === s.id}
+              >
+                {isAdd ? <UserPlus size={15} /> : <UserX size={15} />}
+                {busyId === s.id ? "Working…" : isAdd ? "Add" : "Remove"}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </Drawer>
   );
 }
 
