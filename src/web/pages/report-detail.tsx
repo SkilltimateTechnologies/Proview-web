@@ -95,10 +95,14 @@ export default function ReportDetail() {
         }
       />
 
-      <div className="grid grid-cols-3 gap-4 mb-4">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4">
         <div className="card p-5">
           <div className="stat-num text-[1.8rem]">{results.filter((r) => !r.absent).length}</div>
           <div className="mono-label mt-1">Attempts</div>
+        </div>
+        <div className="card p-5">
+          <div className="stat-num text-[1.8rem]" style={{ color: "#c0453b" }}>{results.filter((r) => r.absent).length}</div>
+          <div className="mono-label mt-1">Absent</div>
         </div>
         <div className="card p-5">
           <div className="stat-num text-[1.8rem]">{topper?.score ?? "—"}</div>
@@ -106,7 +110,7 @@ export default function ReportDetail() {
         </div>
         <div className="card p-5">
           <div className="stat-num text-[1.8rem]">
-            {results.filter((r) => (r.score ?? 0) >= 40).length}
+            {results.filter((r) => !r.absent && (r.score ?? 0) >= 40).length}
           </div>
           <div className="mono-label mt-1">Passed</div>
         </div>
@@ -129,7 +133,7 @@ export default function ReportDetail() {
             <span className="mono-label w-6 sm:w-8 shrink-0">{String((curPage - 1) * PS + i + 1).padStart(2, "0")}</span>
             <div className="flex-1 min-w-0">
               <div className="font-medium text-[var(--color-ink)] truncate">{r.name}</div>
-              <div className="text-xs text-[var(--color-muted)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{r.rollNo}</div>
+              <div className="text-xs text-[var(--color-muted)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{r.rollNo}{r.section ? ` · ${r.section}` : ""}</div>
             </div>
             <span className="w-28 text-right shrink-0 hidden sm:block text-xs text-[var(--color-muted)]" style={{ fontFamily: "var(--font-mono)" }}>{fmtSubmitted(r.submittedAt)}</span>
             {r.absent ? (
