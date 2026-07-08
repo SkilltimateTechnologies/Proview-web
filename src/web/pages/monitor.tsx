@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, UserX, Pause, Play, Plus, Wifi, WifiOff } from "lucide-react";
+import { Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, UserX, Pause, Play, Plus, Wifi, WifiOff, RotateCcw } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Drawer } from "../components/ui";
@@ -324,6 +324,10 @@ function StudentDrawer({ s, onClose }: { s: LiveStudent; onClose: () => void }) 
         )}
       </div>
 
+      {s.status === "finished" && s.examId && (
+        <ReopenControl examId={s.examId} attemptId={s.attemptId} student={s.student} onDone={onClose} />
+      )}
+
       {s.status === "absent" ? (
         <div className="card p-6 text-center text-sm text-[var(--color-ink2)]">
           This candidate did not appear — the exam window has closed and they never started.
@@ -349,6 +353,87 @@ function StudentDrawer({ s, onClose }: { s: LiveStudent; onClose: () => void }) 
         </>
       )}
     </Drawer>
+  );
+}
+
+/** Reopen an accidentally-submitted attempt back to in-progress, keeping the
+ *  student's answers. Optionally grant extra minutes to this student only. */
+function ReopenControl({ examId, attemptId, student, onDone }: { examId: string; attemptId: string; student: string; onDone: () => void }) {
+  const qc = useQueryClient();
+  const [confirming, setConfirming] = useState(false);
+  const [addMinutes, setAddMinutes] = useState(0);
+  const [err, setErr] = useState<string | null>(null);
+
+  const reopen = useMutation({
+    mutationFn: async () => {
+      const res = await api.exams[":id"].attempts[":attemptId"].reopen.$post({
+        param: { id: examId, attemptId },
+        json: { addMinutes },
+      });
+      const body = await res.json().catch(() => ({}) as any);
+      if (!res.ok) throw new Error(("message" in body && body.message) || "Could not reopen the attempt.");
+      return body;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["monitor"] });
+      onDone();
+    },
+    onError: (e: Error) => setErr(e.message),
+  });
+
+  if (!confirming) {
+    return (
+      <div className="rounded-xl border border-[var(--color-line)] bg-[var(--color-page)] p-4 mb-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-medium text-[var(--color-ink)]">Submitted by accident?</div>
+            <div className="text-xs text-[var(--color-ink2)] mt-0.5">Reopen this attempt so {student} can continue. Their answers are kept.</div>
+          </div>
+          <button
+            onClick={() => setConfirming(true)}
+            className="inline-flex items-center gap-1.5 text-xs font-semibold rounded-lg px-3 py-1.5 border border-[var(--brand)] text-[var(--brand)] hover:bg-[var(--color-brand-soft)] transition"
+          >
+            <RotateCcw size={13} /> Reopen exam
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-xl border border-[var(--brand)] bg-[var(--color-brand-soft)] p-4 mb-5">
+      <div className="text-sm font-medium text-[var(--color-ink)] mb-1">Reopen {student}'s exam?</div>
+      <div className="text-xs text-[var(--color-ink2)] mb-3">
+        Status flips back to <b>in progress</b> and the timer resumes from their original start time. Answers are preserved. If the exam window is tight, grant extra minutes below (this student only).
+      </div>
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="inline-flex items-center gap-1 rounded-lg border border-[var(--color-line)] bg-[var(--color-card)] px-1.5 py-0.5">
+          <input
+            type="number"
+            min={0}
+            value={addMinutes}
+            onChange={(e) => setAddMinutes(Math.max(0, Number(e.target.value) || 0))}
+            className="w-12 bg-transparent text-sm text-[var(--color-ink)] outline-none text-center"
+          />
+          <span className="mono-label pr-1">extra min</span>
+        </div>
+        <button
+          onClick={() => reopen.mutate()}
+          disabled={reopen.isPending}
+          className="inline-flex items-center gap-1.5 text-xs font-semibold rounded-lg px-3 py-1.5 bg-[var(--brand)] text-white disabled:opacity-50"
+        >
+          {reopen.isPending ? <Loader2 size={13} className="animate-spin" /> : <RotateCcw size={13} />} Confirm reopen
+        </button>
+        <button
+          onClick={() => { setConfirming(false); setErr(null); }}
+          disabled={reopen.isPending}
+          className="text-xs font-semibold text-[var(--color-ink2)] px-2 py-1.5 disabled:opacity-50"
+        >
+          Cancel
+        </button>
+      </div>
+      {err && <div className="text-xs mt-2 font-medium" style={{ color: "#c0453b" }}>{err}</div>}
+    </div>
   );
 }
 

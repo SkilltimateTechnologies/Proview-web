@@ -1253,6 +1253,45 @@ const app = new Hono<{ Variables: Vars }>()
     return c.json({ ok: true, extraMin: row.extraMin }, 200);
   })
 
+  // Reopen a single accidentally-submitted attempt. Flips submitted/graded back
+  // to in_progress WITHOUT wiping the student's work — their answers stay in the
+  // DB and their timer resumes from the original startedAt (via effectiveEndMs).
+  // Optional addMinutes grants extra time to THIS student only by bumping the
+  // per-attempt pausedMs (does not affect anyone else in the exam).
+  .post("/exams/:id/attempts/:attemptId/reopen", requireAuth, requirePermission("liveMonitor"), async (c) => {
+    const p = c.get("profile")!;
+    const eid = c.req.param("id");
+    const aid = c.req.param("attemptId");
+    const b = await c.req.json().catch(() => ({}));
+    let addMinutes = Number(b.addMinutes);
+    if (!Number.isFinite(addMinutes) || addMinutes < 0) addMinutes = 0;
+    addMinutes = Math.round(addMinutes);
+
+    const [exam] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    if (!exam || exam.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
+    const [attempt] = await db.select().from(schema.attempts).where(eq(schema.attempts.id, aid)).limit(1);
+    if (!attempt || attempt.examId !== eid) return c.json({ message: "Attempt not found" }, 404);
+    if (attempt.status !== "submitted" && attempt.status !== "graded") {
+      return c.json({ message: "Only a submitted or graded attempt can be reopened." }, 400);
+    }
+
+    const newPaused = (attempt.pausedMs ?? 0) + addMinutes * 60_000;
+    await db
+      .update(schema.attempts)
+      .set({
+        status: "in_progress",
+        score: null,
+        submittedAt: null,
+        pausedMs: newPaused,
+        lastPausedAt: null,
+        lastSeenAt: new Date(),
+      })
+      .where(eq(schema.attempts.id, aid));
+
+    const endAtMs = effectiveEndMs(exam, { startedAt: attempt.startedAt, pausedMs: newPaused }, Date.now());
+    return c.json({ ok: true, endAt: new Date(endAtMs), addedMinutes: addMinutes }, 200);
+  })
+
   // =================== LIVE MONITOR ===================
   .get("/monitor", requireAuth, requirePermission("liveMonitor"), async (c) => {
     const p = c.get("profile")!;
