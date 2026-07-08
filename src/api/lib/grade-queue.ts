@@ -232,6 +232,7 @@ export async function sweepAutoSubmit() {
     const examById = new Map(exams.map((e) => [e.id, e]));
     const provider = await getProvider();
     let done = 0;
+    let dropped = 0;
     for (const a of inProg) {
       const exam = examById.get(a.examId);
       if (!exam) continue;
@@ -240,13 +241,27 @@ export async function sweepAutoSubmit() {
       const endMs = effectiveEndMs(exam, a, now);
       if (endMs + AUTOSUBMIT_GRACE_MS >= now) continue; // still within window + grace
       try {
+        // A student who opened the exam but never submitted a single answer by
+        // the deadline is effectively absent. There is nothing to grade, so
+        // rather than force-submit them to a graded 0 (a wasted grading pass
+        // that also turns a no-show into a "participant"), delete the empty
+        // abandoned attempt — the report then surfaces them as auto-absent "A".
+        const ans = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, a.id));
+        const hasWork = ans.some((x) => hasContent(x.response));
+        if (!hasWork) {
+          await db.delete(schema.answers).where(eq(schema.answers.attemptId, a.id));
+          await db.delete(schema.integrityEvents).where(eq(schema.integrityEvents.attemptId, a.id));
+          await db.delete(schema.attempts).where(eq(schema.attempts.id, a.id));
+          dropped++;
+          continue;
+        }
         await finalizeAttempt(a, [], provider);
         done++;
       } catch (e) {
         console.error(`[auto-submit] attempt ${a.id} failed:`, e);
       }
     }
-    if (done) console.log(`[auto-submit] force-submitted ${done} expired in-progress attempt(s)`);
+    if (done || dropped) console.log(`[auto-submit] force-submitted ${done} expired attempt(s); dropped ${dropped} empty attempt(s) as absent`);
   } catch (e) {
     console.error("[auto-submit] sweep failed:", e);
   }
