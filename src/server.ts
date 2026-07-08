@@ -7,6 +7,13 @@ const indexPath = `${distDir}/index.html`;
 
 const server = Bun.serve({
   port,
+  // Bun's default idleTimeout is 10s. The /student/run-code path can legitimately
+  // run much longer under exam load (queue wait up to JUDGE0_MAX_WAIT_MS=30s +
+  // Judge0 batch polling ~17.5s). If the socket idles past the limit Bun closes
+  // it and the edge (Cloudflare/Railway) returns a raw 502 "Bad Gateway" with no
+  // body — which is exactly what students saw as "Request failed (502)". 255s is
+  // Bun's max and comfortably covers the worst-case synchronous run-code time.
+  idleTimeout: 255,
   async fetch(request) {
     const url = new URL(request.url);
 
