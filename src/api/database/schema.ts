@@ -59,6 +59,8 @@ export const students = sqliteTable(
     rollNo: text("roll_no").notNull(),   // STU-21CS102
     name: text("name").notNull(),
     email: text("email"),
+    phone: text("phone"),
+    gender: text("gender"),              // male | female
     // Phase 1 stores a login password for the Phase 2 desktop student client.
     password: text("password").notNull().default("Welcome@123"),
     // Force a password change on first login with the issued password.

@@ -9,7 +9,6 @@ const TYPES = [
   { v: "mcq", label: "MCQ (single)" },
   { v: "multi", label: "Multi-select" },
   { v: "truefalse", label: "True / False" },
-  { v: "fillblank", label: "Fill in the blank" },
   { v: "short", label: "Short answer" },
   { v: "essay", label: "Essay" },
   { v: "coding", label: "Coding" },

@@ -43,6 +43,28 @@ function effectiveEndMs(
   return base + extra;
 }
 
+// Resolve the tenant for the public registration page from a URL code.
+// Accepts (case-insensitive) the college short code (shortName), the slug, or the raw tenant id.
+async function resolveRegisterTenant(codeRaw: string) {
+  const code = String(codeRaw ?? "").trim();
+  if (!code) return null;
+  const lower = code.toLowerCase();
+  const [byCode] = await db
+    .select()
+    .from(schema.tenants)
+    .where(
+      and(
+        eq(schema.tenants.enabled, true),
+        or(
+          dsql`lower(${schema.tenants.shortName}) = ${lower}`,
+          dsql`lower(${schema.tenants.slug}) = ${lower}`,
+          eq(schema.tenants.id, code),
+        ),
+      ),
+    );
+  return byCode ?? null;
+}
+
 const app = new Hono<{ Variables: Vars }>()
   .use(cors({ origin: (origin) => origin ?? "*", credentials: true, exposeHeaders: ["set-auth-token"] }))
   .on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw))
@@ -110,6 +132,92 @@ const app = new Hono<{ Variables: Vars }>()
     } catch {
       return c.text("Not found", 404);
     }
+  })
+
+  // =================== PUBLIC SELF-REGISTRATION (no auth) ===================
+  // Meta for the public registration page: tenant name + section dropdown list.
+  // The URL uses the college short code (e.g. /register/tkr), resolved below.
+  .get("/register/:code/meta", async (c) => {
+    const t = await resolveRegisterTenant(c.req.param("code"));
+    if (!t) return c.json({ message: "Invalid registration link" }, 404);
+    const rows = await db
+      .select({ id: schema.classes.id, code: schema.classes.code })
+      .from(schema.classes)
+      .where(eq(schema.classes.tenantId, t.id));
+    rows.sort((a, b) => a.code.localeCompare(b.code));
+    return c.json({ tenant: { id: t.id, name: t.name, code: t.shortName }, sections: rows }, 200);
+  })
+  // Check whether a roll number already exists for this tenant.
+  .get("/register/:code/check", async (c) => {
+    const roll = String(c.req.query("rollNo") ?? "").trim().replace(/\s+/g, "").toUpperCase();
+    if (!roll) return c.json({ message: "Roll number required" }, 400);
+    const t = await resolveRegisterTenant(c.req.param("code"));
+    if (!t) return c.json({ message: "Invalid registration link" }, 404);
+    const tid = t.id;
+    const rows = await db
+      .select({ name: schema.students.name })
+      .from(schema.students)
+      .where(and(eq(schema.students.tenantId, tid), eq(schema.students.rollNo, roll)));
+    return c.json({ rollNo: roll, exists: rows.length > 0, name: rows[0]?.name ?? null }, 200);
+  })
+  // Register a new student (only if the roll number is not already present).
+  .post("/register/:code", async (c) => {
+    const rt = await resolveRegisterTenant(c.req.param("code"));
+    if (!rt) return c.json({ message: "Invalid registration link" }, 404);
+    const tid = rt.id;
+    const b = await c.req.json();
+
+    const roll = String(b.rollNo ?? "").trim().replace(/\s+/g, "").toUpperCase();
+    const name = String(b.name ?? "")
+      .trim()
+      .replace(/\s+/g, " ")
+      .toLowerCase()
+      .replace(/\b\w/g, (ch) => ch.toUpperCase());
+    const email = String(b.email ?? "").trim().toLowerCase();
+    const phone = String(b.phone ?? "").trim();
+    const gender = String(b.gender ?? "").trim().toLowerCase();
+    const classId = b.classId ? String(b.classId) : null;
+
+    if (!roll) return c.json({ message: "Roll number is required" }, 400);
+    if (!name) return c.json({ message: "Name is required" }, 400);
+    if (!classId) return c.json({ message: "Please select your section" }, 400);
+    if (!email || !/^\S+@\S+\.\S+$/.test(email)) return c.json({ message: "A valid email is required" }, 400);
+    if (!/^\d{10}$/.test(phone.replace(/\D/g, "").slice(-10))) return c.json({ message: "A valid phone number is required" }, 400);
+    if (gender !== "male" && gender !== "female") return c.json({ message: "Please select gender" }, 400);
+
+    // Section must belong to this tenant.
+    const [cls] = await db
+      .select({ id: schema.classes.id })
+      .from(schema.classes)
+      .where(and(eq(schema.classes.id, classId), eq(schema.classes.tenantId, tid)));
+    if (!cls) return c.json({ message: "Invalid section" }, 400);
+
+    // Block duplicates by roll number (case-insensitive; already upper-cased).
+    const [dupRoll] = await db
+      .select({ id: schema.students.id })
+      .from(schema.students)
+      .where(and(eq(schema.students.tenantId, tid), eq(schema.students.rollNo, roll)));
+    if (dupRoll) return c.json({ message: "This roll number is already registered", exists: true }, 409);
+
+    // Block duplicate email within the tenant.
+    const [dupEmail] = await db
+      .select({ id: schema.students.id })
+      .from(schema.students)
+      .where(and(eq(schema.students.tenantId, tid), eq(schema.students.email, email)));
+    if (dupEmail) return c.json({ message: "This email is already registered" }, 409);
+
+    await db.insert(schema.students).values({
+      id: id("stu"),
+      tenantId: tid,
+      classId,
+      rollNo: roll,
+      name,
+      email,
+      phone: phone.replace(/\D/g, "").slice(-10),
+      gender,
+      password: await hashPassword("Welcome@123"),
+    });
+    return c.json({ ok: true, name, rollNo: roll }, 201);
   })
 
   // =================== TENANTS (super admin) ===================
