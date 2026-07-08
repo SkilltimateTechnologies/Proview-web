@@ -110,7 +110,11 @@ export default function ReportDetail() {
               <div className="text-xs text-[var(--color-muted)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{r.rollNo}</div>
             </div>
             <span className="w-28 text-right shrink-0 hidden sm:block text-xs text-[var(--color-muted)]" style={{ fontFamily: "var(--font-mono)" }}>{fmtSubmitted(r.submittedAt)}</span>
-            <span className="stat-num w-14 sm:w-20 text-right shrink-0 text-[var(--color-ink)]">{r.score ?? "—"}</span>
+            {r.status === "graded" ? (
+              <span className="stat-num w-14 sm:w-20 text-right shrink-0 text-[var(--color-ink)]">{r.score ?? "—"}</span>
+            ) : (
+              <span className="w-14 sm:w-20 text-right shrink-0 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "#b7791f", fontFamily: "var(--font-mono)" }}>Grading</span>
+            )}
             <ChevronRight size={16} className="text-[var(--color-muted)] w-4 shrink-0" />
           </button>
         ))}
@@ -156,7 +160,7 @@ function AttemptDrawer({ examId, row, onClose }: { examId: string; row: Row; onC
   return (
     <Drawer eyebrow="Student report" title={row.name} subtitle={`${row.rollNo}${row.email ? " · " + row.email : ""}`} onClose={onClose} width="max-w-3xl">
       <div className="grid grid-cols-2 gap-4 mb-6">
-        <div className="card p-4"><div className="stat-num text-[1.6rem]" style={{ color: "var(--brand)" }}>{row.score != null ? `${row.score}/100` : "—"}</div><div className="mono-label mt-1">Marks scored</div></div>
+        <div className="card p-4">{row.status === "graded" ? (<div className="stat-num text-[1.6rem]" style={{ color: "var(--brand)" }}>{row.score != null ? `${row.score}/100` : "—"}</div>) : (<div className="stat-num text-[1.6rem]" style={{ color: "#b7791f" }}>Grading…</div>)}<div className="mono-label mt-1">Marks scored</div></div>
         <div className="card p-4"><div className="stat-num text-[1.6rem] text-[var(--color-ink)]">{fmtSubmitted(row.submittedAt)}</div><div className="mono-label mt-1">Submitted</div></div>
       </div>
 
@@ -197,7 +201,7 @@ function AnswerCard({ a, index }: { a: AnswerRow; index: number }) {
           <div className="mono-label mt-1 uppercase">{a.type}{a.topic ? ` · ${a.topic}` : ""}</div>
         </div>
         <span className="stat-num text-sm shrink-0 whitespace-nowrap" style={{ color: scoreColor }}>
-          {score}/{maxScore || "—"} pt
+          {scored ? `${score}/${maxScore || "—"} pt` : "Grading…"}
         </span>
       </div>
 

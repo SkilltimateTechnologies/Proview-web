@@ -75,7 +75,7 @@ export function queueAttemptGrading(attemptId: string, provider?: string | null)
     .finally(() => inFlight.delete(attemptId));
 }
 
-async function gradeAttempt(attemptId: string, providerArg?: string | null) {
+export async function gradeAttempt(attemptId: string, providerArg?: string | null) {
   const provider = providerArg !== undefined ? providerArg : await getProvider();
   const answers = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, attemptId));
   const pending = answers.filter((a) => !a.autoGraded && a.score == null && hasContent(a.response));
