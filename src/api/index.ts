@@ -1275,7 +1275,27 @@ const app = new Hono<{ Variables: Vars }>()
       return c.json({ message: "Only a submitted or graded attempt can be reopened." }, 400);
     }
 
-    const newPaused = (attempt.pausedMs ?? 0) + addMinutes * 60_000;
+    const now = Date.now();
+    const basePaused = (attempt.pausedMs ?? 0) + addMinutes * 60_000;
+
+    // Natural deadline if we just resumed the original timer.
+    const naturalEnd = effectiveEndMs(exam, { startedAt: attempt.startedAt, pausedMs: basePaused }, now);
+
+    // If the exam window has already closed, the natural deadline is in the past
+    // (effectiveEndMs caps base at exam.endAt), so the student would auto-submit
+    // the instant they reopen — timer 0. Grant a fresh writable window so they
+    // can actually rewrite. We compensate via pausedMs (added AFTER the exam cap
+    // inside effectiveEndMs), which affects THIS attempt only.
+    const MIN_WRITABLE_MS = 60_000; // 1 min floor of usable time
+    let newPaused = basePaused;
+    if (naturalEnd - now < MIN_WRITABLE_MS) {
+      const grantMin = addMinutes > 0 ? addMinutes : exam.durationMin;
+      const desiredEnd = now + grantMin * 60_000;
+      // Deadline with pausedMs=0 (includes the exam-window cap + admin extras).
+      const floorEnd = effectiveEndMs(exam, { startedAt: attempt.startedAt, pausedMs: 0 }, now);
+      newPaused = Math.max(basePaused, desiredEnd - floorEnd);
+    }
+
     await db
       .update(schema.attempts)
       .set({
@@ -1288,8 +1308,8 @@ const app = new Hono<{ Variables: Vars }>()
       })
       .where(eq(schema.attempts.id, aid));
 
-    const endAtMs = effectiveEndMs(exam, { startedAt: attempt.startedAt, pausedMs: newPaused }, Date.now());
-    return c.json({ ok: true, endAt: new Date(endAtMs), addedMinutes: addMinutes }, 200);
+    const endAtMs = effectiveEndMs(exam, { startedAt: attempt.startedAt, pausedMs: newPaused }, now);
+    return c.json({ ok: true, endAt: new Date(endAtMs), grantedUntil: new Date(endAtMs), addedMinutes: addMinutes }, 200);
   })
 
   // =================== LIVE MONITOR ===================
