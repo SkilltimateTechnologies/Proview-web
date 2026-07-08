@@ -1660,9 +1660,29 @@ const app = new Hono<{ Variables: Vars }>()
       const cid = smap.get(sid)?.classId;
       return cid ? clmap.get(cid)?.code ?? "" : "";
     };
-    const rows = atts
-      .map((a) => ({ attemptId: a.id, studentId: a.studentId, name: smap.get(a.studentId)?.name ?? "—", rollNo: smap.get(a.studentId)?.rollNo ?? "", email: smap.get(a.studentId)?.email ?? null, section: sectionOf(a.studentId), score: a.score, status: a.status, submittedAt: a.submittedAt }))
+    const attemptRows = atts
+      .map((a) => ({ attemptId: a.id, studentId: a.studentId, name: smap.get(a.studentId)?.name ?? "—", rollNo: smap.get(a.studentId)?.rollNo ?? "", email: smap.get(a.studentId)?.email ?? null, section: sectionOf(a.studentId), score: a.score, status: a.status, submittedAt: a.submittedAt, absent: false }))
       .sort((x, y) => (y.score ?? -1) - (x.score ?? -1));
+    // Assigned-but-absent students: enrolled in the exam's cohort yet no attempt row.
+    // Only surface them once the exam window has closed (before that they may still
+    // show up). Rendered as "A" (absent) rather than a misleading 0.
+    const attemptedIds = new Set(atts.map((a) => a.studentId));
+    const endAtMs = ex.endAt == null ? null : typeof ex.endAt === "number" ? ex.endAt : new Date(ex.endAt as any).getTime();
+    const deadlineOver = ex.status === "finished" || (endAtMs !== null && !Number.isNaN(endAtMs) && Date.now() >= endAtMs);
+    const absentRows = !deadlineOver
+      ? []
+      : students
+          .filter((stu) => {
+            if (stu.enabled === false) return false;
+            if (attemptedIds.has(stu.id)) return false;
+            if (ex.classId && stu.classId && ex.classId !== stu.classId) return false;
+            if (Array.isArray(ex.sectionIds) && ex.sectionIds.length && stu.classId && !ex.sectionIds.includes(stu.classId)) return false;
+            return true;
+          })
+          .map((stu) => ({ attemptId: `absent-${stu.id}`, studentId: stu.id, name: stu.name ?? "—", rollNo: stu.rollNo ?? "", email: stu.email ?? null, section: sectionOf(stu.id), score: null, status: "absent", submittedAt: null, absent: true }))
+          .sort((x, y) => x.rollNo.localeCompare(y.rollNo));
+    // Attempts (scored, sorted high→low) first, absentees last.
+    const rows = [...attemptRows, ...absentRows];
     return c.json({ exam: ex, results: rows }, 200);
   })
   .get("/reports/:examId/attempt/:attemptId", requireAuth, requirePermission("reports"), async (c) => {

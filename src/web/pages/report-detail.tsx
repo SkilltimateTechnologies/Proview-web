@@ -6,7 +6,7 @@ import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, Pill, Drawer, usePagination, Pager } from "../components/ui";
 
-type Row = { attemptId: string; studentId: string; name: string; rollNo: string; email: string | null; section: string; score: number | null; status: string; submittedAt: string | number | null };
+type Row = { attemptId: string; studentId: string; name: string; rollNo: string; email: string | null; section: string; score: number | null; status: string; submittedAt: string | number | null; absent?: boolean };
 
 function fmtSubmitted(t: string | number | null | undefined) {
   if (!t) return "—";
@@ -48,7 +48,7 @@ export default function ReportDetail() {
   function exportCsv() {
     const header = ["Name", "Roll No", "Section", "Score"];
     const lines = results.map((r) => [
-      r.name, r.rollNo, r.section ?? "", r.score ?? "",
+      r.name, r.rollNo, r.section ?? "", r.absent ? "A" : r.score ?? "",
     ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(","));
     const csv = [header.join(","), ...lines].join("\r\n");
     const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" });
@@ -75,7 +75,7 @@ export default function ReportDetail() {
 
       <div className="grid grid-cols-3 gap-4 mb-4">
         <div className="card p-5">
-          <div className="stat-num text-[1.8rem]">{results.length}</div>
+          <div className="stat-num text-[1.8rem]">{results.filter((r) => !r.absent).length}</div>
           <div className="mono-label mt-1">Attempts</div>
         </div>
         <div className="card p-5">
@@ -101,8 +101,8 @@ export default function ReportDetail() {
         {pageResults.map((r, i) => (
           <button
             key={r.rollNo + i}
-            onClick={() => setOpenAttempt(r)}
-            className="w-full flex items-center gap-3 sm:gap-4 px-3 sm:px-4 py-3 border-b border-[var(--color-line)] last:border-0 text-left hover:bg-[var(--color-brand-soft)] transition"
+            onClick={() => { if (!r.absent) setOpenAttempt(r); }}
+            className={`w-full flex items-center gap-3 sm:gap-4 px-3 sm:px-4 py-3 border-b border-[var(--color-line)] last:border-0 text-left transition ${r.absent ? "cursor-default opacity-70" : "hover:bg-[var(--color-brand-soft)]"}`}
           >
             <span className="mono-label w-6 sm:w-8 shrink-0">{String((curPage - 1) * PS + i + 1).padStart(2, "0")}</span>
             <div className="flex-1 min-w-0">
@@ -110,12 +110,14 @@ export default function ReportDetail() {
               <div className="text-xs text-[var(--color-muted)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{r.rollNo}</div>
             </div>
             <span className="w-28 text-right shrink-0 hidden sm:block text-xs text-[var(--color-muted)]" style={{ fontFamily: "var(--font-mono)" }}>{fmtSubmitted(r.submittedAt)}</span>
-            {r.status === "graded" ? (
+            {r.absent ? (
+              <span className="stat-num w-14 sm:w-20 text-right shrink-0" style={{ color: "#c0453b" }} title="Absent">A</span>
+            ) : r.status === "graded" ? (
               <span className="stat-num w-14 sm:w-20 text-right shrink-0 text-[var(--color-ink)]">{r.score ?? "—"}</span>
             ) : (
               <span className="w-14 sm:w-20 text-right shrink-0 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "#b7791f", fontFamily: "var(--font-mono)" }}>Grading</span>
             )}
-            <ChevronRight size={16} className="text-[var(--color-muted)] w-4 shrink-0" />
+            {r.absent ? <span className="w-4 shrink-0" /> : <ChevronRight size={16} className="text-[var(--color-muted)] w-4 shrink-0" />}
           </button>
         ))}
       </div>
