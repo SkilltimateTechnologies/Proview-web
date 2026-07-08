@@ -10,6 +10,7 @@ type LiveStudent = {
   examId?: string;
   student: string;
   rollNo: string;
+  section?: string;
   status: "in_progress" | "finished" | "not_started" | "absent";
   online?: boolean;
   lastSeenAt?: string | number | null;
@@ -195,6 +196,7 @@ export default function Monitor() {
                           <tr>
                             <th>Student</th>
                             <th>Roll No</th>
+                            <th>Section</th>
                             <th>Status</th>
                             <th className="text-right">Score</th>
                             <th className="text-right">Started</th>
@@ -215,6 +217,7 @@ export default function Monitor() {
                                 </div>
                               </td>
                               <td><span className="mono-label whitespace-nowrap">{s.rollNo || "—"}</span></td>
+                              <td><span className="mono-label whitespace-nowrap">{s.section || "—"}</span></td>
                               <td>
                                 {s.status === "in_progress" ? (
                                   <span className="inline-flex items-center gap-2">
@@ -296,7 +299,7 @@ function StudentDrawer({ s, onClose }: { s: LiveStudent; onClose: () => void }) 
     <Drawer
       eyebrow="Live status"
       title={s.student}
-      subtitle={`${s.rollNo} · ${s.examTitle ?? ""}`}
+      subtitle={`${s.rollNo}${s.section ? ` · ${s.section}` : ""} · ${s.examTitle ?? ""}`}
       onClose={onClose}
       width="max-w-3xl"
     >
@@ -388,6 +391,7 @@ function ObjectiveAnswer({ a }: { a: SheetAnswer }) {
   const resp = a.response;
   const isCorrect = (i: number) => (Array.isArray(correct) ? (correct as number[]).includes(i) : correct === i);
   const isChosen = (i: number) => (Array.isArray(resp) ? (resp as number[]).includes(i) : resp === i);
+  const answered = Array.isArray(resp) ? resp.length > 0 : resp != null && resp !== "";
 
   if (a.type === "truefalse") {
     const rows: [string, boolean][] = [["True", true], ["False", false]];
@@ -398,6 +402,7 @@ function ObjectiveAnswer({ a }: { a: SheetAnswer }) {
           const isC = correct === val;
           return <OptRow key={lbl} letter={val ? "T" : "F"} label={lbl} correct={isC} chosen={chosen} />;
         })}
+        {!answered && <NotAnswered />}
       </div>
     );
   }
@@ -407,6 +412,15 @@ function ObjectiveAnswer({ a }: { a: SheetAnswer }) {
       {opts.map((o, i) => (
         <OptRow key={i} letter={LETTERS[i] ?? String(i + 1)} label={o} correct={isCorrect(i)} chosen={isChosen(i)} />
       ))}
+      {!answered && <NotAnswered />}
+    </div>
+  );
+}
+
+function NotAnswered() {
+  return (
+    <div className="text-[13px] font-semibold mt-1 rounded-lg px-3 py-2" style={{ color: "#c0453b", background: "#fdecea", border: "1px solid #f3c6c1" }}>
+      Not answered
     </div>
   );
 }

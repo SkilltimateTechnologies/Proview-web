@@ -44,6 +44,25 @@ export function autoGrade(
   }
 }
 
+/**
+ * Effective absolute deadline for an attempt, in ms.
+ * base = startedAt + duration, capped by the exam window (endAt),
+ * then extended by: student pausedMs (legacy) + admin extraMin + admin holdMs
+ * + the currently-running hold (now - heldAt) if the exam is held right now.
+ */
+export function effectiveEndMs(
+  exam: { durationMin: number; endAt: Date | number | string | null; extraMin?: number | null; holdMs?: number | null; heldAt?: Date | number | string | null },
+  attempt: { startedAt: Date | number | string | null; pausedMs?: number | null },
+  now: number,
+): number {
+  const startedMs = attempt.startedAt ? new Date(attempt.startedAt).getTime() : now;
+  let base = startedMs + exam.durationMin * 60_000;
+  if (exam.endAt) base = Math.min(base, new Date(exam.endAt).getTime());
+  let extra = (attempt.pausedMs ?? 0) + (exam.extraMin ?? 0) * 60_000 + (exam.holdMs ?? 0);
+  if (exam.heldAt) extra += Math.max(0, now - new Date(exam.heldAt).getTime());
+  return base + extra;
+}
+
 export function computeYear(batchStartYear: number): number {
   const now = new Date();
   // Academic year rolls in June/July.

@@ -1,15 +1,15 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { eq, ne, and, or, desc, inArray, sql as dsql } from "drizzle-orm";
+import { eq, ne, and, or, desc, inArray, like, sql as dsql } from "drizzle-orm";
 import { auth } from "./auth";
 import { hashPassword, verifyPassword } from "better-auth/crypto";
 import { db } from "./database";
 import * as schema from "./database/schema";
 import { authMiddleware, requireAuth, requireSuperAdmin, requirePermission } from "./middleware/auth";
 import type { SessionUser, ProfileCtx } from "./middleware/auth";
-import { id, displayId, autoGrade, computeYear } from "./lib/util";
+import { id, displayId, autoGrade, computeYear, effectiveEndMs } from "./lib/util";
 import { generateQuestions } from "./lib/ai";
-import { queueAttemptGrading } from "./lib/grade-queue";
+import { queueAttemptGrading, finalizeAttempt } from "./lib/grade-queue";
 import { presignPut, getObject } from "./lib/s3";
 import { signStudentToken, verifyStudentToken } from "./lib/student-token";
 import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
@@ -22,25 +22,6 @@ async function getGlobalSettings() {
   let [s] = await db.select().from(schema.settings).where(eq(schema.settings.id, GLOBAL_SETTINGS));
   if (!s) [s] = await db.insert(schema.settings).values({ id: GLOBAL_SETTINGS }).returning();
   return s;
-}
-
-/**
- * Effective absolute deadline for an attempt, in ms.
- * base = startedAt + duration, capped by the exam window (endAt),
- * then extended by: student pausedMs (legacy) + admin extraMin + admin holdMs
- * + the currently-running hold (now - heldAt) if the exam is held right now.
- */
-function effectiveEndMs(
-  exam: { durationMin: number; endAt: Date | number | string | null; extraMin?: number | null; holdMs?: number | null; heldAt?: Date | number | string | null },
-  attempt: { startedAt: Date | number | string | null; pausedMs?: number | null },
-  now: number,
-) {
-  const startedMs = attempt.startedAt ? new Date(attempt.startedAt).getTime() : now;
-  let base = startedMs + exam.durationMin * 60_000;
-  if (exam.endAt) base = Math.min(base, new Date(exam.endAt).getTime());
-  let extra = (attempt.pausedMs ?? 0) + (exam.extraMin ?? 0) * 60_000 + (exam.holdMs ?? 0);
-  if (exam.heldAt) extra += Math.max(0, now - new Date(exam.heldAt).getTime());
-  return base + extra;
 }
 
 // Resolve the tenant for the public registration page from a URL code.
@@ -147,18 +128,41 @@ const app = new Hono<{ Variables: Vars }>()
     rows.sort((a, b) => a.code.localeCompare(b.code));
     return c.json({ tenant: { id: t.id, name: t.name, code: t.shortName }, sections: rows }, 200);
   })
-  // Check whether a roll number already exists for this tenant.
+  // Check whether a student already exists for this tenant — by roll number OR name.
   .get("/register/:code/check", async (c) => {
-    const roll = String(c.req.query("rollNo") ?? "").trim().replace(/\s+/g, "").toUpperCase();
-    if (!roll) return c.json({ message: "Roll number required" }, 400);
+    const raw = String(c.req.query("q") ?? c.req.query("rollNo") ?? "").trim();
+    if (!raw) return c.json({ message: "Enter a roll number or name" }, 400);
     const t = await resolveRegisterTenant(c.req.param("code"));
     if (!t) return c.json({ message: "Invalid registration link" }, 404);
     const tid = t.id;
+
+    const roll = raw.replace(/\s+/g, "").toUpperCase();
+    const nameQ = raw.replace(/\s+/g, " ");
+    // A query containing a digit is treated as a roll number; otherwise a name.
+    const looksLikeRoll = /\d/.test(raw);
+
     const rows = await db
-      .select({ name: schema.students.name })
+      .select({ name: schema.students.name, rollNo: schema.students.rollNo })
       .from(schema.students)
-      .where(and(eq(schema.students.tenantId, tid), eq(schema.students.rollNo, roll)));
-    return c.json({ rollNo: roll, exists: rows.length > 0, name: rows[0]?.name ?? null }, 200);
+      .where(
+        and(
+          eq(schema.students.tenantId, tid),
+          or(eq(schema.students.rollNo, roll), like(schema.students.name, `%${nameQ}%`)),
+        ),
+      )
+      .limit(6);
+
+    return c.json(
+      {
+        query: raw,
+        looksLikeRoll,
+        exists: rows.length > 0,
+        matches: rows,
+        name: rows[0]?.name ?? null,
+        rollNo: looksLikeRoll ? roll : (rows[0]?.rollNo ?? ""),
+      },
+      200,
+    );
   })
   // Register a new student (only if the roll number is not already present).
   .post("/register/:code", async (c) => {
@@ -842,13 +846,6 @@ const app = new Hono<{ Variables: Vars }>()
     const body = await c.req.json().catch(() => ({}));
     const respArr: { questionId: string; response: unknown }[] = Array.isArray(body.answers) ? body.answers : [];
 
-    // Load exam questions (with correct answers + meta) for grading.
-    const eqs = await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, attempt.examId)).orderBy(schema.examQuestions.order);
-    const qids = eqs.map((q) => q.questionId);
-    const qs = qids.length ? await db.select().from(schema.questions).where(inArray(schema.questions.id, qids)) : [];
-    const qById = new Map(qs.map((q) => [q.id, q]));
-    const pointsById = new Map(eqs.map((e) => [e.questionId, e.points]));
-
     // Global AI provider for grading (single global settings row).
     let provider: string | null = null;
     try {
@@ -856,69 +853,12 @@ const app = new Hono<{ Variables: Vars }>()
       provider = s?.aiProvider ?? null;
     } catch { /* ignore */ }
 
-    // Wipe any prior answers for idempotency, then insert fresh.
-    await db.delete(schema.answers).where(eq(schema.answers.attemptId, aid));
+    // Persist + grade through the shared path. Objective graded inline; subjective
+    // + coding deferred to the background queue. The same path is reused by the
+    // server-side auto-submit sweep for abandoned attempts.
+    const { score } = await finalizeAttempt(attempt, respArr, provider);
 
-    // Grade objective (mcq/multi/truefalse/fillblank) + blanks INLINE so submit
-    // stays fast. Subjective + coding answers are left pending (score=null,
-    // autoGraded=false) and graded off the request path by the background queue,
-    // so a whole class auto-submitting at the deadline never stalls or hits AI
-    // rate limits on the critical path.
-    let earned = 0;
-    let max = 0;
-    let hasPending = false;
-    const rows: (typeof schema.answers.$inferInsert)[] = [];
-    for (const eq2 of eqs) {
-      const q = qById.get(eq2.questionId);
-      if (!q) continue;
-      const maxScore = pointsById.get(eq2.questionId) ?? q.points ?? 1;
-      max += maxScore;
-      const given = respArr.find((r) => r.questionId === eq2.questionId);
-      const response = given?.response ?? null;
-      let score: number | null = null;
-      let autoGraded = false;
-
-      const auto = autoGrade(q.type, q.correct, response, maxScore);
-      if (auto !== null) {
-        score = auto;
-        autoGraded = true;
-      } else if (response != null && String(response).trim() !== "") {
-        // Subjective / coding: defer to background grading.
-        score = null;
-        autoGraded = false;
-        hasPending = true;
-      } else {
-        score = 0; // blank answer
-        autoGraded = true;
-      }
-      if (score != null) earned += score;
-      rows.push({
-        id: id("ans"),
-        attemptId: aid,
-        questionId: eq2.questionId,
-        response,
-        score,
-        maxScore,
-        aiNotes: null,
-        autoGraded,
-      });
-    }
-    if (rows.length) await db.insert(schema.answers).values(rows);
-
-    // Partial score from objective answers only for now; flips to full once
-    // background grading completes. "submitted" and "graded" are treated
-    // identically downstream (both count as finished + show score).
-    const scorePct = max > 0 ? Math.round((earned / max) * 1000) / 10 : 0;
-    const [updated] = await db.update(schema.attempts).set({
-      status: hasPending ? "submitted" : "graded",
-      score: scorePct,
-      submittedAt: new Date(),
-    }).where(eq(schema.attempts.id, aid)).returning();
-
-    // Kick off background subjective grading (fire-and-forget, globally throttled).
-    if (hasPending) queueAttemptGrading(aid, provider);
-
-    return c.json({ ok: true, attemptId: aid, score: updated.score }, 200);
+    return c.json({ ok: true, attemptId: aid, score }, 200);
   })
 
   // Review a finished attempt: per-question response, score, correct answer + AI notes.
@@ -1368,6 +1308,10 @@ const app = new Hono<{ Variables: Vars }>()
     // All enabled students in the tenant — used to compute the assigned cohort
     // per exam so we can surface who hasn't started yet.
     const allStudents = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, tid), eq(schema.students.enabled, true)));
+    // Resolve a student's classId to a readable section code (e.g. "CSE-C").
+    const allClasses = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, tid));
+    const classCodeById = new Map(allClasses.map((cl) => [cl.id, cl.code]));
+    const sectionOf = (classId: string | null) => (classId ? classCodeById.get(classId) ?? "" : "");
     const assignedStudents = (e: { classId: string | null; sectionIds: string[] | null }) =>
       allStudents.filter((stu) => {
         if (e.classId && stu.classId && e.classId !== stu.classId) return false;
@@ -1391,6 +1335,7 @@ const app = new Hono<{ Variables: Vars }>()
               examId: ex.id,
               student: stu?.name ?? "—",
               rollNo: stu?.rollNo ?? "",
+              section: sectionOf(stu?.classId ?? null),
               status,
               online,
               lastSeenAt: a.lastSeenAt,
@@ -1415,6 +1360,7 @@ const app = new Hono<{ Variables: Vars }>()
             examId: ex.id,
             student: stu.name ?? "—",
             rollNo: stu.rollNo ?? "",
+            section: sectionOf(stu.classId ?? null),
             status: (windowClosed ? "absent" : "not_started") as "absent" | "not_started",
             online: false,
             lastSeenAt: null as string | null,

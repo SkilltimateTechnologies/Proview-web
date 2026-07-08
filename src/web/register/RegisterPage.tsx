@@ -36,8 +36,11 @@ export function RegisterPage() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [existingName, setExistingName] = useState("");
+  const [existingRoll, setExistingRoll] = useState("");
 
-  // form fields
+  // step 1 lookup + form fields
+  const [query, setQuery] = useState("");
+  const [rollLocked, setRollLocked] = useState(false);
   const [rollNo, setRollNo] = useState("");
   const [name, setName] = useState("");
   const [classId, setClassId] = useState("");
@@ -54,20 +57,32 @@ export function RegisterPage() {
 
   async function checkRoll(e: React.FormEvent) {
     e.preventDefault();
-    const roll = rollNo.trim().replace(/\s+/g, "").toUpperCase();
-    if (!roll) { setErr("Enter your roll number."); return; }
+    const raw = query.trim().replace(/\s+/g, " ");
+    if (!raw) { setErr("Enter your roll number or name."); return; }
+    const looksLikeRoll = /\d/.test(raw);
     setBusy(true); setErr("");
     try {
-      const res = await jget<{ exists: boolean; name: string | null; rollNo: string }>(
-        `/api/register/${tenantId}/check?rollNo=${encodeURIComponent(roll)}`,
+      const res = await jget<{ exists: boolean; name: string | null; rollNo: string; looksLikeRoll: boolean }>(
+        `/api/register/${tenantId}/check?q=${encodeURIComponent(raw)}`,
       );
-      setRollNo(res.rollNo);
       if (res.exists) {
         setExistingName(res.name || "");
+        setExistingRoll(res.rollNo || "");
         setStep("exists");
-      } else {
-        setStep("form");
+        return;
       }
+      // Not found → go to the form, prefilling what we know.
+      if (looksLikeRoll) {
+        setRollNo(raw.replace(/\s+/g, "").toUpperCase());
+        setRollLocked(true);
+        setName("");
+      } else {
+        setRollNo("");
+        setRollLocked(false);
+        // Title-case the typed name as a starting point.
+        setName(raw.toLowerCase().replace(/\b\w/g, (ch) => ch.toUpperCase()));
+      }
+      setStep("form");
     } catch (e2) {
       setErr(e2 instanceof Error ? e2.message : "Something went wrong");
     } finally {
@@ -77,6 +92,7 @@ export function RegisterPage() {
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
+    if (!rollNo.trim()) { setErr("Enter your roll number."); return; }
     if (!name.trim()) { setErr("Enter your full name."); return; }
     if (!classId) { setErr("Select your section."); return; }
     if (!/^\S+@\S+\.\S+$/.test(email.trim())) { setErr("Enter a valid email address."); return; }
@@ -133,7 +149,7 @@ export function RegisterPage() {
             <>
               <p style={{ color: "var(--color-ink2)", fontSize: 14, marginBottom: 22 }}>
                 {step === "roll"
-                  ? "Enter your roll number to begin."
+                  ? "Enter your roll number or name to begin."
                   : "Fill in your details to complete registration."}
               </p>
             </>
@@ -143,8 +159,8 @@ export function RegisterPage() {
           {meta && step === "roll" && (
             <form onSubmit={checkRoll} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               <div>
-                <label className="mono-label" style={lbl}>Roll Number</label>
-                <input className="input" value={rollNo} onChange={(e) => { setRollNo(e.target.value.toUpperCase()); setErr(""); }} placeholder="23K91A0501" autoFocus style={{ textTransform: "uppercase" }} />
+                <label className="mono-label" style={lbl}>Roll Number or Name</label>
+                <input className="input" value={query} onChange={(e) => { setQuery(e.target.value); setErr(""); }} placeholder="23K91A0501 or Ira Reddy" autoFocus />
               </div>
               {err && (
                 <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--color-danger)", background: "var(--color-danger-bg)", padding: "10px 12px", borderRadius: 10, fontSize: 13 }}>
@@ -163,7 +179,11 @@ export function RegisterPage() {
             <form onSubmit={submit} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               <div>
                 <label className="mono-label" style={lbl}>Roll Number</label>
-                <input className="input" value={rollNo} readOnly style={{ opacity: 0.75, cursor: "not-allowed" }} />
+                {rollLocked ? (
+                  <input className="input" value={rollNo} readOnly style={{ opacity: 0.75, cursor: "not-allowed" }} />
+                ) : (
+                  <input className="input" value={rollNo} onChange={(e) => { setRollNo(e.target.value.replace(/\s+/g, "").toUpperCase()); setErr(""); }} placeholder="23K91A0501" style={{ textTransform: "uppercase" }} />
+                )}
               </div>
               <div>
                 <label className="mono-label" style={lbl}>Full Name</label>
@@ -237,10 +257,14 @@ export function RegisterPage() {
                 {existingName || "You"}, you are already registered
               </h1>
               <p style={{ color: "var(--color-ink2)", fontSize: 14, marginBottom: 18 }}>
-                Roll number <span style={{ fontFamily: "var(--font-mono, monospace)" }}>{rollNo}</span> already exists in our records. No need to register again.
+                {existingRoll ? (
+                  <>Roll number <span style={{ fontFamily: "var(--font-mono, monospace)" }}>{existingRoll}</span> already exists in our records. No need to register again.</>
+                ) : (
+                  <>This student already exists in our records. No need to register again.</>
+                )}
               </p>
-              <button type="button" className="btn" onClick={() => { setStep("roll"); setRollNo(""); setExistingName(""); setErr(""); }} style={{ padding: 10, fontSize: 13, color: "var(--color-ink2)" }}>
-                <Icon name="arrow-left" size={14} /> Check another roll number
+              <button type="button" className="btn" onClick={() => { setStep("roll"); setQuery(""); setRollNo(""); setRollLocked(false); setExistingName(""); setExistingRoll(""); setErr(""); }} style={{ padding: 10, fontSize: 13, color: "var(--color-ink2)" }}>
+                <Icon name="arrow-left" size={14} /> Check another student
               </button>
             </div>
           )}

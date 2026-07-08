@@ -1,5 +1,5 @@
 import app from "./api";
-import { sweepPendingGrading } from "./api/lib/grade-queue";
+import { sweepPendingGrading, startAutoSubmitSweep } from "./api/lib/grade-queue";
 
 const port = Number(process.env.PORT ?? 3000);
 const distDir = `${import.meta.dir}/../dist`;
@@ -40,6 +40,11 @@ console.log(`Web server listening on http://localhost:${server.port}`);
 // Recover any subjective answers left ungraded (e.g. restart mid-grading or a
 // prior AI rate-limit burst). Runs off the boot path, globally throttled.
 void sweepPendingGrading();
+
+// Recurring server-side auto-submit: force-submit + grade any expired
+// `in_progress` attempts (student closed the browser / lost connection at the
+// cutoff) so they never stay stuck in-progress. Runs every 60s.
+startAutoSubmitSweep(60_000);
 
 function getStaticFilePath(pathname: string) {
   const cleanPath = decodeURIComponent(pathname)

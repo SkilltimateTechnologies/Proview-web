@@ -13,6 +13,7 @@ import { eq, inArray } from "drizzle-orm";
 import { db } from "../database";
 import * as schema from "../database/schema";
 import { gradeSubjective } from "./ai";
+import { autoGrade, effectiveEndMs, id } from "./util";
 
 const MAX_CONCURRENT = 3;
 let active = 0;
@@ -124,6 +125,138 @@ async function gradeAttempt(attemptId: string, providerArg?: string | null) {
   if (att && (att.status === "submitted" || att.status === "graded")) {
     await db.update(schema.attempts).set({ status: stillUngraded ? "submitted" : "graded", score: scorePct }).where(eq(schema.attempts.id, attemptId));
   }
+}
+
+/**
+ * Persist answers for an attempt and grade it. Objective questions
+ * (mcq / multi / truefalse / fillblank) are graded inline; subjective + coding
+ * answers with content are deferred to the background queue. This is the single
+ * shared grading path used by BOTH the student submit endpoint and the
+ * server-side auto-submit sweep, so a force-submit grades identically to a
+ * normal submit. Idempotent: wipes prior answers before reinserting.
+ *
+ * `respArr` is the client-supplied answers. For the auto-submit sweep it is `[]`
+ * (a disconnected student never synced answers to the server, so unanswered
+ * questions score 0) — the point is to move an abandoned attempt out of
+ * `in_progress` and into grading, not to fabricate answers.
+ */
+export async function finalizeAttempt(
+  attempt: typeof schema.attempts.$inferSelect,
+  respArr: { questionId: string; response: unknown }[],
+  provider: string | null,
+): Promise<{ score: number; status: "submitted" | "graded" }> {
+  const aid = attempt.id;
+  const eqs = await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, attempt.examId)).orderBy(schema.examQuestions.order);
+  const qids = eqs.map((q) => q.questionId);
+  const qs = qids.length ? await db.select().from(schema.questions).where(inArray(schema.questions.id, qids)) : [];
+  const qById = new Map(qs.map((q) => [q.id, q]));
+  const pointsById = new Map(eqs.map((e) => [e.questionId, e.points]));
+
+  // Wipe any prior answers for idempotency, then insert fresh.
+  await db.delete(schema.answers).where(eq(schema.answers.attemptId, aid));
+
+  let earned = 0;
+  let max = 0;
+  let hasPending = false;
+  const rows: (typeof schema.answers.$inferInsert)[] = [];
+  for (const eq2 of eqs) {
+    const q = qById.get(eq2.questionId);
+    if (!q) continue;
+    const maxScore = pointsById.get(eq2.questionId) ?? q.points ?? 1;
+    max += maxScore;
+    const given = respArr.find((r) => r.questionId === eq2.questionId);
+    const response = given?.response ?? null;
+    let score: number | null = null;
+    let autoGraded = false;
+
+    const auto = autoGrade(q.type, q.correct, response, maxScore);
+    if (auto !== null) {
+      score = auto;
+      autoGraded = true;
+    } else if (response != null && String(response).trim() !== "") {
+      // Subjective / coding with content: defer to background grading.
+      score = null;
+      autoGraded = false;
+      hasPending = true;
+    } else {
+      score = 0; // blank answer
+      autoGraded = true;
+    }
+    if (score != null) earned += score;
+    rows.push({
+      id: id("ans"),
+      attemptId: aid,
+      questionId: eq2.questionId,
+      response,
+      score,
+      maxScore,
+      aiNotes: null,
+      autoGraded,
+    });
+  }
+  if (rows.length) await db.insert(schema.answers).values(rows);
+
+  const scorePct = max > 0 ? Math.round((earned / max) * 1000) / 10 : 0;
+  const status: "submitted" | "graded" = hasPending ? "submitted" : "graded";
+  await db.update(schema.attempts).set({
+    status,
+    score: scorePct,
+    submittedAt: new Date(),
+  }).where(eq(schema.attempts.id, aid));
+
+  if (hasPending) queueAttemptGrading(aid, provider);
+  return { score: scorePct, status };
+}
+
+// Grace window after an attempt's effective deadline before the server
+// force-submits it. Gives an online client's own auto-submit, and an offline
+// client reconnecting to sync buffered answers, time to land first — so we only
+// force-submit attempts that are genuinely abandoned (browser closed / lost
+// connection through the cutoff and never returned).
+const AUTOSUBMIT_GRACE_MS = 3 * 60_000;
+let autoSubmitTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Find `in_progress` attempts whose effective deadline (+ grace) has passed and
+ * force-submit them server-side through the shared grading path, so a student
+ * who closed their browser or lost connection at the cutoff still gets submitted
+ * and graded instead of staying stuck `in_progress` forever.
+ */
+export async function sweepAutoSubmit() {
+  try {
+    const now = Date.now();
+    const inProg = await db.select().from(schema.attempts).where(eq(schema.attempts.status, "in_progress"));
+    if (!inProg.length) return;
+    const examIds = [...new Set(inProg.map((a) => a.examId))];
+    const exams = examIds.length ? await db.select().from(schema.exams).where(inArray(schema.exams.id, examIds)) : [];
+    const examById = new Map(exams.map((e) => [e.id, e]));
+    const provider = await getProvider();
+    let done = 0;
+    for (const a of inProg) {
+      const exam = examById.get(a.examId);
+      if (!exam) continue;
+      if (exam.status === "draft") continue;   // never touch unpublished exams
+      if (exam.heldAt) continue;               // exam paused/held for everyone — don't force-submit
+      const endMs = effectiveEndMs(exam, a, now);
+      if (endMs + AUTOSUBMIT_GRACE_MS >= now) continue; // still within window + grace
+      try {
+        await finalizeAttempt(a, [], provider);
+        done++;
+      } catch (e) {
+        console.error(`[auto-submit] attempt ${a.id} failed:`, e);
+      }
+    }
+    if (done) console.log(`[auto-submit] force-submitted ${done} expired in-progress attempt(s)`);
+  } catch (e) {
+    console.error("[auto-submit] sweep failed:", e);
+  }
+}
+
+/** Start the recurring auto-submit sweep (runs immediately, then on an interval). */
+export function startAutoSubmitSweep(intervalMs = 60_000) {
+  if (autoSubmitTimer) return;
+  void sweepAutoSubmit();
+  autoSubmitTimer = setInterval(() => void sweepAutoSubmit(), intervalMs);
 }
 
 /**
