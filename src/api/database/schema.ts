@@ -149,6 +149,28 @@ export const examQuestions = sqliteTable(
   (t) => [index("exam_questions_exam_idx").on(t.examId)],
 );
 
+/**
+ * Ad-hoc roster overrides for an exam. Base eligibility is cohort-based
+ * (class + optional sections). These rows let an admin explicitly add a
+ * student who isn't in the cohort, or remove a student who is — e.g. when
+ * merging students from another batch onto spare machines.
+ *   mode "add"    -> student is eligible regardless of cohort
+ *   mode "remove" -> student is excluded even if the cohort matches
+ * An "add" always wins over a "remove".
+ */
+export const examRoster = sqliteTable(
+  "exam_roster",
+  {
+    id: text("id").primaryKey(),
+    examId: text("exam_id").notNull(),
+    studentId: text("student_id").notNull(),
+    mode: text("mode").notNull(), // add | remove
+    createdBy: text("created_by"),
+    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
+  },
+  (t) => [index("exam_roster_exam_idx").on(t.examId)],
+);
+
 /** A student's attempt at an exam. */
 export const attempts = sqliteTable(
   "attempts",

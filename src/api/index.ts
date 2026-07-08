@@ -13,6 +13,7 @@ import { queueAttemptGrading, finalizeAttempt } from "./lib/grade-queue";
 import { presignPut, getObject } from "./lib/s3";
 import { signStudentToken, verifyStudentToken } from "./lib/student-token";
 import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
+import { isEligible, matchesCohort, loadRoster, loadRosters } from "./lib/roster";
 
 type Vars = { user: SessionUser | null; profile: ProfileCtx | null };
 
@@ -604,12 +605,10 @@ const app = new Hono<{ Variables: Vars }>()
       .where(and(eq(schema.exams.tenantId, stu.tenantId), inArray(schema.exams.status, ["scheduled", "live", "finished"])))
       .orderBy(desc(schema.exams.createdAt));
 
-    // Only exams targeting the student's class (or all-class exams), and matching section if scoped.
-    const visible = allExams.filter((e) => {
-      if (e.classId && stu.classId && e.classId !== stu.classId) return false;
-      if (Array.isArray(e.sectionIds) && e.sectionIds.length && stu.classId && !e.sectionIds.includes(stu.classId)) return false;
-      return true;
-    });
+    // Only exams targeting the student's class (or all-class exams), matching
+    // section if scoped, honouring any ad-hoc roster add/remove overrides.
+    const rosters = await loadRosters(allExams.map((e) => e.id));
+    const visible = allExams.filter((e) => isEligible(e, stu, rosters.get(e.id)));
 
     const exIds = visible.map((e) => e.id);
     const myAttempts = exIds.length
@@ -722,6 +721,11 @@ const app = new Hono<{ Variables: Vars }>()
     const eid = c.req.param("examId");
     const [exam] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
     if (!exam) return c.json({ message: "Not found" }, 404);
+    // Only eligible students (cohort match or explicitly added, not removed) may start.
+    const [startStu] = await db.select().from(schema.students).where(eq(schema.students.id, sid)).limit(1);
+    if (!startStu || !startStu.enabled || !isEligible(exam, startStu, await loadRoster(eid))) {
+      return c.json({ message: "Not eligible for this exam" }, 403);
+    }
 
     let [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid))).limit(1);
     if (attempt && (attempt.status === "submitted" || attempt.status === "graded")) {
@@ -1390,12 +1394,9 @@ const app = new Hono<{ Variables: Vars }>()
     const allClasses = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, tid));
     const classCodeById = new Map(allClasses.map((cl) => [cl.id, cl.code]));
     const sectionOf = (classId: string | null) => (classId ? classCodeById.get(classId) ?? "" : "");
-    const assignedStudents = (e: { classId: string | null; sectionIds: string[] | null }) =>
-      allStudents.filter((stu) => {
-        if (e.classId && stu.classId && e.classId !== stu.classId) return false;
-        if (Array.isArray(e.sectionIds) && e.sectionIds.length && stu.classId && !e.sectionIds.includes(stu.classId)) return false;
-        return true;
-      });
+    const liveRosters = await loadRosters(liveExams.map((e) => e.id));
+    const assignedStudents = (e: { id: string; classId: string | null; sectionIds: string[] | null }) =>
+      allStudents.filter((stu) => isEligible(e, stu, liveRosters.get(e.id)));
 
     const out = await Promise.all(
       liveExams.map(async (ex) => {
@@ -1610,12 +1611,9 @@ const app = new Hono<{ Variables: Vars }>()
         : allExams.filter((e) => e.status === "finished" || e.status === "live" || (e.status === "scheduled" && isStarted(e)));
     // All students in the tenant — used to size the "assigned" cohort per exam.
     const allStudents = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, tid), eq(schema.students.enabled, true)));
-    const assignedFor = (e: { classId: string | null; sectionIds: string[] | null }) =>
-      allStudents.filter((stu) => {
-        if (e.classId && stu.classId && e.classId !== stu.classId) return false;
-        if (Array.isArray(e.sectionIds) && e.sectionIds.length && stu.classId && !e.sectionIds.includes(stu.classId)) return false;
-        return true;
-      }).length;
+    const reportRosters = await loadRosters(rows.map((e) => e.id));
+    const assignedFor = (e: { id: string; classId: string | null; sectionIds: string[] | null }) =>
+      allStudents.filter((stu) => isEligible(e, stu, reportRosters.get(e.id))).length;
     const PASS_MARK = 40; // percentage
     const withStats = await Promise.all(
       rows.map(async (e) => {
@@ -1669,15 +1667,14 @@ const app = new Hono<{ Variables: Vars }>()
     const attemptedIds = new Set(atts.map((a) => a.studentId));
     const endAtMs = ex.endAt == null ? null : typeof ex.endAt === "number" ? ex.endAt : new Date(ex.endAt as any).getTime();
     const deadlineOver = ex.status === "finished" || (endAtMs !== null && !Number.isNaN(endAtMs) && Date.now() >= endAtMs);
+    const exRoster = await loadRoster(eid);
     const absentRows = !deadlineOver
       ? []
       : students
           .filter((stu) => {
             if (stu.enabled === false) return false;
             if (attemptedIds.has(stu.id)) return false;
-            if (ex.classId && stu.classId && ex.classId !== stu.classId) return false;
-            if (Array.isArray(ex.sectionIds) && ex.sectionIds.length && stu.classId && !ex.sectionIds.includes(stu.classId)) return false;
-            return true;
+            return isEligible(ex, stu, exRoster);
           })
           .map((stu) => ({ attemptId: `absent-${stu.id}`, studentId: stu.id, name: stu.name ?? "—", rollNo: stu.rollNo ?? "", email: stu.email ?? null, section: sectionOf(stu.id), score: null, status: "absent", submittedAt: null, absent: true }))
           .sort((x, y) => x.rollNo.localeCompare(y.rollNo));
@@ -1726,6 +1723,106 @@ const app = new Hono<{ Variables: Vars }>()
       attempt: { score: att.score, status: att.status, submittedAt: att.submittedAt, startedAt: att.startedAt },
       answers,
     }, 200);
+  })
+
+  // =================== ROSTER (per-exam add / remove / mark-absent) ===================
+  // Search enabled students in the tenant who are NOT already eligible for the
+  // exam — used by the "Add student to assessment" picker.
+  .get("/reports/:examId/roster/candidates", requireAuth, requirePermission("reports"), async (c) => {
+    const p = c.get("profile")!;
+    const eid = c.req.param("examId");
+    const q = (c.req.query("q") ?? "").trim().toLowerCase();
+    const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid));
+    if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
+    const roster = await loadRoster(eid);
+    const allStudents = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, p.tenantId!), eq(schema.students.enabled, true)));
+    const classes = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, p.tenantId!));
+    const clmap = new Map(classes.map((cl) => [cl.id, cl]));
+    const candidates = allStudents
+      // Not already eligible (so the picker only offers students you can add).
+      .filter((stu) => !isEligible(ex, stu, roster))
+      .filter((stu) => {
+        if (!q) return true;
+        return (stu.name ?? "").toLowerCase().includes(q) || (stu.rollNo ?? "").toLowerCase().includes(q) || (stu.email ?? "").toLowerCase().includes(q);
+      })
+      .slice(0, 30)
+      .map((stu) => ({ id: stu.id, name: stu.name ?? "—", rollNo: stu.rollNo ?? "", email: stu.email ?? null, section: stu.classId ? clmap.get(stu.classId)?.code ?? "" : "" }));
+    return c.json({ candidates }, 200);
+  })
+
+  // Add a student to an assessment (ad-hoc, outside their cohort). Idempotent:
+  // clears any prior "remove" override and records an "add" override.
+  .post("/reports/:examId/roster/add", requireAuth, requirePermission("reports"), async (c) => {
+    const p = c.get("profile")!;
+    const eid = c.req.param("examId");
+    const b = await c.req.json().catch(() => ({}));
+    const studentId = String(b.studentId ?? "");
+    if (!studentId) return c.json({ message: "studentId required" }, 400);
+    const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid));
+    if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
+    const [stu] = await db.select().from(schema.students).where(eq(schema.students.id, studentId));
+    if (!stu || stu.tenantId !== p.tenantId) return c.json({ message: "Student not found" }, 404);
+    // Drop any existing override for this student, then add.
+    await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
+    // Only need an explicit "add" row when the student isn't already a cohort match.
+    if (!matchesCohort(ex, stu)) {
+      await db.insert(schema.examRoster).values({ id: id("rst"), examId: eid, studentId, mode: "add", createdBy: p.userId ?? null });
+    }
+    return c.json({ ok: true }, 200);
+  })
+
+  // Remove a student from an assessment entirely: records a "remove" override
+  // (so they drop off the roster/report) AND deletes any attempt + answers they
+  // had for this exam, so they are not counted at all.
+  .post("/reports/:examId/roster/remove", requireAuth, requirePermission("reports"), async (c) => {
+    const p = c.get("profile")!;
+    const eid = c.req.param("examId");
+    const b = await c.req.json().catch(() => ({}));
+    const studentId = String(b.studentId ?? "");
+    if (!studentId) return c.json({ message: "studentId required" }, 400);
+    const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid));
+    if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
+    // Delete this student's attempt(s) + answers for the exam.
+    const atts = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
+    for (const a of atts) {
+      await db.delete(schema.answers).where(eq(schema.answers.attemptId, a.id));
+      await db.delete(schema.integrityEvents).where(eq(schema.integrityEvents.attemptId, a.id));
+    }
+    if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
+    // Record the remove override (clear any prior override first).
+    await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
+    await db.insert(schema.examRoster).values({ id: id("rst"), examId: eid, studentId, mode: "remove", createdBy: p.userId ?? null });
+    return c.json({ ok: true }, 200);
+  })
+
+  // Mark a student Absent: they STAY on the report (as "A") but are counted
+  // absent. Ensures they are roster-eligible, then deletes any attempt so they
+  // fall through to the auto-absent path (assigned + no attempt + deadline).
+  .post("/reports/:examId/roster/mark-absent", requireAuth, requirePermission("reports"), async (c) => {
+    const p = c.get("profile")!;
+    const eid = c.req.param("examId");
+    const b = await c.req.json().catch(() => ({}));
+    const studentId = String(b.studentId ?? "");
+    if (!studentId) return c.json({ message: "studentId required" }, 400);
+    const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid));
+    if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
+    const [stu] = await db.select().from(schema.students).where(eq(schema.students.id, studentId));
+    if (!stu || stu.tenantId !== p.tenantId) return c.json({ message: "Student not found" }, 404);
+    // Delete any attempt + answers so they read as absent (never attempted).
+    const atts = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
+    for (const a of atts) {
+      await db.delete(schema.answers).where(eq(schema.answers.attemptId, a.id));
+      await db.delete(schema.integrityEvents).where(eq(schema.integrityEvents.attemptId, a.id));
+    }
+    if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
+    // Guarantee roster eligibility: clear a stray "remove"; add an "add" override
+    // only if the student isn't already a cohort match.
+    await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId), eq(schema.examRoster.mode, "remove")));
+    if (!matchesCohort(ex, stu)) {
+      const existing = await db.select().from(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId), eq(schema.examRoster.mode, "add")));
+      if (!existing.length) await db.insert(schema.examRoster).values({ id: id("rst"), examId: eid, studentId, mode: "add", createdBy: p.userId ?? null });
+    }
+    return c.json({ ok: true }, 200);
   })
 
   // =================== SETTINGS ===================

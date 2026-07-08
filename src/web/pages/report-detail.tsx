@@ -1,7 +1,7 @@
-import { useState, type CSSProperties } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useState, useEffect, useRef, type CSSProperties } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, Link } from "wouter";
-import { ArrowLeft, Download, ChevronRight, Check, X, Sparkles, Lightbulb } from "lucide-react";
+import { ArrowLeft, Download, ChevronRight, Check, X, Sparkles, Lightbulb, MoreVertical, UserPlus, UserX, Trash2, Search } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, Pill, Drawer, usePagination, Pager } from "../components/ui";
@@ -15,8 +15,11 @@ function fmtSubmitted(t: string | number | null | undefined) {
 
 export default function ReportDetail() {
   const { examId } = useParams<{ examId: string }>();
+  const qc = useQueryClient();
   const [openAttempt, setOpenAttempt] = useState<Row | null>(null);
   const [page, setPage] = useState(1);
+  const [addOpen, setAddOpen] = useState(false);
+  const [confirm, setConfirm] = useState<{ row: Row; action: "absent" | "remove" } | null>(null);
   const q = useQuery({
     queryKey: ["report", examId],
     queryFn: async () => {
@@ -24,6 +27,24 @@ export default function ReportDetail() {
       if (!res.ok) throw new Error("failed");
       return res.json();
     },
+  });
+
+  const refresh = () => qc.invalidateQueries({ queryKey: ["report", examId] });
+  const markAbsent = useMutation({
+    mutationFn: async (studentId: string) => {
+      const res = await api.reports[":examId"].roster["mark-absent"].$post({ param: { examId }, json: { studentId } });
+      if (!res.ok) throw new Error("failed");
+      return res.json();
+    },
+    onSuccess: () => { refresh(); setConfirm(null); },
+  });
+  const removeStudent = useMutation({
+    mutationFn: async (studentId: string) => {
+      const res = await api.reports[":examId"].roster.remove.$post({ param: { examId }, json: { studentId } });
+      if (!res.ok) throw new Error("failed");
+      return res.json();
+    },
+    onSuccess: () => { refresh(); setConfirm(null); },
   });
 
   if (q.isLoading) return <Loader />;
@@ -67,6 +88,7 @@ export default function ReportDetail() {
         title={exam.title}
         action={
           <div className="flex items-center gap-2">
+            <button className="btn btn-ghost" onClick={() => setAddOpen(true)}><UserPlus size={16} /> Add student</button>
             <button className="btn btn-ghost" onClick={exportCsv}><Download size={16} /> Export CSV</button>
             <Pill label={exam.status.toUpperCase()} color="#2e7d5b" />
           </div>
@@ -96,13 +118,13 @@ export default function ReportDetail() {
           <span className="mono-label flex-1 min-w-0">Student</span>
           <span className="mono-label w-28 text-right shrink-0 hidden sm:block">Submitted</span>
           <span className="mono-label w-14 sm:w-20 text-right shrink-0">Score</span>
-          <span className="w-4 shrink-0" />
+          <span className="w-8 shrink-0" />
         </div>
         {pageResults.map((r, i) => (
-          <button
+          <div
             key={r.rollNo + i}
             onClick={() => { if (!r.absent) setOpenAttempt(r); }}
-            className={`w-full flex items-center gap-3 sm:gap-4 px-3 sm:px-4 py-3 border-b border-[var(--color-line)] last:border-0 text-left transition ${r.absent ? "cursor-default opacity-70" : "hover:bg-[var(--color-brand-soft)]"}`}
+            className={`w-full flex items-center gap-3 sm:gap-4 px-3 sm:px-4 py-3 border-b border-[var(--color-line)] last:border-0 text-left transition ${r.absent ? "" : "cursor-pointer hover:bg-[var(--color-brand-soft)]"}`}
           >
             <span className="mono-label w-6 sm:w-8 shrink-0">{String((curPage - 1) * PS + i + 1).padStart(2, "0")}</span>
             <div className="flex-1 min-w-0">
@@ -117,15 +139,179 @@ export default function ReportDetail() {
             ) : (
               <span className="w-14 sm:w-20 text-right shrink-0 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "#b7791f", fontFamily: "var(--font-mono)" }}>Grading</span>
             )}
-            {r.absent ? <span className="w-4 shrink-0" /> : <ChevronRight size={16} className="text-[var(--color-muted)] w-4 shrink-0" />}
-          </button>
+            <RowActions
+              absent={!!r.absent}
+              onMarkAbsent={() => setConfirm({ row: r, action: "absent" })}
+              onRemove={() => setConfirm({ row: r, action: "remove" })}
+            />
+          </div>
         ))}
       </div>
 
       <Pager page={curPage} pageCount={pageCount} from={from} to={to} total={results.length} onChange={setPage} unit="students" />
 
       {openAttempt && <AttemptDrawer examId={examId} row={openAttempt} onClose={() => setOpenAttempt(null)} />}
+
+      {addOpen && <AddStudentDrawer examId={examId} onClose={() => setAddOpen(false)} onAdded={refresh} />}
+
+      {confirm && (
+        <ConfirmDialog
+          row={confirm.row}
+          action={confirm.action}
+          busy={markAbsent.isPending || removeStudent.isPending}
+          onCancel={() => setConfirm(null)}
+          onConfirm={() => {
+            if (confirm.action === "absent") markAbsent.mutate(confirm.row.studentId);
+            else removeStudent.mutate(confirm.row.studentId);
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+function RowActions({ absent, onMarkAbsent, onRemove }: { absent: boolean; onMarkAbsent: () => void; onRemove: () => void }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+  return (
+    <div ref={ref} className="relative w-8 shrink-0 flex justify-end" onClick={(e) => e.stopPropagation()}>
+      <button
+        className="p-1.5 rounded-md hover:bg-[var(--color-line)] text-[var(--color-muted)]"
+        onClick={() => setOpen((v) => !v)}
+        title="Roster actions"
+      >
+        <MoreVertical size={16} />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-9 z-20 w-52 rounded-lg border border-[var(--color-line)] bg-white shadow-lg py-1" style={{ boxShadow: "0 8px 28px rgba(0,0,0,.12)" }}>
+          {!absent && (
+            <button
+              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-[var(--color-ink)] hover:bg-[var(--color-brand-soft)] text-left"
+              onClick={() => { setOpen(false); onMarkAbsent(); }}
+            >
+              <UserX size={15} /> Mark as absent
+            </button>
+          )}
+          <button
+            className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-[#fbeceb]"
+            style={{ color: "#c0453b" }}
+            onClick={() => { setOpen(false); onRemove(); }}
+          >
+            <Trash2 size={15} /> Remove from assessment
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ConfirmDialog({ row, action, busy, onCancel, onConfirm }: { row: Row; action: "absent" | "remove"; busy: boolean; onCancel: () => void; onConfirm: () => void }) {
+  const isRemove = action === "remove";
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(15,20,30,.45)" }} onClick={onCancel}>
+      <div className="card p-6 w-full max-w-md" onClick={(e) => e.stopPropagation()}>
+        <div className="text-lg font-semibold text-[var(--color-ink)] mb-1">
+          {isRemove ? "Remove from assessment?" : "Mark student absent?"}
+        </div>
+        <p className="text-sm text-[var(--color-ink2)] leading-relaxed mb-5">
+          {isRemove ? (
+            <><span className="font-medium text-[var(--color-ink)]">{row.name}</span> ({row.rollNo}) will be removed from this assessment. Any attempt and answers they submitted will be deleted and they will no longer appear on the report.</>
+          ) : (
+            <><span className="font-medium text-[var(--color-ink)]">{row.name}</span> ({row.rollNo}) will be marked absent. Any submitted attempt will be cleared and they will show as “A” on the report.</>
+          )}
+        </p>
+        <div className="flex justify-end gap-2">
+          <button className="btn btn-ghost" onClick={onCancel} disabled={busy}>Cancel</button>
+          <button
+            className="btn"
+            style={{ background: isRemove ? "#c0453b" : "#b7791f", color: "#fff" }}
+            onClick={onConfirm}
+            disabled={busy}
+          >
+            {busy ? "Working…" : isRemove ? "Remove" : "Mark absent"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type Candidate = { id: string; name: string; rollNo: string; email: string | null; section: string };
+
+function AddStudentDrawer({ examId, onClose, onAdded }: { examId: string; onClose: () => void; onAdded: () => void }) {
+  const [term, setTerm] = useState("");
+  const [debounced, setDebounced] = useState("");
+  const [addingId, setAddingId] = useState<string | null>(null);
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(term), 250);
+    return () => clearTimeout(t);
+  }, [term]);
+
+  const q = useQuery({
+    queryKey: ["roster-candidates", examId, debounced],
+    queryFn: async () => {
+      const res = await api.reports[":examId"].roster.candidates.$get({ param: { examId }, query: { q: debounced } });
+      if (!res.ok) throw new Error("failed");
+      return res.json();
+    },
+  });
+  const candidates = (q.data && !("message" in q.data) ? q.data.candidates : []) as Candidate[];
+
+  const add = useMutation({
+    mutationFn: async (studentId: string) => {
+      setAddingId(studentId);
+      const res = await api.reports[":examId"].roster.add.$post({ param: { examId }, json: { studentId } });
+      if (!res.ok) throw new Error("failed");
+      return res.json();
+    },
+    onSuccess: () => { onAdded(); q.refetch(); },
+    onSettled: () => setAddingId(null),
+  });
+
+  return (
+    <Drawer eyebrow="Roster" title="Add student to assessment" subtitle="Merge a student from another batch onto this assessment" onClose={onClose} width="max-w-lg">
+      <div className="relative mb-4">
+        <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--color-muted)]" />
+        <input
+          autoFocus
+          value={term}
+          onChange={(e) => setTerm(e.target.value)}
+          placeholder="Search by name, roll no, or email"
+          className="w-full pl-9 pr-3 py-2.5 rounded-lg border border-[var(--color-line)] text-sm bg-white text-[var(--color-ink)]"
+        />
+      </div>
+      {q.isLoading ? (
+        <Loader />
+      ) : candidates.length === 0 ? (
+        <div className="card p-6 text-center text-sm text-[var(--color-ink2)]">
+          {debounced ? "No matching students available to add." : "Start typing to find students from other batches."}
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {candidates.map((s) => (
+            <div key={s.id} className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-[var(--color-line)]">
+              <div className="flex-1 min-w-0">
+                <div className="font-medium text-[var(--color-ink)] truncate">{s.name}</div>
+                <div className="text-xs text-[var(--color-muted)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{s.rollNo}{s.section ? ` · ${s.section}` : ""}{s.email ? ` · ${s.email}` : ""}</div>
+              </div>
+              <button
+                className="btn btn-ghost shrink-0"
+                onClick={() => add.mutate(s.id)}
+                disabled={addingId === s.id}
+              >
+                <UserPlus size={15} /> {addingId === s.id ? "Adding…" : "Add"}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </Drawer>
   );
 }
 
