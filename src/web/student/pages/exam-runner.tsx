@@ -425,6 +425,38 @@ export function ExamRunner() {
       try {
         const st = await api.status(examId);
         if (stop) return;
+        // Admin RESET: the attempt was flipped back to in_progress (e.g. submitted
+        // by accident, or reopened with leftover time). Drop the score screen and
+        // bounce the student straight back into the exam — resume screen if any
+        // lockdown gate is on, otherwise straight into running — carrying their
+        // saved answers and the fresh server-anchored deadline.
+        if (st.status === "in_progress" && st.endAt && st.attemptId) {
+          submittedRef.current = false;
+          setResult(null);
+          setGradeDone(false);
+          setGradedScore(null);
+          const saved = loadProgress(examId);
+          const endAt = new Date(st.endAt).getTime();
+          setSession({
+            attemptId: st.attemptId,
+            endAt,
+            answers: saved?.answers ?? {},
+            flags: saved?.flags ?? {},
+            integrityEvents: [],
+          });
+          saveProgress(examId, { attemptId: st.attemptId, endAt, answers: saved?.answers ?? {}, flags: saved?.flags ?? {}, cur: saved?.cur });
+          if (typeof saved?.cur === "number" && Number.isFinite(saved.cur)) setCur(saved.cur);
+          setHeld(!!st.held);
+          const cfg = proctoringRef.current;
+          if (cfg.requireWebcam || cfg.fullscreenRequired || cfg.requireSingleScreen) {
+            setPhase("resume");
+            if (cfg.requireWebcam) void enableCamera();
+            if (cfg.requireSingleScreen) void getDisplayCount().then(setDisplayCount).catch(() => {});
+          } else {
+            enterRunning();
+          }
+          return;
+        }
         if (st.status === "graded") {
           setGradedScore(typeof st.score === "number" ? st.score : null);
           setGradeDone(true);

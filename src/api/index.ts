@@ -1276,25 +1276,44 @@ const app = new Hono<{ Variables: Vars }>()
     }
 
     const now = Date.now();
-    const basePaused = (attempt.pausedMs ?? 0) + addMinutes * 60_000;
+    const addMs = addMinutes * 60_000;
 
-    // Natural deadline if we just resumed the original timer.
-    const naturalEnd = effectiveEndMs(exam, { startedAt: attempt.startedAt, pausedMs: basePaused }, now);
-
-    // If the exam window has already closed, the natural deadline is in the past
-    // (effectiveEndMs caps base at exam.endAt), so the student would auto-submit
-    // the instant they reopen — timer 0. Grant a fresh writable window so they
-    // can actually rewrite. We compensate via pausedMs (added AFTER the exam cap
-    // inside effectiveEndMs), which affects THIS attempt only.
-    const MIN_WRITABLE_MS = 60_000; // 1 min floor of usable time
-    let newPaused = basePaused;
-    if (naturalEnd - now < MIN_WRITABLE_MS) {
-      const grantMin = addMinutes > 0 ? addMinutes : exam.durationMin;
-      const desiredEnd = now + grantMin * 60_000;
-      // Deadline with pausedMs=0 (includes the exam-window cap + admin extras).
-      const floorEnd = effectiveEndMs(exam, { startedAt: attempt.startedAt, pausedMs: 0 }, now);
-      newPaused = Math.max(basePaused, desiredEnd - floorEnd);
+    // Shared exam-window end that everyone still writing is bound to:
+    // endAt + admin extra time + accumulated hold + any currently-running hold.
+    // This is independent of THIS attempt's (possibly skewed) startedAt, so a
+    // reset student picks up exactly the time still left on the room's clock.
+    let sharedEnd = 0;
+    if (exam.endAt) {
+      sharedEnd =
+        new Date(exam.endAt).getTime() + (exam.extraMin ?? 0) * 60_000 + (exam.holdMs ?? 0);
+      if (exam.heldAt) sharedEnd += Math.max(0, now - new Date(exam.heldAt).getTime());
     }
+
+    // Deadline if we simply resumed this attempt's own timer.
+    const naturalEnd = effectiveEndMs(exam, { startedAt: attempt.startedAt, pausedMs: attempt.pausedMs ?? 0 }, now);
+
+    // Target deadline = the later of the shared window end and this attempt's
+    // natural end, plus any admin-granted minutes for THIS student only. Using
+    // the shared end means a student who submitted early (or whose start time is
+    // skewed) resumes with the SAME leftover time as the rest of the room — e.g.
+    // 30 min left on the window + 20 min admin extra = 50 min — never a fresh
+    // full duration.
+    let target = Math.max(sharedEnd, naturalEnd) + addMs;
+
+    // Only if the whole window has already closed (nothing left for anyone) do we
+    // grant a fresh writable window so the student can still finish: the added
+    // minutes if given, else the exam's normal duration.
+    const MIN_WRITABLE_MS = 60_000; // 1 min floor of usable time
+    if (target - now < MIN_WRITABLE_MS) {
+      const grantMin = addMinutes > 0 ? addMinutes : exam.durationMin;
+      target = now + grantMin * 60_000;
+    }
+
+    // Realise `target` via pausedMs (added AFTER the exam-window cap inside
+    // effectiveEndMs), keeping startedAt untouched. pausedMs affects only this
+    // attempt.
+    const floorEnd = effectiveEndMs(exam, { startedAt: attempt.startedAt, pausedMs: 0 }, now);
+    const newPaused = Math.max(0, target - floorEnd);
 
     await db
       .update(schema.attempts)
