@@ -278,9 +278,16 @@ function FinishedList({ exams, onOpen }: { exams: ExamListItem[]; onOpen: (attem
             <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--color-ink2)", fontSize: 13, fontWeight: 600 }}>
               <Icon name="loader-circle" size={15} className="animate-spin" /> Grading in progress — your score will appear shortly
             </div>
+          ) : e.attempt && !e.resultsReady ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", justifyContent: "flex-end" }}>
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 7, color: "var(--color-ink2)", fontSize: 12.5, fontWeight: 600 }}>
+                <Icon name="lock" size={14} /> Review unlocks after the exam closes
+              </span>
+              <button className="btn btn-ghost" disabled style={{ opacity: 0.55, cursor: "not-allowed" }}><Icon name="file-search" /> Review answers</button>
+            </div>
           ) : (
             <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-              {e.attempt && e.resultsReady && <button className="btn btn-ghost" onClick={() => onOpen(e.attempt!.id)}><Icon name="file-search" /> Review answers</button>}
+              {e.attempt && <button className="btn btn-ghost" onClick={() => onOpen(e.attempt!.id)}><Icon name="file-search" /> Review answers</button>}
             </div>
           )}
         </ExamCard>
@@ -405,9 +412,16 @@ function Dashboard({ finished, onReview }: { finished: ExamListItem[]; onReview:
                   <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--color-ink2)", fontSize: 13, fontWeight: 600 }}>
                     <Icon name="loader-circle" size={15} className="animate-spin" /> Grading in progress
                   </div>
+                ) : e.attempt && !e.resultsReady ? (
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: 7, color: "var(--color-ink2)", fontSize: 12.5, fontWeight: 600 }}>
+                      <Icon name="lock" size={14} /> Review unlocks after the exam closes
+                    </span>
+                    <button className="btn btn-ghost" disabled style={{ opacity: 0.55, cursor: "not-allowed" }}><Icon name="file-search" /> Review</button>
+                  </div>
                 ) : (
                   <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-                    {e.attempt && e.resultsReady && <button className="btn btn-ghost" onClick={() => onReview(e.attempt!.id)}><Icon name="file-search" /> Review</button>}
+                    {e.attempt && <button className="btn btn-ghost" onClick={() => onReview(e.attempt!.id)}><Icon name="file-search" /> Review</button>}
                   </div>
                 )}
               </ExamCard>

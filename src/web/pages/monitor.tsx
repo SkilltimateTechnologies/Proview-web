@@ -198,6 +198,7 @@ export default function Monitor() {
                             <th>Status</th>
                             <th className="text-right">Score</th>
                             <th className="text-right">Started</th>
+                            <th className="text-right">Submitted</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -242,6 +243,7 @@ export default function Monitor() {
                                 )}
                               </td>
                               <td className="text-right"><span className="mono-label">{fmtTime(s.startedAt)}</span></td>
+                              <td className="text-right"><span className="mono-label">{s.status === "finished" ? fmtTime(s.submittedAt) : "—"}</span></td>
                             </tr>
                           ))}
                         </tbody>
@@ -313,6 +315,9 @@ function StudentDrawer({ s, onClose }: { s: LiveStudent; onClose: () => void }) 
         )}
         {s.status !== "not_started" && s.status !== "absent" && (
           <span className="inline-flex items-center gap-1.5 text-sm text-[var(--color-ink2)]"><Clock size={14} /> Started {fmtTime(s.startedAt)}</span>
+        )}
+        {s.status === "finished" && (
+          <span className="inline-flex items-center gap-1.5 text-sm text-[var(--color-ink2)]"><CheckCircle2 size={14} /> Submitted {fmtTime(s.submittedAt)}</span>
         )}
       </div>
 

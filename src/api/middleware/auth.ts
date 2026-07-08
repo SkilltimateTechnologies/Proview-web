@@ -38,7 +38,15 @@ export const authMiddleware = createMiddleware(async (c, next) => {
   // Super admin may scope to a specific college via X-Tenant-Id header.
   if (profile && profile.role === "super_admin") {
     const scope = c.req.header("x-tenant-id");
-    if (scope) profile.tenantId = scope;
+    if (scope) {
+      profile.tenantId = scope;
+    } else if (!profile.tenantId) {
+      // No explicit scope yet (e.g. first paint before the college switcher
+      // has resolved). Default to the sole tenant when exactly one exists so
+      // analytics/lists populate instead of returning an empty payload.
+      const ts = await db.select({ id: schema.tenants.id }).from(schema.tenants).limit(2);
+      if (ts.length === 1) profile.tenantId = ts[0].id;
+    }
   }
   c.set("profile", profile);
   return next();

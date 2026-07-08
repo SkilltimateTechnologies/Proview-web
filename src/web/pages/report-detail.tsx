@@ -8,6 +8,11 @@ import { Loader, Pill, Drawer, usePagination, Pager } from "../components/ui";
 
 type Row = { attemptId: string; studentId: string; name: string; rollNo: string; email: string | null; section: string; score: number | null; status: string; submittedAt: string | number | null };
 
+function fmtSubmitted(t: string | number | null | undefined) {
+  if (!t) return "—";
+  return new Date(t).toLocaleString("en-IN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" });
+}
+
 export default function ReportDetail() {
   const { examId } = useParams<{ examId: string }>();
   const [openAttempt, setOpenAttempt] = useState<Row | null>(null);
@@ -89,6 +94,7 @@ export default function ReportDetail() {
         <div className="flex items-center gap-3 sm:gap-4 px-3 sm:px-4 py-3 border-b border-[var(--color-line)]">
           <span className="mono-label w-6 sm:w-8 shrink-0">#</span>
           <span className="mono-label flex-1 min-w-0">Student</span>
+          <span className="mono-label w-28 text-right shrink-0 hidden sm:block">Submitted</span>
           <span className="mono-label w-14 sm:w-20 text-right shrink-0">Score</span>
           <span className="w-4 shrink-0" />
         </div>
@@ -103,6 +109,7 @@ export default function ReportDetail() {
               <div className="font-medium text-[var(--color-ink)] truncate">{r.name}</div>
               <div className="text-xs text-[var(--color-muted)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{r.rollNo}</div>
             </div>
+            <span className="w-28 text-right shrink-0 hidden sm:block text-xs text-[var(--color-muted)]" style={{ fontFamily: "var(--font-mono)" }}>{fmtSubmitted(r.submittedAt)}</span>
             <span className="stat-num w-14 sm:w-20 text-right shrink-0 text-[var(--color-ink)]">{r.score ?? "—"}</span>
             <ChevronRight size={16} className="text-[var(--color-muted)] w-4 shrink-0" />
           </button>
@@ -148,8 +155,9 @@ function AttemptDrawer({ examId, row, onClose }: { examId: string; row: Row; onC
 
   return (
     <Drawer eyebrow="Student report" title={row.name} subtitle={`${row.rollNo}${row.email ? " · " + row.email : ""}`} onClose={onClose} width="max-w-3xl">
-      <div className="mb-6">
+      <div className="grid grid-cols-2 gap-4 mb-6">
         <div className="card p-4"><div className="stat-num text-[1.6rem]" style={{ color: "var(--brand)" }}>{row.score != null ? `${row.score}/100` : "—"}</div><div className="mono-label mt-1">Marks scored</div></div>
+        <div className="card p-4"><div className="stat-num text-[1.6rem] text-[var(--color-ink)]">{fmtSubmitted(row.submittedAt)}</div><div className="mono-label mt-1">Submitted</div></div>
       </div>
 
       {q.isLoading ? (

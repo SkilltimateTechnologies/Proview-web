@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { eq, and, or, desc, inArray, sql as dsql } from "drizzle-orm";
+import { eq, ne, and, or, desc, inArray, sql as dsql } from "drizzle-orm";
 import { auth } from "./auth";
 import { hashPassword, verifyPassword } from "better-auth/crypto";
 import { db } from "./database";
@@ -1339,7 +1339,17 @@ const app = new Hono<{ Variables: Vars }>()
     const tid = p.tenantId;
     if (!tid) return c.json({ stats: null, classAvg: [], trend: [], topStudents: [], classToppers: [] }, 200);
 
-    const finishedExams = await db.select().from(schema.exams).where(and(eq(schema.exams.tenantId, tid), eq(schema.exams.status, "finished"))).orderBy(schema.exams.createdAt);
+    // An exam counts toward results once it is either explicitly finished OR its
+    // window has closed (deadline passed). Drafts never count. This mirrors the
+    // effective-status logic used by the reports endpoint so the dashboard stays
+    // consistent with what admins see under Reports.
+    const nowMs = Date.now();
+    const allExams = await db.select().from(schema.exams).where(and(eq(schema.exams.tenantId, tid), ne(schema.exams.status, "draft"))).orderBy(schema.exams.createdAt);
+    const finishedExams = allExams.filter((e) => {
+      if (e.status === "finished") return true;
+      const end = e.endAt ? new Date(e.endAt).getTime() : null;
+      return end != null && !Number.isNaN(end) && nowMs > end;
+    });
     const examIds = finishedExams.map((e) => e.id);
     const atts = examIds.length ? await db.select().from(schema.attempts).where(inArray(schema.attempts.examId, examIds)) : [];
     const graded = atts.filter((a) => a.score != null);
