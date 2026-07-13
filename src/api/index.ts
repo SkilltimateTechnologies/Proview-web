@@ -9,7 +9,7 @@ import { authMiddleware, requireAuth, requireSuperAdmin, requirePermission } fro
 import type { SessionUser, ProfileCtx } from "./middleware/auth";
 import { id, displayId, autoGrade, computeYear, effectiveEndMs } from "./lib/util";
 import { generateQuestions } from "./lib/ai";
-import { queueAttemptGrading, finalizeAttempt } from "./lib/grade-queue";
+import { queueAttemptGrading, finalizeAttempt, hasContent } from "./lib/grade-queue";
 import { presignPut, getObject } from "./lib/s3";
 import { signStudentToken, verifyStudentToken } from "./lib/student-token";
 import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
@@ -835,6 +835,51 @@ const app = new Hono<{ Variables: Vars }>()
     await db.update(schema.attempts).set({ lastSeenAt: new Date(now) }).where(eq(schema.attempts.id, attempt.id));
     const endAtMs = effectiveEndMs(exam, attempt, now);
     return c.json({ held: !!exam.heldAt, endAt: new Date(endAtMs), serverNow: new Date(now) }, 200);
+  })
+
+  // Per-answer autosave. The running client calls this the moment a student
+  // answers a question and navigates (plus a short debounce while typing), and
+  // flushes any offline-buffered answers here on reconnect. Upserts each answer
+  // WITHOUT grading — grading happens only at submit / auto-submit. Keeping every
+  // answer server-side in real time means a mid-exam disconnect no longer loses
+  // work, and `answeredCount` gives reports an accurate "answered N/total".
+  .post("/student/attempts/:attemptId/answers", async (c) => {
+    const sid = await verifyStudentToken(c.req.header("x-student-token"));
+    if (!sid) return c.json({ message: "Unauthorized" }, 401);
+    const aid = c.req.param("attemptId");
+    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.id, aid), eq(schema.attempts.studentId, sid))).limit(1);
+    if (!attempt) return c.json({ message: "Not found" }, 404);
+    // Once submitted/graded the answer set is frozen — ignore late autosaves.
+    if (attempt.status === "submitted" || attempt.status === "graded") {
+      return c.json({ ok: true, frozen: true, answeredCount: attempt.answeredCount }, 200);
+    }
+
+    const body = await c.req.json().catch(() => ({}));
+    const incoming: { questionId: string; response: unknown }[] = Array.isArray(body.answers)
+      ? body.answers
+      : body.questionId ? [{ questionId: body.questionId, response: body.response }] : [];
+
+    // Restrict to questions that actually belong to this exam (ignore stray ids).
+    const eqs = await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, attempt.examId));
+    const validQ = new Set(eqs.map((e) => e.questionId));
+
+    for (const a of incoming) {
+      if (!a || !validQ.has(a.questionId)) continue;
+      const [existing] = await db.select().from(schema.answers)
+        .where(and(eq(schema.answers.attemptId, aid), eq(schema.answers.questionId, a.questionId))).limit(1);
+      if (existing) {
+        await db.update(schema.answers).set({ response: a.response ?? null }).where(eq(schema.answers.id, existing.id));
+      } else {
+        await db.insert(schema.answers).values({ id: id("ans"), attemptId: aid, questionId: a.questionId, response: a.response ?? null, score: null, maxScore: null, autoGraded: false });
+      }
+    }
+
+    // Recompute answeredCount from rows that carry real content.
+    const rows = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, aid));
+    const answeredCount = rows.filter((r) => hasContent(r.response)).length;
+    await db.update(schema.attempts).set({ answeredCount, lastSeenAt: new Date() }).where(eq(schema.attempts.id, aid));
+
+    return c.json({ ok: true, answeredCount }, 200);
   })
 
   // Submit an attempt: persist answers, auto-grade objective questions
@@ -1815,6 +1860,8 @@ const app = new Hono<{ Variables: Vars }>()
     if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
     if (p.role === "tpo" && ex.status !== "finished") return c.json({ message: "Report not available until finished" }, 403);
     const atts = await db.select().from(schema.attempts).where(eq(schema.attempts.examId, eid));
+    // Total questions on the exam so the report can show "answered N/total".
+    const totalQuestions = (await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, eid))).length;
     const students = await db.select().from(schema.students).where(eq(schema.students.tenantId, p.tenantId!));
     const smap = new Map(students.map((s) => [s.id, s]));
     const classes = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, p.tenantId!));
@@ -1824,7 +1871,7 @@ const app = new Hono<{ Variables: Vars }>()
       return cid ? clmap.get(cid)?.code ?? "" : "";
     };
     const attemptRows = atts
-      .map((a) => ({ attemptId: a.id, studentId: a.studentId, name: smap.get(a.studentId)?.name ?? "—", rollNo: smap.get(a.studentId)?.rollNo ?? "", email: smap.get(a.studentId)?.email ?? null, section: sectionOf(a.studentId), score: a.score, status: a.status, submittedAt: a.submittedAt, absent: false }))
+      .map((a) => ({ attemptId: a.id, studentId: a.studentId, name: smap.get(a.studentId)?.name ?? "—", rollNo: smap.get(a.studentId)?.rollNo ?? "", email: smap.get(a.studentId)?.email ?? null, section: sectionOf(a.studentId), score: a.score, status: a.status, submittedAt: a.submittedAt, absent: false, disconnected: !!a.disconnected, answeredCount: a.answeredCount ?? 0 }))
       .sort((x, y) => (y.score ?? -1) - (x.score ?? -1));
     // Assigned-but-absent students: enrolled in the exam's cohort yet no attempt row.
     // Only surface them once the exam window has closed (before that they may still
@@ -1841,11 +1888,11 @@ const app = new Hono<{ Variables: Vars }>()
             if (attemptedIds.has(stu.id)) return false;
             return isEligible(ex, stu, exRoster);
           })
-          .map((stu) => ({ attemptId: `absent-${stu.id}`, studentId: stu.id, name: stu.name ?? "—", rollNo: stu.rollNo ?? "", email: stu.email ?? null, section: sectionOf(stu.id), score: null, status: "absent", submittedAt: null, absent: true }))
+          .map((stu) => ({ attemptId: `absent-${stu.id}`, studentId: stu.id, name: stu.name ?? "—", rollNo: stu.rollNo ?? "", email: stu.email ?? null, section: sectionOf(stu.id), score: null, status: "absent", submittedAt: null, absent: true, disconnected: false, answeredCount: 0 }))
           .sort((x, y) => x.rollNo.localeCompare(y.rollNo));
     // Attempts (scored, sorted high→low) first, absentees last.
     const rows = [...attemptRows, ...absentRows];
-    return c.json({ exam: ex, results: rows }, 200);
+    return c.json({ exam: ex, results: rows, totalQuestions }, 200);
   })
   .get("/reports/:examId/attempt/:attemptId", requireAuth, requirePermission("reports"), async (c) => {
     const p = c.get("profile")!;

@@ -105,6 +105,12 @@ export function ExamRunner() {
   // flip the network badge — no freeze, no logout. Time credit for a real outage
   // comes only from an admin GLOBAL hold, never from a single student's drop.
   const notifiedOfflineRef = useRef(false);
+  // Real-time answer sync: `dirtyRef` holds question ids whose answers changed
+  // but haven't reached the server yet. We flush on navigation + a 2s typing
+  // debounce + heartbeat + reconnect. A failed flush leaves ids dirty to retry.
+  const dirtyRef = useRef<Set<string>>(new Set());
+  const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const syncingRef = useRef(false);
   // Admin global hold: when the whole exam is held (venue outage) the heartbeat
   // reports held=true and we freeze behind an overlay until the admin resumes.
   const [held, setHeld] = useState(false);
@@ -382,6 +388,8 @@ export function ExamRunner() {
       notifiedOfflineRef.current = false;
       const s = sessionRef.current;
       if (s) saveProgress(examId, { answers: s.answers, flags: s.flags, cur: curRef.current });
+      // Flush every answer edited during the offline window (all still dirty).
+      flushSyncRef.current();
     }
   }, [online, phase, examId, pushAlert]);
 
@@ -395,6 +403,9 @@ export function ExamRunner() {
     let stopped = false;
     const beat = () => {
       if (stopped || submittedRef.current || !navigator.onLine) return;
+      // Piggyback a sync on every heartbeat so any answer left dirty (e.g. the
+      // student is idle on one question) reaches the server within ~15s.
+      flushSyncRef.current();
       void api.heartbeat(examId)
         .then((info) => {
           if (stopped) return;
@@ -587,9 +598,38 @@ export function ExamRunner() {
     }
   }, [phase, examId, session]);
 
+  // ---- Real-time answer sync ----
+  // Push every dirty answer to the server. Called on navigation, on a 2s typing
+  // debounce, on each heartbeat, and on reconnect. Snapshots the dirty set so
+  // concurrent edits aren't lost, and re-queues everything on failure to retry.
+  const flushSync = useCallback(() => {
+    if (syncingRef.current || submittedRef.current) return;
+    const s = sessionRef.current;
+    if (!s?.attemptId || !navigator.onLine || dirtyRef.current.size === 0) return;
+    const ids = Array.from(dirtyRef.current);
+    dirtyRef.current.clear();
+    const answers = ids.map((questionId) => ({ questionId, response: s.answers[questionId] ?? null }));
+    syncingRef.current = true;
+    void api.syncAnswers(s.attemptId, answers)
+      .catch(() => { for (const q of ids) dirtyRef.current.add(q); })
+      .finally(() => { syncingRef.current = false; });
+  }, []);
+  const flushSyncRef = useRef(flushSync);
+  flushSyncRef.current = flushSync;
+  // Navigate to a question index, flushing any pending answer first so the DB is
+  // always current the instant a student moves off a question.
+  const navTo = useCallback((next: number | ((c: number) => number)) => {
+    if (syncTimerRef.current) { clearTimeout(syncTimerRef.current); syncTimerRef.current = null; }
+    flushSyncRef.current();
+    setCur(next);
+  }, []);
+
   // ---- Answer handlers ----
   function setAnswer(qId: string, value: unknown) {
     setSession((prev) => (prev ? { ...prev, answers: { ...prev.answers, [qId]: value } } : prev));
+    dirtyRef.current.add(qId);
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    syncTimerRef.current = setTimeout(() => flushSyncRef.current(), 2000);
   }
   function toggleFlag(qId: string) {
     setSession((prev) => (prev ? { ...prev, flags: { ...prev.flags, [qId]: !prev.flags[qId] } } : prev));
@@ -925,8 +965,8 @@ export function ExamRunner() {
             <QuestionInput q={q} value={session.answers[q.id]} onChange={(v) => setAnswer(q.id, v)} online={online} />
 
             <div style={{ display: "flex", justifyContent: "space-between", marginTop: 30 }}>
-              <button className="btn btn-ghost" disabled={cur === 0} onClick={() => setCur((c) => Math.max(0, c - 1))}><Icon name="arrow-left" /> Previous</button>
-              <button className="btn btn-ghost" disabled={cur === questions.length - 1} onClick={() => setCur((c) => Math.min(questions.length - 1, c + 1))}>Next <Icon name="arrow-right" /></button>
+              <button className="btn btn-ghost" disabled={cur === 0} onClick={() => navTo((c) => Math.max(0, c - 1))}><Icon name="arrow-left" /> Previous</button>
+              <button className="btn btn-ghost" disabled={cur === questions.length - 1} onClick={() => navTo((c) => Math.min(questions.length - 1, c + 1))}>Next <Icon name="arrow-right" /></button>
             </div>
 
             {/* Big blinking "minutes left" alert (fires at 10 min + 5 min, auto-hides after 10s) */}
@@ -945,7 +985,7 @@ export function ExamRunner() {
                   {flagCount > 0 && <span style={{ color: "var(--color-warn)" }}><Icon name="flag" size={13} /> {flagCount} flagged for review</span>}
                 </div>
                 {flagCount > 0 && (
-                  <button className="btn btn-ghost" onClick={() => { const idx = questions.findIndex((qq) => session.flags[qq.id]); if (idx >= 0) setCur(idx); }}>
+                  <button className="btn btn-ghost" onClick={() => { const idx = questions.findIndex((qq) => session.flags[qq.id]); if (idx >= 0) navTo(idx); }}>
                     <Icon name="flag" /> Review flagged questions
                   </button>
                 )}
@@ -973,7 +1013,7 @@ export function ExamRunner() {
               const answered = session.answers[qq.id] != null && String(session.answers[qq.id]).length > 0;
               const flagged = session.flags[qq.id];
               return (
-                <button key={qq.id} className={`pal-cell ${i === cur ? "cur" : ""} ${flagged ? "pal-flag" : answered ? "pal-answered" : ""}`} onClick={() => setCur(i)}>
+                <button key={qq.id} className={`pal-cell ${i === cur ? "cur" : ""} ${flagged ? "pal-flag" : answered ? "pal-answered" : ""}`} onClick={() => navTo(i)}>
                   {i + 1}
                   {flagged && <span className="pal-flag-dot" />}
                 </button>
@@ -990,7 +1030,7 @@ export function ExamRunner() {
               <div className="mono-label" style={{ marginBottom: 8 }}>Flagged for review</div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                 {questions.map((qq, i) => session.flags[qq.id] ? (
-                  <button key={qq.id} className="btn btn-sm btn-ghost" onClick={() => setCur(i)}>Q{i + 1}</button>
+                  <button key={qq.id} className="btn btn-sm btn-ghost" onClick={() => navTo(i)}>Q{i + 1}</button>
                 ) : null)}
               </div>
             </div>

@@ -57,7 +57,7 @@ async function getProvider(): Promise<string | null> {
   }
 }
 
-function hasContent(response: unknown): boolean {
+export function hasContent(response: unknown): boolean {
   return response != null && String(typeof response === "string" ? response : JSON.stringify(response)).trim() !== "";
 }
 
@@ -198,9 +198,11 @@ export async function finalizeAttempt(
 
   const scorePct = max > 0 ? Math.round((earned / max) * 1000) / 10 : 0;
   const status: "submitted" | "graded" = hasPending ? "submitted" : "graded";
+  const answeredCount = rows.filter((r) => hasContent(r.response)).length;
   await db.update(schema.attempts).set({
     status,
     score: scorePct,
+    answeredCount,
     submittedAt: new Date(),
   }).where(eq(schema.attempts.id, aid));
 
@@ -232,7 +234,6 @@ export async function sweepAutoSubmit() {
     const examById = new Map(exams.map((e) => [e.id, e]));
     const provider = await getProvider();
     let done = 0;
-    let dropped = 0;
     for (const a of inProg) {
       const exam = examById.get(a.examId);
       if (!exam) continue;
@@ -241,27 +242,24 @@ export async function sweepAutoSubmit() {
       const endMs = effectiveEndMs(exam, a, now);
       if (endMs + AUTOSUBMIT_GRACE_MS >= now) continue; // still within window + grace
       try {
-        // A student who opened the exam but never submitted a single answer by
-        // the deadline is effectively absent. There is nothing to grade, so
-        // rather than force-submit them to a graded 0 (a wasted grading pass
-        // that also turns a no-show into a "participant"), delete the empty
-        // abandoned attempt — the report then surfaces them as auto-absent "A".
+        // A student who started but never submitted by the deadline lost the
+        // connection through the cutoff. We DO NOT delete the attempt anymore —
+        // that erased who actually participated. Instead we grade whatever they
+        // synced (per-answer autosave keeps the server copy current) and flag the
+        // attempt `disconnected` so the report shows a distinct "Disconnected ·
+        // answered N/total" instead of a misleading blank "Absent".
         const ans = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, a.id));
-        const hasWork = ans.some((x) => hasContent(x.response));
-        if (!hasWork) {
-          await db.delete(schema.answers).where(eq(schema.answers.attemptId, a.id));
-          await db.delete(schema.integrityEvents).where(eq(schema.integrityEvents.attemptId, a.id));
-          await db.delete(schema.attempts).where(eq(schema.attempts.id, a.id));
-          dropped++;
-          continue;
-        }
-        await finalizeAttempt(a, [], provider);
+        const synced = ans
+          .filter((x) => hasContent(x.response))
+          .map((x) => ({ questionId: x.questionId, response: x.response }));
+        await finalizeAttempt(a, synced, provider);
+        await db.update(schema.attempts).set({ disconnected: true }).where(eq(schema.attempts.id, a.id));
         done++;
       } catch (e) {
         console.error(`[auto-submit] attempt ${a.id} failed:`, e);
       }
     }
-    if (done || dropped) console.log(`[auto-submit] force-submitted ${done} expired attempt(s); dropped ${dropped} empty attempt(s) as absent`);
+    if (done) console.log(`[auto-submit] force-submitted ${done} disconnected attempt(s) on synced answers`);
   } catch (e) {
     console.error("[auto-submit] sweep failed:", e);
   }

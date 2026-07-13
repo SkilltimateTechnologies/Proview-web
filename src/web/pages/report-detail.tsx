@@ -6,7 +6,7 @@ import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, Pill, Drawer, usePagination, Pager } from "../components/ui";
 
-type Row = { attemptId: string; studentId: string; name: string; rollNo: string; email: string | null; section: string; score: number | null; status: string; submittedAt: string | number | null; absent?: boolean };
+type Row = { attemptId: string; studentId: string; name: string; rollNo: string; email: string | null; section: string; score: number | null; status: string; submittedAt: string | number | null; absent?: boolean; disconnected?: boolean; answeredCount?: number };
 
 function fmtSubmitted(t: string | number | null | undefined) {
   if (!t) return "—";
@@ -68,7 +68,7 @@ export default function ReportDetail() {
     );
   }
 
-  const { exam, results } = q.data as { exam: { title: string; status: string }; results: Row[] };
+  const { exam, results, totalQuestions } = q.data as { exam: { title: string; status: string }; results: Row[]; totalQuestions?: number };
   const topper = results[0];
 
   const BANDS = [90, 80, 70, 60, 50];
@@ -265,7 +265,14 @@ export default function ReportDetail() {
             />
             <span className="mono-label w-6 sm:w-8 shrink-0">{String((curPage - 1) * PS + i + 1).padStart(2, "0")}</span>
             <div className="flex-1 min-w-0">
-              <div className="font-medium text-[var(--color-ink)] truncate">{r.name}</div>
+              <div className="font-medium text-[var(--color-ink)] truncate flex items-center gap-2">
+                {r.name}
+                {r.disconnected && (
+                  <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded" style={{ color: "#b7791f", background: "rgba(183,121,31,.12)", fontFamily: "var(--font-mono)" }} title="Lost connection before submitting — only synced answers were graded">
+                    Disconnected · {r.answeredCount ?? 0}/{totalQuestions ?? "—"}
+                  </span>
+                )}
+              </div>
               <div className="text-xs text-[var(--color-muted)] truncate md:hidden" style={{ fontFamily: "var(--font-mono)" }}>{r.rollNo}{r.section ? ` · ${r.section}` : ""}</div>
             </div>
             <span className="w-32 shrink-0 hidden md:block text-sm text-[var(--color-ink2)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{r.rollNo}</span>

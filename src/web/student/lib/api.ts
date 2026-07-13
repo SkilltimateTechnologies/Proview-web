@@ -136,6 +136,16 @@ export const api = {
   bundle: (examId: string) => req<Bundle>(`/student/exams/${examId}/bundle`),
   start: (examId: string) => req<StartInfo>(`/student/attempts/${examId}/start`, { method: "POST" }),
   status: (examId: string) => req<StatusInfo>(`/student/attempts/${examId}/status`),
+  // Real-time per-answer autosave. keepalive lets the request survive a page
+  // hide/unload so the last answer still reaches the server. Never throws — a
+  // failed sync just leaves the answer in the client's dirty set to retry.
+  syncAnswers: (attemptId: string, answers: { questionId: string; response: unknown }[]) =>
+    fetch(`${API_URL}/api/student/attempts/${attemptId}/answers`, {
+      method: "POST",
+      keepalive: true,
+      headers: { "Content-Type": "application/json", ...tokenHeader() },
+      body: JSON.stringify({ answers }),
+    }).then((r) => (r.ok ? (r.json() as Promise<{ ok: boolean; answeredCount?: number; frozen?: boolean }>) : Promise.reject(new Error(`sync failed (${r.status})`)))),
   submit: (attemptId: string, payload: { answers: { questionId: string; response: unknown }[]; integrityEvents: { type: string; detail?: string; at?: number }[] }) =>
     req<{ ok: boolean; score: number; integrityScore: number }>(`/student/attempts/${attemptId}/submit`, {
       method: "POST",

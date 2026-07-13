@@ -191,6 +191,14 @@ export const attempts = sqliteTable(
     lastPausedAt: integer("last_paused_at", { mode: "timestamp_ms" }),
     // Last heartbeat from the student client — drives Live Monitor online/offline.
     lastSeenAt: integer("last_seen_at", { mode: "timestamp_ms" }),
+    // Number of questions with a synced (server-received) answer. Kept current by
+    // the per-answer autosave endpoint + finalizeAttempt, so reports can show
+    // "answered N/total" even for attempts that never reached a normal submit.
+    answeredCount: integer("answered_count").notNull().default(0),
+    // True when the attempt was force-finalized by the server-side sweep because
+    // the student started but never submitted (lost connection through the
+    // cutoff). Lets reports show a distinct "Disconnected" status vs true Absent.
+    disconnected: integer("disconnected", { mode: "boolean" }).notNull().default(false),
     submittedAt: integer("submitted_at", { mode: "timestamp_ms" }),
     createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
   },
