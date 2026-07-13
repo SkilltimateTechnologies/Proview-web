@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useLocation } from "wouter";
-import { ChevronRight, Search, Users, CheckCircle2, Clock, UserX } from "lucide-react";
+import { ChevronRight, Search, Users, CheckCircle2, Clock, UserX, CalendarDays } from "lucide-react";
 import { api } from "../lib/api";
 import { useSession } from "../lib/session";
 import { PageHeader } from "../components/shell";
@@ -46,6 +46,8 @@ export default function Reports() {
   const isTpo = me?.profile.role === "tpo";
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("all");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
 
   const q = useQuery({
     queryKey: ["reports"],
@@ -62,8 +64,22 @@ export default function Reports() {
     let list = all;
     if (search.trim()) list = list.filter((e) => e.title.toLowerCase().includes(search.trim().toLowerCase()));
     if (status !== "all") list = list.filter((e) => e.status === status);
+    // Date-range filter on the conducted date (startAt, falling back to createdAt).
+    const fromMs = dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : null;
+    const toMs = dateTo ? new Date(`${dateTo}T23:59:59.999`).getTime() : null;
+    if (fromMs !== null || toMs !== null) {
+      list = list.filter((e) => {
+        const raw = e.startAt ?? e.createdAt;
+        if (!raw) return false;
+        const t = new Date(raw as any).getTime();
+        if (isNaN(t)) return false;
+        if (fromMs !== null && t < fromMs) return false;
+        if (toMs !== null && t > toMs) return false;
+        return true;
+      });
+    }
     return list;
-  }, [all, search, status]);
+  }, [all, search, status, dateFrom, dateTo]);
 
   const totals = useMemo(() => {
     return all.reduce(
@@ -118,6 +134,34 @@ export default function Reports() {
                 <option value="finished">Finished</option>
                 <option value="live">Live</option>
               </select>
+            )}
+            <div className="flex items-center gap-1.5">
+              <CalendarDays size={15} className="text-[var(--color-muted)]" />
+              <input
+                type="date"
+                className="input w-auto"
+                aria-label="From date"
+                value={dateFrom}
+                max={dateTo || undefined}
+                onChange={(e) => setDateFrom(e.target.value)}
+              />
+              <span className="text-[var(--color-muted)] text-sm">–</span>
+              <input
+                type="date"
+                className="input w-auto"
+                aria-label="To date"
+                value={dateTo}
+                min={dateFrom || undefined}
+                onChange={(e) => setDateTo(e.target.value)}
+              />
+            </div>
+            {(dateFrom || dateTo || search || status !== "all") && (
+              <button
+                className="btn-ghost text-sm"
+                onClick={() => { setSearch(""); setStatus("all"); setDateFrom(""); setDateTo(""); }}
+              >
+                Clear
+              </button>
             )}
           </div>
 
