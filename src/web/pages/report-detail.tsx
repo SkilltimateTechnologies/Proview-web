@@ -243,6 +243,8 @@ export default function ReportDetail() {
           />
           <span className="mono-label w-6 sm:w-8 shrink-0">#</span>
           <span className="mono-label flex-1 min-w-0">Student</span>
+          <span className="mono-label w-32 shrink-0 hidden md:block">Roll No</span>
+          <span className="mono-label w-20 shrink-0 hidden md:block">Section</span>
           <span className="mono-label w-28 text-right shrink-0 hidden sm:block">Submitted</span>
           <span className="mono-label w-14 sm:w-20 text-right shrink-0">Score</span>
           <span className="w-8 shrink-0" />
@@ -264,8 +266,10 @@ export default function ReportDetail() {
             <span className="mono-label w-6 sm:w-8 shrink-0">{String((curPage - 1) * PS + i + 1).padStart(2, "0")}</span>
             <div className="flex-1 min-w-0">
               <div className="font-medium text-[var(--color-ink)] truncate">{r.name}</div>
-              <div className="text-xs text-[var(--color-muted)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{r.rollNo}{r.section ? ` · ${r.section}` : ""}</div>
+              <div className="text-xs text-[var(--color-muted)] truncate md:hidden" style={{ fontFamily: "var(--font-mono)" }}>{r.rollNo}{r.section ? ` · ${r.section}` : ""}</div>
             </div>
+            <span className="w-32 shrink-0 hidden md:block text-sm text-[var(--color-ink2)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{r.rollNo}</span>
+            <span className="w-20 shrink-0 hidden md:block text-sm text-[var(--color-ink2)] truncate" style={{ fontFamily: "var(--font-mono)" }}>{r.section || "—"}</span>
             <span className="w-28 text-right shrink-0 hidden sm:block text-xs text-[var(--color-muted)]" style={{ fontFamily: "var(--font-mono)" }}>{fmtSubmitted(r.submittedAt)}</span>
             {r.absent ? (
               <span className="stat-num w-14 sm:w-20 text-right shrink-0" style={{ color: "#c0453b" }} title="Absent">A</span>
