@@ -97,13 +97,15 @@ export default function ReportDetail() {
   }
 
   const { exam, results, totalQuestions } = q.data as { exam: { title: string; status: string }; results: Row[]; totalQuestions?: number };
-  const topper = results[0];
+  // Metrics + roster follow the active section filter (or the whole exam when "all").
+  const scoped = sectionFilter === "all" ? results : results.filter((r) => r.section === sectionFilter);
+  const topper = scoped.find((r) => !r.absent && r.score != null) ?? scoped[0];
 
   const BANDS = [90, 80, 70, 60, 50];
-  const bandCount = (min: number) => results.filter((r) => !r.absent && (r.score ?? 0) >= min).length;
+  const bandCount = (min: number) => scoped.filter((r) => !r.absent && (r.score ?? 0) >= min).length;
   // Pass/Fail: a student who wrote the exam and scored below 40% is a Fail.
   const PASS_MARK = 40;
-  const gradedRows = results.filter((r) => !r.absent && r.score != null);
+  const gradedRows = scoped.filter((r) => !r.absent && r.score != null);
   const isFail = (r: Row) => !r.absent && r.score != null && (r.score ?? 0) < PASS_MARK;
   const isPass = (r: Row) => !r.absent && r.score != null && (r.score ?? 0) >= PASS_MARK;
   const failCount = gradedRows.filter(isFail).length;
@@ -269,11 +271,11 @@ export default function ReportDetail() {
           return (
             <>
               <button type="button" onClick={() => setStat("all")} className={cardCls(statFilter === "all")}>
-                <div className="stat-num text-[1.8rem]">{results.length}</div>
+                <div className="stat-num text-[1.8rem]">{scoped.length}</div>
                 <div className="mono-label mt-1">All students</div>
               </button>
               <button type="button" onClick={() => setStat("attempts")} className={cardCls(statFilter === "attempts")}>
-                <div className="stat-num text-[1.8rem]">{results.filter((r) => !r.absent).length}</div>
+                <div className="stat-num text-[1.8rem]">{scoped.filter((r) => !r.absent).length}</div>
                 <div className="mono-label mt-1">Attempts</div>
               </button>
               <button type="button" onClick={() => setStat("pass")} className={cardCls(statFilter === "pass")}>
@@ -285,7 +287,7 @@ export default function ReportDetail() {
                 <div className="mono-label mt-1">Fail (&lt;40%)</div>
               </button>
               <button type="button" onClick={() => setStat("absent")} className={cardCls(statFilter === "absent")}>
-                <div className="stat-num text-[1.8rem]" style={{ color: "#c0453b" }}>{results.filter((r) => r.absent).length}</div>
+                <div className="stat-num text-[1.8rem]" style={{ color: "#c0453b" }}>{scoped.filter((r) => r.absent).length}</div>
                 <div className="mono-label mt-1">Absent</div>
               </button>
               <div className="card p-5">
