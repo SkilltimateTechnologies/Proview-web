@@ -72,9 +72,11 @@ export default function Reports() {
         acc.finished += e.finished;
         acc.inProgress += e.inProgress;
         acc.absent += e.absent;
+        acc.passed += e.passed;
+        acc.failed += e.failed;
         return acc;
       },
-      { assigned: 0, finished: 0, inProgress: 0, absent: 0 },
+      { assigned: 0, finished: 0, inProgress: 0, absent: 0, passed: 0, failed: 0 },
     );
   }, [all]);
 
@@ -91,9 +93,11 @@ export default function Reports() {
       ) : (
         <>
           {/* Summary stats across all conducted assessments */}
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+          <div className="grid grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
             <StatCard label="Assigned" value={totals.assigned} icon={<Users size={18} />} />
             <StatCard label="Finished" value={totals.finished} icon={<CheckCircle2 size={18} />} tone="#2e7d5b" />
+            <StatCard label="Passed" value={totals.passed} icon={<CheckCircle2 size={18} />} tone="#2e7d5b" />
+            <StatCard label="Failed" value={totals.failed} icon={<UserX size={18} />} tone="#c0453b" />
             <StatCard label="In Progress" value={totals.inProgress} icon={<Clock size={18} />} tone="#b7791f" />
             <StatCard label="Absent" value={totals.absent} icon={<UserX size={18} />} tone="#c0453b" />
           </div>
@@ -129,6 +133,8 @@ export default function Reports() {
                       <th className="text-left">Date Conducted</th>
                       <th className="text-center">Assigned</th>
                       <th className="text-center">Finished</th>
+                      <th className="text-center">Passed</th>
+                      <th className="text-center">Failed</th>
                       <th className="text-center">In Progress</th>
                       <th className="text-center">Absent</th>
                       <th className="text-left">Status</th>
@@ -152,6 +158,14 @@ export default function Reports() {
                           <td className="text-center font-medium text-[var(--color-ink)]">{e.assigned}</td>
                           <td className="text-center">
                             <span className="font-semibold" style={{ color: "#2e7d5b" }}>{e.finished}</span>
+                          </td>
+                          <td className="text-center">
+                            <span className="font-semibold" style={{ color: "#2e7d5b" }}>{e.passed}</span>
+                            {e.graded ? <div className="mono-label mt-0.5">{Math.round((e.passed / e.graded) * 100)}%</div> : null}
+                          </td>
+                          <td className="text-center">
+                            <span className="font-semibold" style={{ color: "#c0453b" }}>{e.failed}</span>
+                            {e.graded ? <div className="mono-label mt-0.5">{Math.round((e.failed / e.graded) * 100)}%</div> : null}
                           </td>
                           <td className="text-center">
                             <span className="font-semibold" style={{ color: "#b7791f" }}>{e.inProgress}</span>
