@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import type { Dispatch, SetStateAction } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Lock, BarChart3, Clock, CalendarClock, ArrowLeft, Pencil, Ban, Search, UserPlus, UserX, Undo2, Users } from "lucide-react";
+import { Plus, Lock, BarChart3, Clock, CalendarClock, ArrowLeft, Pencil, Ban, Search, UserPlus, UserX, Undo2, Users, X } from "lucide-react";
 import { useLocation, useParams } from "wouter";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
@@ -573,10 +573,13 @@ function StudentPicker({ selected, setSelected }: { selected: string[]; setSelec
   const classes = ((classesQ.data as { classes?: Array<{ id: string; code: string }> })?.classes ?? []);
   const clmap = new Map(classes.map((c) => [c.id, c.code]));
   const sel = new Set(selected);
+  const byId = new Map(students.map((s) => [s.id, s]));
+  const selectedStudents = selected.map((id) => byId.get(id)).filter(Boolean) as StudentLite[];
 
   const q = term.trim().toLowerCase();
   const filtered = students.filter((s) =>
-    !q || (s.name ?? "").toLowerCase().includes(q) || (s.rollNo ?? "").toLowerCase().includes(q) || (s.email ?? "").toLowerCase().includes(q),
+    !sel.has(s.id) &&
+    (!q || (s.name ?? "").toLowerCase().includes(q) || (s.rollNo ?? "").toLowerCase().includes(q) || (s.email ?? "").toLowerCase().includes(q)),
   );
   const shown = filtered.slice(0, 100);
 
@@ -600,6 +603,29 @@ function StudentPicker({ selected, setSelected }: { selected: string[]; setSelec
           <button className="text-xs text-[var(--color-muted)] underline" onClick={() => setSelected([])}>Clear</button>
         )}
       </div>
+      {selectedStudents.length > 0 && (
+        <div className="flex flex-wrap gap-2 mb-3">
+          {selectedStudents.map((s) => (
+            <span
+              key={s.id}
+              className="inline-flex items-center gap-1.5 pl-2.5 pr-1.5 py-1 rounded-full text-xs font-medium bg-[var(--color-brand-soft)] border border-[var(--color-brand)] text-[var(--color-ink)]"
+            >
+              <span className="truncate max-w-[180px]">
+                {s.name ?? s.rollNo}
+                <span className="text-[var(--color-muted)]" style={{ fontFamily: "var(--font-mono)" }}> · {s.rollNo}</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => toggle(s.id)}
+                className="shrink-0 grid place-items-center w-4 h-4 rounded-full hover:bg-[var(--color-brand)] hover:text-white transition"
+                title="Remove"
+              >
+                <X size={12} />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
       {studentsQ.isLoading ? (
         <Loader />
       ) : students.length === 0 ? (
@@ -607,10 +633,15 @@ function StudentPicker({ selected, setSelected }: { selected: string[]; setSelec
       ) : (
         <div className="rounded-lg border border-[var(--color-line)] overflow-hidden">
           <div className="flex items-center gap-3 px-3 py-2 border-b border-[var(--color-line)] bg-[var(--color-brand-soft)]">
-            <input type="checkbox" className="w-4 h-4 accent-[var(--color-brand)] cursor-pointer" checked={allShownSelected} onChange={toggleAllShown} title="Select all shown" />
-            <span className="mono-label flex-1">{filtered.length} shown{filtered.length > shown.length ? ` (first ${shown.length})` : ""}</span>
+            <input type="checkbox" className="w-4 h-4 accent-[var(--color-brand)] cursor-pointer" checked={allShownSelected} onChange={toggleAllShown} title="Add all shown" />
+            <span className="mono-label flex-1">{filtered.length} available{filtered.length > shown.length ? ` (first ${shown.length})` : ""}</span>
           </div>
           <div className="max-h-72 overflow-y-auto">
+            {shown.length === 0 && (
+              <div className="px-3 py-8 text-center text-sm text-[var(--color-muted)]">
+                {q ? "No matching students." : "All students added."}
+              </div>
+            )}
             {shown.map((s) => {
               const on = sel.has(s.id);
               return (
