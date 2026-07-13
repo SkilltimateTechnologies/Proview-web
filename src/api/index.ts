@@ -1914,6 +1914,30 @@ const app = new Hono<{ Variables: Vars }>()
     return c.json({ ok: true }, 200);
   })
 
+  // Bulk-remove students from the assessment (checkbox selection on the report).
+  .post("/reports/:examId/roster/bulk-remove", requireAuth, requirePermission("reports"), async (c) => {
+    const p = c.get("profile")!;
+    const eid = c.req.param("examId");
+    const b = await c.req.json().catch(() => ({}));
+    const studentIds = Array.isArray(b.studentIds) ? b.studentIds.map((s: unknown) => String(s)).filter(Boolean) : [];
+    if (!studentIds.length) return c.json({ message: "studentIds required" }, 400);
+    const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid));
+    if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
+    let removed = 0;
+    for (const studentId of studentIds) {
+      const atts = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
+      for (const a of atts) {
+        await db.delete(schema.answers).where(eq(schema.answers.attemptId, a.id));
+        await db.delete(schema.integrityEvents).where(eq(schema.integrityEvents.attemptId, a.id));
+      }
+      if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
+      await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
+      await db.insert(schema.examRoster).values({ id: id("rst"), examId: eid, studentId, mode: "remove", createdBy: p.userId ?? null });
+      removed++;
+    }
+    return c.json({ ok: true, removed }, 200);
+  })
+
   // Mark a student Absent: they STAY on the report (as "A") but are counted
   // absent. Ensures they are roster-eligible, then deletes any attempt so they
   // fall through to the auto-absent path (assigned + no attempt + deadline).

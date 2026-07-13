@@ -19,6 +19,8 @@ export default function ReportDetail() {
   const [openAttempt, setOpenAttempt] = useState<Row | null>(null);
   const [page, setPage] = useState(1);
   const [confirm, setConfirm] = useState<{ row: Row; action: "absent" | "remove" } | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkConfirm, setBulkConfirm] = useState(false);
   const q = useQuery({
     queryKey: ["report", examId],
     queryFn: async () => {
@@ -45,6 +47,14 @@ export default function ReportDetail() {
     },
     onSuccess: () => { refresh(); setConfirm(null); },
   });
+  const bulkRemove = useMutation({
+    mutationFn: async (studentIds: string[]) => {
+      const res = await api.reports[":examId"].roster["bulk-remove"].$post({ param: { examId }, json: { studentIds } });
+      if (!res.ok) throw new Error("failed");
+      return res.json();
+    },
+    onSuccess: () => { refresh(); setSelected(new Set()); setBulkConfirm(false); },
+  });
 
   if (q.isLoading) return <Loader />;
   if (!q.data || "message" in q.data) {
@@ -64,6 +74,19 @@ export default function ReportDetail() {
   const pageResults = results.slice((curPage - 1) * PS, curPage * PS);
   const from = results.length === 0 ? 0 : (curPage - 1) * PS + 1;
   const to = Math.min(curPage * PS, results.length);
+
+  const allIds = results.map((r) => r.studentId);
+  const allSelected = allIds.length > 0 && allIds.every((sid) => selected.has(sid));
+  const toggleAll = () => {
+    setSelected((prev) => (allIds.every((sid) => prev.has(sid)) ? new Set() : new Set(allIds)));
+  };
+  const toggleOne = (sid: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(sid)) next.delete(sid); else next.add(sid);
+      return next;
+    });
+  };
 
   function exportCsv() {
     const header = ["Name", "Roll No", "Section", "Score"];
@@ -114,8 +137,32 @@ export default function ReportDetail() {
         </div>
       </div>
 
+      {selected.size > 0 && (
+        <div className="card flex items-center justify-between gap-3 px-4 py-3 mb-4" style={{ borderColor: "var(--color-brand)" }}>
+          <div className="text-sm text-[var(--color-ink)]">
+            <span className="font-semibold">{selected.size}</span> selected
+            <button className="ml-3 text-xs text-[var(--color-muted)] underline" onClick={() => setSelected(new Set())}>Clear</button>
+          </div>
+          <button
+            className="btn"
+            style={{ background: "#c0453b", color: "#fff" }}
+            onClick={() => setBulkConfirm(true)}
+          >
+            <Trash2 size={16} /> Delete selected
+          </button>
+        </div>
+      )}
+
       <div className="card overflow-hidden">
         <div className="flex items-center gap-3 sm:gap-4 px-3 sm:px-4 py-3 border-b border-[var(--color-line)]">
+          <input
+            type="checkbox"
+            className="w-4 h-4 shrink-0 accent-[var(--color-brand)] cursor-pointer"
+            checked={allSelected}
+            ref={(el) => { if (el) el.indeterminate = selected.size > 0 && !allSelected; }}
+            onChange={toggleAll}
+            title="Select all"
+          />
           <span className="mono-label w-6 sm:w-8 shrink-0">#</span>
           <span className="mono-label flex-1 min-w-0">Student</span>
           <span className="mono-label w-28 text-right shrink-0 hidden sm:block">Submitted</span>
@@ -126,8 +173,16 @@ export default function ReportDetail() {
           <div
             key={r.rollNo + i}
             onClick={() => { if (!r.absent) setOpenAttempt(r); }}
-            className={`w-full flex items-center gap-3 sm:gap-4 px-3 sm:px-4 py-3 border-b border-[var(--color-line)] last:border-0 text-left transition ${r.absent ? "" : "cursor-pointer hover:bg-[var(--color-brand-soft)]"}`}
+            className={`w-full flex items-center gap-3 sm:gap-4 px-3 sm:px-4 py-3 border-b border-[var(--color-line)] last:border-0 text-left transition ${selected.has(r.studentId) ? "bg-[var(--color-brand-soft)]" : ""} ${r.absent ? "" : "cursor-pointer hover:bg-[var(--color-brand-soft)]"}`}
           >
+            <input
+              type="checkbox"
+              className="w-4 h-4 shrink-0 accent-[var(--color-brand)] cursor-pointer"
+              checked={selected.has(r.studentId)}
+              onClick={(e) => e.stopPropagation()}
+              onChange={() => toggleOne(r.studentId)}
+              title="Select student"
+            />
             <span className="mono-label w-6 sm:w-8 shrink-0">{String((curPage - 1) * PS + i + 1).padStart(2, "0")}</span>
             <div className="flex-1 min-w-0">
               <div className="font-medium text-[var(--color-ink)] truncate">{r.name}</div>
@@ -151,6 +206,23 @@ export default function ReportDetail() {
       </div>
 
       <Pager page={curPage} pageCount={pageCount} from={from} to={to} total={results.length} onChange={setPage} unit="students" />
+
+      {bulkConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(15,20,30,.45)" }} onClick={() => !bulkRemove.isPending && setBulkConfirm(false)}>
+          <div className="card p-6 w-full max-w-md" onClick={(e) => e.stopPropagation()}>
+            <div className="text-lg font-semibold text-[var(--color-ink)] mb-1">Delete {selected.size} student{selected.size > 1 ? "s" : ""}?</div>
+            <p className="text-sm text-[var(--color-ink2)] leading-relaxed mb-5">
+              The selected students will be removed from this assessment. Any attempts and answers they submitted will be deleted and they will no longer appear on the report. This cannot be undone from here.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button className="btn btn-ghost" onClick={() => setBulkConfirm(false)} disabled={bulkRemove.isPending}>Cancel</button>
+              <button className="btn" style={{ background: "#c0453b", color: "#fff" }} onClick={() => bulkRemove.mutate([...selected])} disabled={bulkRemove.isPending}>
+                {bulkRemove.isPending ? "Deleting…" : `Delete ${selected.size}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {openAttempt && <AttemptDrawer examId={examId} row={openAttempt} onClose={() => setOpenAttempt(null)} />}
 
