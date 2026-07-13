@@ -21,6 +21,8 @@ export default function ReportDetail() {
   const [confirm, setConfirm] = useState<{ row: Row; action: "absent" | "remove" } | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkConfirm, setBulkConfirm] = useState(false);
+  const [statFilter, setStatFilter] = useState<"none" | "attempts" | "absent" | "passed">("none");
+  const [sectionFilter, setSectionFilter] = useState<string>("all");
   const q = useQuery({
     queryKey: ["report", examId],
     queryFn: async () => {
@@ -68,14 +70,25 @@ export default function ReportDetail() {
 
   const { exam, results } = q.data as { exam: { title: string; status: string }; results: Row[] };
   const topper = results[0];
-  const PS = 20;
-  const pageCount = Math.max(1, Math.ceil(results.length / PS));
-  const curPage = Math.min(page, pageCount);
-  const pageResults = results.slice((curPage - 1) * PS, curPage * PS);
-  const from = results.length === 0 ? 0 : (curPage - 1) * PS + 1;
-  const to = Math.min(curPage * PS, results.length);
 
-  const allIds = results.map((r) => r.studentId);
+  const isPassed = (r: Row) => !r.absent && (r.score ?? 0) >= 40;
+  const sections = Array.from(new Set(results.map((r) => r.section).filter(Boolean))).sort();
+  const filtered = results.filter((r) => {
+    if (sectionFilter !== "all" && r.section !== sectionFilter) return false;
+    if (statFilter === "attempts" && r.absent) return false;
+    if (statFilter === "absent" && !r.absent) return false;
+    if (statFilter === "passed" && !isPassed(r)) return false;
+    return true;
+  });
+
+  const PS = 20;
+  const pageCount = Math.max(1, Math.ceil(filtered.length / PS));
+  const curPage = Math.min(page, pageCount);
+  const pageResults = filtered.slice((curPage - 1) * PS, curPage * PS);
+  const from = filtered.length === 0 ? 0 : (curPage - 1) * PS + 1;
+  const to = Math.min(curPage * PS, filtered.length);
+
+  const allIds = filtered.map((r) => r.studentId);
   const allSelected = allIds.length > 0 && allIds.every((sid) => selected.has(sid));
   const toggleAll = () => {
     setSelected((prev) => (allIds.every((sid) => prev.has(sid)) ? new Set() : new Set(allIds)));
@@ -117,25 +130,70 @@ export default function ReportDetail() {
       />
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4">
-        <div className="card p-5">
-          <div className="stat-num text-[1.8rem]">{results.filter((r) => !r.absent).length}</div>
-          <div className="mono-label mt-1">Attempts</div>
-        </div>
-        <div className="card p-5">
-          <div className="stat-num text-[1.8rem]" style={{ color: "#c0453b" }}>{results.filter((r) => r.absent).length}</div>
-          <div className="mono-label mt-1">Absent</div>
-        </div>
-        <div className="card p-5">
-          <div className="stat-num text-[1.8rem]">{topper?.score ?? "—"}</div>
-          <div className="mono-label mt-1">Highest score</div>
-        </div>
-        <div className="card p-5">
-          <div className="stat-num text-[1.8rem]">
-            {results.filter((r) => !r.absent && (r.score ?? 0) >= 40).length}
-          </div>
-          <div className="mono-label mt-1">Passed</div>
-        </div>
+        {(() => {
+          const setStat = (v: typeof statFilter) => { setStatFilter((prev) => (prev === v ? "none" : v)); setPage(1); };
+          const cardCls = (active: boolean) =>
+            `card p-5 text-left w-full transition ${active ? "ring-2 ring-[var(--color-brand)]" : "hover:border-[var(--color-brand)]"}`;
+          return (
+            <>
+              <button type="button" onClick={() => setStat("attempts")} className={cardCls(statFilter === "attempts")}>
+                <div className="stat-num text-[1.8rem]">{results.filter((r) => !r.absent).length}</div>
+                <div className="mono-label mt-1">Attempts</div>
+              </button>
+              <button type="button" onClick={() => setStat("absent")} className={cardCls(statFilter === "absent")}>
+                <div className="stat-num text-[1.8rem]" style={{ color: "#c0453b" }}>{results.filter((r) => r.absent).length}</div>
+                <div className="mono-label mt-1">Absent</div>
+              </button>
+              <div className="card p-5">
+                <div className="stat-num text-[1.8rem]">{topper?.score ?? "—"}</div>
+                <div className="mono-label mt-1">Highest score</div>
+              </div>
+              <button type="button" onClick={() => setStat("passed")} className={cardCls(statFilter === "passed")}>
+                <div className="stat-num text-[1.8rem]">
+                  {results.filter((r) => !r.absent && (r.score ?? 0) >= 40).length}
+                </div>
+                <div className="mono-label mt-1">Passed</div>
+              </button>
+            </>
+          );
+        })()}
       </div>
+
+      {(sections.length > 0 || statFilter !== "none") && (
+        <div className="flex flex-wrap items-center gap-2 mb-4">
+          {sections.length > 0 && (
+            <>
+              <span className="mono-label">Section</span>
+              <button
+                type="button"
+                onClick={() => { setSectionFilter("all"); setPage(1); }}
+                className={`px-3 py-1.5 rounded-full text-xs font-medium border transition ${sectionFilter === "all" ? "bg-[var(--color-brand)] text-white border-[var(--color-brand)]" : "border-[var(--color-line)] text-[var(--color-ink2)] hover:border-[var(--color-brand)]"}`}
+              >
+                All
+              </button>
+              {sections.map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => { setSectionFilter(s); setPage(1); }}
+                  className={`px-3 py-1.5 rounded-full text-xs font-medium border transition ${sectionFilter === s ? "bg-[var(--color-brand)] text-white border-[var(--color-brand)]" : "border-[var(--color-line)] text-[var(--color-ink2)] hover:border-[var(--color-brand)]"}`}
+                >
+                  {s}
+                </button>
+              ))}
+            </>
+          )}
+          {(statFilter !== "none" || sectionFilter !== "all") && (
+            <button
+              type="button"
+              onClick={() => { setStatFilter("none"); setSectionFilter("all"); setPage(1); }}
+              className="ml-auto text-xs text-[var(--color-muted)] underline"
+            >
+              Clear filters
+            </button>
+          )}
+        </div>
+      )}
 
       {selected.size > 0 && (
         <div className="card flex items-center justify-between gap-3 px-4 py-3 mb-4" style={{ borderColor: "var(--color-brand)" }}>
@@ -203,9 +261,12 @@ export default function ReportDetail() {
             />
           </div>
         ))}
+        {pageResults.length === 0 && (
+          <div className="px-4 py-10 text-center text-sm text-[var(--color-muted)]">No students match the current filters.</div>
+        )}
       </div>
 
-      <Pager page={curPage} pageCount={pageCount} from={from} to={to} total={results.length} onChange={setPage} unit="students" />
+      <Pager page={curPage} pageCount={pageCount} from={from} to={to} total={filtered.length} onChange={setPage} unit="students" />
 
       {bulkConfirm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(15,20,30,.45)" }} onClick={() => !bulkRemove.isPending && setBulkConfirm(false)}>
