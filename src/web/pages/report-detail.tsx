@@ -101,9 +101,20 @@ export default function ReportDetail() {
 
   const BANDS = [90, 80, 70, 60, 50];
   const bandCount = (min: number) => results.filter((r) => !r.absent && (r.score ?? 0) >= min).length;
+  // Pass/Fail: a student who wrote the exam and scored below 40% is a Fail.
+  const PASS_MARK = 40;
+  const gradedRows = results.filter((r) => !r.absent && r.score != null);
+  const isFail = (r: Row) => !r.absent && r.score != null && (r.score ?? 0) < PASS_MARK;
+  const isPass = (r: Row) => !r.absent && r.score != null && (r.score ?? 0) >= PASS_MARK;
+  const failCount = gradedRows.filter(isFail).length;
+  const passCount = gradedRows.filter(isPass).length;
+  const failPct = gradedRows.length ? Math.round((failCount / gradedRows.length) * 100) : 0;
+  const passPct = gradedRows.length ? Math.round((passCount / gradedRows.length) * 100) : 0;
   const matchStat = (r: Row) => {
     if (statFilter === "attempts") return !r.absent;
     if (statFilter === "absent") return !!r.absent;
+    if (statFilter === "pass") return isPass(r);
+    if (statFilter === "fail") return isFail(r);
     if (statFilter.startsWith("b")) return !r.absent && (r.score ?? 0) >= Number(statFilter.slice(1));
     return true; // "all"
   };
@@ -147,7 +158,7 @@ export default function ReportDetail() {
   const fileBase = safeName(`${sectionLabel} - ${examDate}`);
 
   function exportCsv() {
-    const header = ["Rank", "Name", "Roll No", "Section", "Status", "Score"];
+    const header = ["Rank", "Name", "Roll No", "Section", "Status", "Score", "Result"];
     const present = [...sectionRows].filter((r) => !r.absent && r.score != null).sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
     const rankMap = new Map<string, number>();
     let rk = 0, last: number | null = null;
@@ -155,8 +166,9 @@ export default function ReportDetail() {
     const ordered = [...sectionRows].sort((a, b) => (a.absent ? 1 : 0) - (b.absent ? 1 : 0) || (b.score ?? -1) - (a.score ?? -1));
     const lines = ordered.map((r) => {
       const status = r.absent ? "Absent" : r.disconnected ? `Disconnected (${r.answeredCount ?? 0})` : r.status === "graded" ? "Submitted" : "Grading";
+      const result = r.absent ? "" : r.score == null ? "" : (r.score < PASS_MARK ? "Fail" : "Pass");
       return [
-        r.absent ? "" : rankMap.get(r.attemptId) ?? "", r.name, r.rollNo, r.section ?? "", status, r.absent ? "A" : r.score ?? "",
+        r.absent ? "" : rankMap.get(r.attemptId) ?? "", r.name, r.rollNo, r.section ?? "", status, r.absent ? "A" : r.score ?? "", result,
       ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",");
     });
     const csv = [header.join(","), ...lines].join("\r\n");
@@ -249,7 +261,7 @@ export default function ReportDetail() {
         }
       />
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4 mb-4">
         {(() => {
           const setStat = (v: string) => { setStatFilter((prev) => (prev === v ? "all" : v)); setPage(1); };
           const cardCls = (active: boolean) =>
@@ -263,6 +275,14 @@ export default function ReportDetail() {
               <button type="button" onClick={() => setStat("attempts")} className={cardCls(statFilter === "attempts")}>
                 <div className="stat-num text-[1.8rem]">{results.filter((r) => !r.absent).length}</div>
                 <div className="mono-label mt-1">Attempts</div>
+              </button>
+              <button type="button" onClick={() => setStat("pass")} className={cardCls(statFilter === "pass")}>
+                <div className="stat-num text-[1.8rem]" style={{ color: "#2e7d5b" }}>{passCount} <span className="text-[1rem] opacity-70">· {passPct}%</span></div>
+                <div className="mono-label mt-1">Pass (40%+)</div>
+              </button>
+              <button type="button" onClick={() => setStat("fail")} className={cardCls(statFilter === "fail")}>
+                <div className="stat-num text-[1.8rem]" style={{ color: "#c0453b" }}>{failCount} <span className="text-[1rem] opacity-70">· {failPct}%</span></div>
+                <div className="mono-label mt-1">Fail (&lt;40%)</div>
               </button>
               <button type="button" onClick={() => setStat("absent")} className={cardCls(statFilter === "absent")}>
                 <div className="stat-num text-[1.8rem]" style={{ color: "#c0453b" }}>{results.filter((r) => r.absent).length}</div>
@@ -397,7 +417,14 @@ export default function ReportDetail() {
             {r.absent ? (
               <span className="stat-num w-14 sm:w-20 text-right shrink-0" style={{ color: "#c0453b" }} title="Absent">A</span>
             ) : r.status === "graded" ? (
-              <span className="stat-num w-14 sm:w-20 text-right shrink-0 text-[var(--color-ink)]">{r.score ?? "—"}</span>
+              <span className="w-14 sm:w-20 text-right shrink-0 flex flex-col items-end leading-tight">
+                <span className="stat-num text-[var(--color-ink)]">{r.score ?? "—"}</span>
+                {r.score != null && (
+                  <span className="text-[9px] font-bold uppercase tracking-wide" style={{ color: isFail(r) ? "#c0453b" : "#2e7d5b", fontFamily: "var(--font-mono)" }}>
+                    {isFail(r) ? "Fail" : "Pass"}
+                  </span>
+                )}
+              </span>
             ) : (
               <span className="w-14 sm:w-20 text-right shrink-0 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "#b7791f", fontFamily: "var(--font-mono)" }}>Grading</span>
             )}

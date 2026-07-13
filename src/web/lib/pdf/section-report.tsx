@@ -56,8 +56,9 @@ const s = StyleSheet.create({
   cRank: { width: 34 },
   cName: { flex: 1 },
   cRoll: { width: 92 },
-  cStatus: { width: 70 },
-  cScore: { width: 46, textAlign: "right" },
+  cStatus: { width: 66 },
+  cScore: { width: 40, textAlign: "right" },
+  cResult: { width: 44, textAlign: "right" },
 
   footer: { position: "absolute", bottom: 18, left: 34, right: 34, flexDirection: "row", justifyContent: "space-between", borderTopWidth: 0.5, borderTopColor: C.line, paddingTop: 6 },
   footTxt: { fontSize: 7, color: C.muted },
@@ -128,7 +129,8 @@ export function SectionReportDoc({ brand, examTitle, section, rows }: SectionRep
           <Stat num={stats.highest != null ? String(stats.highest) : "\u2014"} label="Highest" />
           <Stat num={stats.lowest != null ? String(stats.lowest) : "\u2014"} label="Lowest" />
           <Stat num={stats.average != null ? String(stats.average) : "\u2014"} label="Average" />
-          <Stat num={stats.passRate != null ? `${stats.passRate}%` : "\u2014"} label="Pass (50%+)" color={accent} />
+          <Stat num={stats.passRate != null ? `${stats.passRate}%` : "\u2014"} label={`Pass ${stats.passMark}%+`} color={C.green} />
+          <Stat num={stats.failRate != null ? `${stats.failRate}%` : "\u2014"} label={`Fail <${stats.passMark}%`} color={C.red} />
         </View>
 
         {/* Donut + band bars */}
@@ -194,6 +196,7 @@ export function SectionReportDoc({ brand, examTitle, section, rows }: SectionRep
             <Text style={[s.th, s.cRoll]}>Roll No</Text>
             <Text style={[s.th, s.cStatus]}>Status</Text>
             <Text style={[s.th, s.cScore]}>Score</Text>
+            <Text style={[s.th, s.cResult]}>Result</Text>
           </View>
           {ordered.map((r, i) => {
             const rank = ranks.get(r.attemptId);
@@ -205,6 +208,10 @@ export function SectionReportDoc({ brand, examTitle, section, rows }: SectionRep
               ? "Submitted"
               : "Grading";
             const statusColor = r.absent ? C.red : r.disconnected ? C.amber : r.status === "graded" ? C.green : C.amber;
+            const passed = !r.absent && r.score != null && (r.score as number) >= stats.passMark;
+            const failed = !r.absent && r.score != null && (r.score as number) < stats.passMark;
+            const resultTxt = r.absent || r.score == null ? "\u2014" : failed ? "Fail" : "Pass";
+            const resultColor = failed ? C.red : passed ? C.green : C.muted;
             return (
               <View key={r.attemptId + i} style={[s.tr, i % 2 ? { backgroundColor: C.soft } : {}]} wrap={false}>
                 <Text style={[s.td, s.cRank, { color: C.muted }]}>{r.absent || rank == null ? "\u2014" : `#${rank}`}</Text>
@@ -212,6 +219,7 @@ export function SectionReportDoc({ brand, examTitle, section, rows }: SectionRep
                 <Text style={[s.td, s.cRoll, { color: C.ink2 }]}>{r.rollNo || "\u2014"}</Text>
                 <Text style={[s.td, s.cStatus, { color: statusColor }]}>{statusTxt}</Text>
                 <Text style={[s.td, s.cScore, { fontFamily: "Helvetica-Bold" }]}>{r.absent ? "A" : r.score != null ? r.score : "\u2014"}</Text>
+                <Text style={[s.td, s.cResult, { fontFamily: "Helvetica-Bold", color: resultColor }]}>{resultTxt}</Text>
               </View>
             );
           })}

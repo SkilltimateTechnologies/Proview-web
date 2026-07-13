@@ -111,15 +111,19 @@ export type SummaryStats = {
   highest: number | null;
   lowest: number | null;
   average: number | null;
-  passCount: number; // >= 50
+  passCount: number; // score >= passMark
   passRate: number | null;
+  failCount: number; // wrote the exam but score < passMark
+  failRate: number | null;
+  passMark: number;
 };
 
-export function summarize(rows: ReportRow[], passMark = 50): SummaryStats {
+export function summarize(rows: ReportRow[], passMark = 40): SummaryStats {
   const present = rows.filter((r) => !r.absent && r.score != null);
   const scores = present.map((r) => r.score as number);
   const total = rows.length;
   const passCount = scores.filter((s) => s >= passMark).length;
+  const failCount = scores.filter((s) => s < passMark).length;
   return {
     total,
     present: present.length,
@@ -129,6 +133,9 @@ export function summarize(rows: ReportRow[], passMark = 50): SummaryStats {
     average: scores.length ? Math.round((scores.reduce((a, b) => a + b, 0) / scores.length) * 10) / 10 : null,
     passCount,
     passRate: present.length ? Math.round((passCount / present.length) * 1000) / 10 : null,
+    failCount,
+    failRate: present.length ? Math.round((failCount / present.length) * 1000) / 10 : null,
+    passMark,
   };
 }
 

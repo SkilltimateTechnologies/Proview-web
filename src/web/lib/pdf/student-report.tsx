@@ -179,7 +179,9 @@ function QuestionCard({ a, index }: { a: StudentAnswer; index: number }) {
 export function StudentReportDoc({ brand, examTitle, student, attempt, totalQuestions, answers }: StudentReportData) {
   const accent = brand.accent || "#1E3A5F";
   const graded = attempt.status === "graded";
-  const scoreColor = attempt.score == null ? C.muted : attempt.score >= 50 ? C.green : C.red;
+  const PASS_MARK = 40;
+  const passed = attempt.score != null && attempt.score >= PASS_MARK;
+  const scoreColor = attempt.score == null ? C.muted : passed ? C.green : C.red;
   return (
     <Document title={`${examTitle} — ${student.name}`}>
       <Page size="A4" style={s.page}>
@@ -203,6 +205,9 @@ export function StudentReportDoc({ brand, examTitle, student, attempt, totalQues
           <View style={s.scoreBox}>
             <Text style={[s.scoreNum, { color: scoreColor }]}>{graded && attempt.score != null ? attempt.score : "\u2014"}<Text style={{ fontSize: 11, color: C.muted }}>/100</Text></Text>
             <Text style={s.scoreLbl}>{graded ? "Marks scored" : "Grading"}</Text>
+            {graded && attempt.score != null ? (
+              <Text style={{ fontSize: 9, fontFamily: "Helvetica-Bold", marginTop: 3, color: passed ? C.green : C.red }}>{passed ? "PASS" : "FAIL"}</Text>
+            ) : null}
           </View>
         </View>
 
