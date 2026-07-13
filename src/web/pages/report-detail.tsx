@@ -7,7 +7,7 @@ import { api } from "../lib/api";
 import { useSession } from "../lib/session";
 import { PageHeader } from "../components/shell";
 import { Loader, Pill, Drawer, usePagination, Pager } from "../components/ui";
-import { sanitizeFile, type Brand } from "../lib/pdf/theme";
+import { safeName, fmtFileDate, type Brand } from "../lib/pdf/theme";
 import type { StudentAnswer } from "../lib/pdf/student-report";
 
 type Row = { attemptId: string; studentId: string; name: string; rollNo: string; email: string | null; section: string; score: number | null; status: string; submittedAt: string | number | null; absent?: boolean; disconnected?: boolean; answeredCount?: number };
@@ -142,7 +142,9 @@ export default function ReportDetail() {
   // The section the exports describe: current section filter, or all sections.
   const sectionLabel = sectionFilter === "all" ? "All sections" : sectionFilter;
   const sectionRows = sectionFilter === "all" ? results : results.filter((r) => r.section === sectionFilter);
-  const fileBase = sanitizeFile(`${exam.title}_${sectionLabel}`);
+  // Report file naming: "Section Name - date" (e.g. "IT-A - Jan 10-2026").
+  const examDate = fmtFileDate((exam as any).endAt ?? (exam as any).startAt ?? (exam as any).createdAt);
+  const fileBase = safeName(`${sectionLabel} - ${examDate}`);
 
   function exportCsv() {
     const header = ["Rank", "Name", "Roll No", "Section", "Status", "Score"];
@@ -158,7 +160,7 @@ export default function ReportDetail() {
       ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",");
     });
     const csv = [header.join(","), ...lines].join("\r\n");
-    saveBlob(new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" }), `${fileBase}_report.csv`);
+    saveBlob(new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" }), `${fileBase}.csv`);
   }
 
   async function exportSectionPdf() {
@@ -166,7 +168,7 @@ export default function ReportDetail() {
     try {
       const { generateSectionReport } = await import("../lib/pdf/section-report");
       const blob = await generateSectionReport({ brand, examTitle: exam.title, section: sectionLabel, rows: sectionRows });
-      saveBlob(blob, `${fileBase}_report.pdf`);
+      saveBlob(blob, `${fileBase}.pdf`);
     } catch (e) {
       alert("Could not generate the section report PDF.");
       console.error(e);
@@ -181,7 +183,7 @@ export default function ReportDetail() {
       const { generateStudentReport } = await import("../lib/pdf/student-report");
       const d = await fetchStudentData(examId, row);
       const blob = await generateStudentReport({ brand, examTitle: exam.title, totalQuestions, ...d });
-      saveBlob(blob, `${sanitizeFile(`${row.rollNo || row.name}_${exam.title}`)}.pdf`);
+      saveBlob(blob, `${safeName(`${row.name} - ${row.rollNo}`)}.pdf`);
     } catch (e) {
       alert("Could not generate this student's answer sheet.");
       console.error(e);
@@ -206,7 +208,7 @@ export default function ReportDetail() {
         try {
           const d = await fetchStudentData(examId, row);
           const blob = await generateStudentReport({ brand, examTitle: exam.title, totalQuestions, ...d });
-          zip.file(`${sanitizeFile(`${row.rollNo || row.name}`)}.pdf`, blob);
+          zip.file(`${safeName(`${row.name} - ${row.rollNo}`)}.pdf`, blob);
         } catch (e) {
           console.error("skip", row.rollNo, e);
         }
@@ -217,7 +219,7 @@ export default function ReportDetail() {
     try {
       await Promise.all(Array.from({ length: Math.min(pool, targets.length) }, worker));
       const out = await zip.generateAsync({ type: "blob" });
-      saveBlob(out, `${fileBase}_answer_sheets.zip`);
+      saveBlob(out, `${fileBase} - Answer Sheets.zip`);
     } catch (e) {
       alert("Could not generate the answer-sheet ZIP.");
       console.error(e);
@@ -621,7 +623,7 @@ function AttemptDrawer({ examId, row, brand, examTitle, totalQuestions, onClose 
         attempt: { score: d.attempt.score, status: d.attempt.status, submittedAt: d.attempt.submittedAt },
         answers: d.answers as StudentAnswer[],
       });
-      saveBlob(blob, `${sanitizeFile(`${row.rollNo || row.name}_${examTitle}`)}.pdf`);
+      saveBlob(blob, `${safeName(`${row.name} - ${row.rollNo}`)}.pdf`);
     } catch (e) {
       alert("Could not generate the answer sheet PDF.");
       console.error(e);

@@ -147,3 +147,22 @@ export function fmtDate(t: string | number | null | undefined): string {
 export function sanitizeFile(s: string): string {
   return s.replace(/[^\w.-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 80) || "report";
 }
+
+/** Filesystem-safe but human-readable: keeps spaces and hyphens, strips only
+ *  characters that are illegal in file names (/ \ : * ? " < > |). */
+export function safeName(s: string): string {
+  return s
+    .replace(/[/\\:*?"<>|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120) || "report";
+}
+
+/** Compact date for file names, e.g. "Jan 10-2026" (IST). */
+export function fmtFileDate(t: string | number | null | undefined): string {
+  const d = t ? new Date(t) : new Date();
+  const mon = d.toLocaleString("en-IN", { month: "short", timeZone: "Asia/Kolkata" });
+  const day = d.toLocaleString("en-IN", { day: "2-digit", timeZone: "Asia/Kolkata" });
+  const year = d.toLocaleString("en-IN", { year: "numeric", timeZone: "Asia/Kolkata" });
+  return `${mon} ${day}-${year}`;
+}
