@@ -1138,7 +1138,9 @@ const app = new Hono<{ Variables: Vars }>()
       .from(schema.examQuestions)
       .where(eq(schema.examQuestions.examId, eid))
       .orderBy(schema.examQuestions.order);
-    return c.json({ exam: row, questionIds: eqs.map((e) => e.questionId) }, 200);
+    // Explicitly-added students (used to hydrate the "specific students" picker).
+    const adds = await db.select({ studentId: schema.examRoster.studentId }).from(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.mode, "add")));
+    return c.json({ exam: row, questionIds: eqs.map((e) => e.questionId), studentIds: adds.map((a) => a.studentId) }, 200);
   })
   .post("/exams", requireAuth, requirePermission("exams"), async (c) => {
     const p = c.get("profile")!;
@@ -1147,6 +1149,7 @@ const app = new Hono<{ Variables: Vars }>()
     const qids: string[] = b.questionIds ?? [];
     const qs = qids.length ? await db.select().from(schema.questions).where(inArray(schema.questions.id, qids)) : [];
     const total = qs.reduce((s, q) => s + q.points, 0);
+    const assignMode = b.assignMode === "students" ? "students" : "cohort";
     const eid = id("ex");
     const [row] = await db
       .insert(schema.exams)
@@ -1155,7 +1158,8 @@ const app = new Hono<{ Variables: Vars }>()
         tenantId: tid,
         title: b.title,
         classId: b.classId ?? null,
-        sectionIds: Array.isArray(b.sectionIds) && b.sectionIds.length ? b.sectionIds : null,
+        sectionIds: assignMode === "students" ? null : (Array.isArray(b.sectionIds) && b.sectionIds.length ? b.sectionIds : null),
+        assignMode,
         status: b.status ?? "scheduled",
         startAt: b.startAt ? new Date(b.startAt) : null,
         // The exam window closes at startAt + duration. After that the window is
@@ -1172,6 +1176,16 @@ const app = new Hono<{ Variables: Vars }>()
         qids.map((q, i) => ({ id: id("eq"), examId: eid, questionId: q, order: i, points: qs.find((x) => x.id === q)?.points ?? 1 })),
       );
     }
+    // "students" mode: seed the roster add-list with the explicitly picked students.
+    if (assignMode === "students" && Array.isArray(b.studentIds) && b.studentIds.length) {
+      const ids = [...new Set(b.studentIds.map((s: unknown) => String(s)).filter(Boolean))] as string[];
+      const valid = await db.select({ id: schema.students.id }).from(schema.students).where(and(eq(schema.students.tenantId, tid), inArray(schema.students.id, ids)));
+      if (valid.length) {
+        await db.insert(schema.examRoster).values(
+          valid.map((s) => ({ id: id("rst"), examId: eid, studentId: s.id, mode: "add" as const, createdBy: p.userId ?? null })),
+        );
+      }
+    }
     return c.json({ exam: row }, 201);
   })
   .patch("/exams/:id", requireAuth, requirePermission("exams"), async (c) => {
@@ -1179,6 +1193,7 @@ const app = new Hono<{ Variables: Vars }>()
     const b = await c.req.json();
     const patch: Record<string, unknown> = {};
     for (const k of ["title", "status", "durationMin"]) if (b[k] !== undefined) patch[k] = b[k];
+    if (b.assignMode !== undefined) patch.assignMode = b.assignMode === "students" ? "students" : "cohort";
     if (b.sectionIds !== undefined) patch.sectionIds = Array.isArray(b.sectionIds) && b.sectionIds.length ? b.sectionIds : null;
     if (b.startAt !== undefined || b.durationMin !== undefined) {
       // Keep the exam window (endAt = startAt + duration) in sync whenever EITHER
@@ -1215,6 +1230,37 @@ const app = new Hono<{ Variables: Vars }>()
         await db.insert(schema.examQuestions).values(
           qids.map((q, i) => ({ id: id("eq"), examId: eid, questionId: q, order: i, points: qs.find((x) => x.id === q)?.points ?? 1 })),
         );
+      }
+    }
+    // In "students" mode, the picked list IS the roster add-list. Reconcile the
+    // exam's "add" overrides to exactly match the provided studentIds. Removing a
+    // student also clears any attempt/answers/events so they aren't counted.
+    if (Array.isArray(b.studentIds)) {
+      const p = c.get("profile")!;
+      const want = new Set(b.studentIds.map((s: unknown) => String(s)).filter(Boolean) as string[]);
+      const existing = await db.select().from(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.mode, "add")));
+      const have = new Set(existing.map((r) => r.studentId));
+      // Drop add-rows no longer wanted (and purge their attempts).
+      for (const r of existing) {
+        if (!want.has(r.studentId)) {
+          const atts = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, r.studentId)));
+          for (const a of atts) {
+            await db.delete(schema.answers).where(eq(schema.answers.attemptId, a.id));
+            await db.delete(schema.integrityEvents).where(eq(schema.integrityEvents.attemptId, a.id));
+          }
+          if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, r.studentId)));
+          await db.delete(schema.examRoster).where(eq(schema.examRoster.id, r.id));
+        }
+      }
+      // Add new picks (validate they belong to the tenant).
+      const toAdd = [...want].filter((sid) => !have.has(sid));
+      if (toAdd.length) {
+        const valid = await db.select({ id: schema.students.id }).from(schema.students).where(and(eq(schema.students.tenantId, p.tenantId!), inArray(schema.students.id, toAdd)));
+        if (valid.length) {
+          await db.insert(schema.examRoster).values(
+            valid.map((s) => ({ id: id("rst"), examId: eid, studentId: s.id, mode: "add" as const, createdBy: p.userId ?? null })),
+          );
+        }
       }
     }
     const [row] = await db.update(schema.exams).set(patch).where(eq(schema.exams.id, eid)).returning();

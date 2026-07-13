@@ -1,6 +1,16 @@
 import app from "./api";
 import { sweepPendingGrading, startAutoSubmitSweep } from "./api/lib/grade-queue";
 
+// Never let a transient background failure (e.g. a brief Turso/libsql socket
+// ECONNRESET during a background grading/auto-submit sweep) take down the whole
+// exam server. Log and keep serving; the recurring sweeps retry on their next tick.
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+});
+
 const port = Number(process.env.PORT ?? 3000);
 const distDir = `${import.meta.dir}/../dist`;
 const indexPath = `${distDir}/index.html`;

@@ -191,15 +191,17 @@ export function EditExam() {
   const sections = (classes.data?.classes ?? []) as Array<{ id: string; code: string }>;
   const qList = (questions.data?.questions ?? []) as PickQ[];
 
-  const exam = (examQ.data && "exam" in examQ.data ? examQ.data.exam : null) as ExamRow | null;
+  const exam = (examQ.data && "exam" in examQ.data ? examQ.data.exam : null) as (ExamRow & { assignMode?: string | null }) | null;
   const initialQIds = (examQ.data && "questionIds" in examQ.data ? examQ.data.questionIds : []) as string[];
+  const initialStudentIds = (examQ.data && "studentIds" in examQ.data ? (examQ.data as { studentIds: string[] }).studentIds : []) as string[];
 
   const [title, setTitle] = useState("");
   const [durationMin, setDurationMin] = useState(60);
   const [date, setDate] = useState("");
   const [slot, setSlot] = useState("");
-  const [scope, setScope] = useState<"all" | "specific">("all");
+  const [scope, setScope] = useState<"all" | "specific" | "students">("all");
   const [sectionIds, setSectionIds] = useState<string[]>([]);
+  const [studentIds, setStudentIds] = useState<string[]>([]);
   const [picked, setPicked] = useState<string[]>([]);
   const [hydrated, setHydrated] = useState(false);
 
@@ -210,13 +212,14 @@ export function EditExam() {
     setDurationMin(exam.durationMin);
     setDate(initial.date);
     setSlot(initial.slot);
-    setScope(exam.sectionIds && exam.sectionIds.length ? "specific" : "all");
+    setScope(exam.assignMode === "students" ? "students" : (exam.sectionIds && exam.sectionIds.length ? "specific" : "all"));
     setSectionIds(exam.sectionIds ?? []);
+    setStudentIds(initialStudentIds);
     setPicked(initialQIds);
     setHydrated(true);
   }
 
-  const sectionsValid = scope === "all" || sectionIds.length > 0;
+  const scopeValid = scope === "all" || (scope === "specific" && sectionIds.length > 0) || (scope === "students" && studentIds.length > 0);
   function toggleSection(sid: string) {
     setSectionIds((p) => (p.includes(sid) ? p.filter((x) => x !== sid) : [...p, sid]));
   }
@@ -237,7 +240,9 @@ export function EditExam() {
           title,
           durationMin,
           startAt,
+          assignMode: scope === "students" ? "students" : "cohort",
           sectionIds: scope === "specific" ? sectionIds : [],
+          studentIds: scope === "students" ? studentIds : [],
           questionIds: picked,
           status: startAt ? "scheduled" : "draft",
         },
@@ -298,12 +303,13 @@ export function EditExam() {
           </p>
         )}
 
-        {/* Sections scope */}
+        {/* Assign scope */}
         <div className="mt-4">
-          <div className="mono-label mb-2">Sections</div>
-          <div className="flex gap-2 mb-3">
+          <div className="mono-label mb-2">Assign to</div>
+          <div className="flex gap-2 mb-3 flex-wrap">
             <button className={`btn ${scope === "all" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("all")}>All sections</button>
             <button className={`btn ${scope === "specific" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("specific")}>Specific sections</button>
+            <button className={`btn ${scope === "students" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("students")}>Specific students</button>
           </div>
           {scope === "specific" && (
             <div className="flex flex-wrap gap-2">
@@ -322,6 +328,7 @@ export function EditExam() {
               })}
             </div>
           )}
+          {scope === "students" && <StudentPicker selected={studentIds} setSelected={setStudentIds} />}
         </div>
 
         {questions.isLoading ? (
@@ -331,7 +338,7 @@ export function EditExam() {
         )}
 
         <div className="flex items-center gap-2 mt-5">
-          <button className="btn btn-primary" disabled={save.isPending || !title.trim() || picked.length === 0 || !sectionsValid} onClick={() => save.mutate()}>
+          <button className="btn btn-primary" disabled={save.isPending || !title.trim() || picked.length === 0 || !scopeValid} onClick={() => save.mutate()}>
             {save.isPending ? "Saving…" : isDraft ? (scheduled ? "Save & schedule" : "Save draft") : "Save changes"}
           </button>
           <button className="btn btn-ghost" onClick={() => navigate("/exams")}>Cancel</button>
@@ -355,7 +362,7 @@ export function EditExam() {
         )}
       </div>
 
-      <RosterPanel examId={examId} />
+      {scope !== "students" && <RosterPanel examId={examId} />}
     </div>
   );
 }
@@ -556,6 +563,75 @@ function RosterPickDrawer({ examId, mode, onClose, onDone }: { examId: string; m
   );
 }
 
+// Searchable multi-select of individual students, for "Specific students" scope.
+type StudentLite = { id: string; name: string | null; rollNo: string | null; email: string | null; classId: string | null };
+function StudentPicker({ selected, setSelected }: { selected: string[]; setSelected: Dispatch<SetStateAction<string[]>> }) {
+  const [term, setTerm] = useState("");
+  const studentsQ = useQuery({ queryKey: ["students-pick"], queryFn: async () => (await api.students.$get()).json() });
+  const classesQ = useQuery({ queryKey: ["classes"], queryFn: async () => (await api.classes.$get()).json() });
+  const students = ((studentsQ.data as { students?: StudentLite[] })?.students ?? []).filter((s) => (s as unknown as { enabled?: boolean }).enabled !== false);
+  const classes = ((classesQ.data as { classes?: Array<{ id: string; code: string }> })?.classes ?? []);
+  const clmap = new Map(classes.map((c) => [c.id, c.code]));
+  const sel = new Set(selected);
+
+  const q = term.trim().toLowerCase();
+  const filtered = students.filter((s) =>
+    !q || (s.name ?? "").toLowerCase().includes(q) || (s.rollNo ?? "").toLowerCase().includes(q) || (s.email ?? "").toLowerCase().includes(q),
+  );
+  const shown = filtered.slice(0, 100);
+
+  const toggle = (sid: string) => setSelected((p) => (p.includes(sid) ? p.filter((x) => x !== sid) : [...p, sid]));
+  const allShownSelected = shown.length > 0 && shown.every((s) => sel.has(s.id));
+  const toggleAllShown = () =>
+    setSelected((p) => {
+      const ids = shown.map((s) => s.id);
+      return ids.every((i) => p.includes(i)) ? p.filter((i) => !ids.includes(i)) : [...new Set([...p, ...ids])];
+    });
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-2 flex-wrap">
+        <div className="relative flex-1 min-w-[200px]">
+          <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--color-muted)]" />
+          <input className="input pl-9" placeholder="Search students by name, roll no, email…" value={term} onChange={(e) => setTerm(e.target.value)} />
+        </div>
+        <span className="mono-label">{selected.length} selected</span>
+        {selected.length > 0 && (
+          <button className="text-xs text-[var(--color-muted)] underline" onClick={() => setSelected([])}>Clear</button>
+        )}
+      </div>
+      {studentsQ.isLoading ? (
+        <Loader />
+      ) : students.length === 0 ? (
+        <div className="text-sm text-[var(--color-ink2)]">No students yet. Add students in Users.</div>
+      ) : (
+        <div className="rounded-lg border border-[var(--color-line)] overflow-hidden">
+          <div className="flex items-center gap-3 px-3 py-2 border-b border-[var(--color-line)] bg-[var(--color-brand-soft)]">
+            <input type="checkbox" className="w-4 h-4 accent-[var(--color-brand)] cursor-pointer" checked={allShownSelected} onChange={toggleAllShown} title="Select all shown" />
+            <span className="mono-label flex-1">{filtered.length} shown{filtered.length > shown.length ? ` (first ${shown.length})` : ""}</span>
+          </div>
+          <div className="max-h-72 overflow-y-auto">
+            {shown.map((s) => {
+              const on = sel.has(s.id);
+              return (
+                <label key={s.id} className={`flex items-center gap-3 px-3 py-2 border-b border-[var(--color-line)] last:border-0 cursor-pointer transition ${on ? "bg-[var(--color-brand-soft)]" : "hover:bg-[var(--color-brand-soft)]"}`}>
+                  <input type="checkbox" className="w-4 h-4 accent-[var(--color-brand)] cursor-pointer" checked={on} onChange={() => toggle(s.id)} />
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-[var(--color-ink)] truncate text-sm">{s.name ?? "—"}</div>
+                    <div className="text-xs text-[var(--color-muted)] truncate" style={{ fontFamily: "var(--font-mono)" }}>
+                      {s.rollNo}{s.classId && clmap.get(s.classId) ? ` · ${clmap.get(s.classId)}` : ""}
+                    </div>
+                  </div>
+                </label>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function NewExam() {
   const qc = useQueryClient();
   const [, navigate] = useLocation();
@@ -566,14 +642,15 @@ export function NewExam() {
   const qList = (questions.data?.questions ?? []) as PickQ[];
 
   const [title, setTitle] = useState("");
-  const [scope, setScope] = useState<"all" | "specific">("all");
+  const [scope, setScope] = useState<"all" | "specific" | "students">("all");
   const [sectionIds, setSectionIds] = useState<string[]>([]);
+  const [studentIds, setStudentIds] = useState<string[]>([]);
   const [durationMin, setDurationMin] = useState(60);
   const [date, setDate] = useState("");
   const [slot, setSlot] = useState("");
   const [picked, setPicked] = useState<string[]>([]);
 
-  const sectionsValid = scope === "all" || sectionIds.length > 0;
+  const scopeValid = scope === "all" || (scope === "specific" && sectionIds.length > 0) || (scope === "students" && studentIds.length > 0);
 
   function goBack() {
     navigate("/exams");
@@ -585,7 +662,9 @@ export function NewExam() {
       const res = await api.exams.$post({
         json: {
           title,
+          assignMode: scope === "students" ? "students" : "cohort",
           sectionIds: scope === "specific" ? sectionIds : undefined,
+          studentIds: scope === "students" ? studentIds : undefined,
           durationMin,
           questionIds: picked,
           startAt,
@@ -630,22 +709,13 @@ export function NewExam() {
           </p>
         )}
 
-        {/* Sections scope */}
+        {/* Assign scope */}
         <div className="mt-4">
-          <div className="mono-label mb-2">Sections</div>
-          <div className="flex gap-2 mb-3">
-            <button
-              className={`btn ${scope === "all" ? "btn-primary" : "btn-ghost"}`}
-              onClick={() => setScope("all")}
-            >
-              All sections
-            </button>
-            <button
-              className={`btn ${scope === "specific" ? "btn-primary" : "btn-ghost"}`}
-              onClick={() => setScope("specific")}
-            >
-              Specific sections
-            </button>
+          <div className="mono-label mb-2">Assign to</div>
+          <div className="flex gap-2 mb-3 flex-wrap">
+            <button className={`btn ${scope === "all" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("all")}>All sections</button>
+            <button className={`btn ${scope === "specific" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("specific")}>Specific sections</button>
+            <button className={`btn ${scope === "students" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("students")}>Specific students</button>
           </div>
           {scope === "specific" && (
             <div className="flex flex-wrap gap-2">
@@ -668,6 +738,7 @@ export function NewExam() {
               })}
             </div>
           )}
+          {scope === "students" && <StudentPicker selected={studentIds} setSelected={setStudentIds} />}
         </div>
 
         {questions.isLoading ? (
@@ -677,7 +748,7 @@ export function NewExam() {
         )}
 
         <div className="flex items-center gap-2 mt-5">
-          <button className="btn btn-primary" disabled={create.isPending || !title.trim() || picked.length === 0 || !sectionsValid} onClick={() => create.mutate()}>
+          <button className="btn btn-primary" disabled={create.isPending || !title.trim() || picked.length === 0 || !scopeValid} onClick={() => create.mutate()}>
             {create.isPending ? "Creating…" : "Create assessment"}
           </button>
           <button className="btn btn-ghost" onClick={goBack}>Cancel</button>

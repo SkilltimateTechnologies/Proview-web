@@ -121,6 +121,9 @@ export const exams = sqliteTable(
     classId: text("class_id"),
     // sectionIds: null/empty = all sections; otherwise a subset of class ids
     sectionIds: text("section_ids", { mode: "json" }).$type<string[]>(),
+    // assignMode: "cohort" = target sections (sectionIds); "students" = only the
+    // explicitly picked students (roster "add" list), no cohort match at all.
+    assignMode: text("assign_mode").notNull().default("cohort"),
     status: text("status").notNull().default("draft"), // draft | scheduled | live | finished
     startAt: integer("start_at", { mode: "timestamp_ms" }),
     endAt: integer("end_at", { mode: "timestamp_ms" }),

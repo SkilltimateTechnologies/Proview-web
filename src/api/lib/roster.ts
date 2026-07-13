@@ -3,7 +3,7 @@ import { db } from "../database";
 import * as schema from "../database/schema";
 
 /** Minimal exam shape needed for cohort matching. */
-export type CohortExam = { classId: string | null; sectionIds: string[] | null };
+export type CohortExam = { classId: string | null; sectionIds: string[] | null; assignMode?: string | null };
 /** Minimal student shape needed for cohort matching. */
 export type CohortStudent = { classId: string | null };
 
@@ -13,6 +13,8 @@ export type CohortStudent = { classId: string | null };
  * sectionIds means "all sections of that class".
  */
 export function matchesCohort(exam: CohortExam, stu: CohortStudent): boolean {
+  // "students" mode: nobody matches by cohort — only the explicit add-list is eligible.
+  if (exam.assignMode === "students") return false;
   if (exam.classId && stu.classId && exam.classId !== stu.classId) return false;
   if (Array.isArray(exam.sectionIds) && exam.sectionIds.length && stu.classId && !exam.sectionIds.includes(stu.classId)) return false;
   return true;
