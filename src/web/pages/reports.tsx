@@ -63,7 +63,13 @@ export default function Reports() {
   const rows = useMemo(() => {
     let list = all;
     if (search.trim()) list = list.filter((e) => e.title.toLowerCase().includes(search.trim().toLowerCase()));
-    if (status !== "all") list = list.filter((e) => e.status === status);
+    if (status !== "all") {
+      list = list.filter((e) =>
+        // "Finished" covers both an admin-flipped "finished" exam and one that's
+        // simply past its deadline (effStatus "ended") — both mean it's over.
+        status === "finished" ? e.status === "finished" || e.status === "ended" : e.status === status,
+      );
+    }
     // Date-range filter on the conducted date (startAt, falling back to createdAt).
     const fromMs = dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : null;
     const toMs = dateTo ? new Date(`${dateTo}T23:59:59.999`).getTime() : null;
@@ -131,7 +137,7 @@ export default function Reports() {
             {!isTpo && (
               <select className="input w-auto" value={status} onChange={(e) => setStatus(e.target.value)}>
                 <option value="all">All statuses</option>
-                <option value="finished">Finished</option>
+                <option value="finished">Finished / Ended</option>
                 <option value="live">Live</option>
               </select>
             )}
