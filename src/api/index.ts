@@ -1687,11 +1687,32 @@ const app = new Hono<{ Variables: Vars }>()
     // effective-status logic used by the reports endpoint so the dashboard stays
     // consistent with what admins see under Reports.
     const nowMs = Date.now();
+    // Optional period filter: from / to are YYYY-MM-DD (inclusive). Scopes every
+    // finished-exam-derived stat to assessments conducted within the window.
+    const fromQ = (c.req.query("from") ?? "").trim();
+    const toQ = (c.req.query("to") ?? "").trim();
+    const fromMs = fromQ ? new Date(`${fromQ}T00:00:00`).getTime() : null;
+    const toMs = toQ ? new Date(`${toQ}T23:59:59.999`).getTime() : null;
+    const conductedMs = (e: { endAt: any; startAt: any; createdAt: any }) => {
+      const raw = e.endAt ?? e.startAt ?? e.createdAt;
+      const t = raw ? new Date(raw).getTime() : NaN;
+      return Number.isNaN(t) ? null : t;
+    };
+    const inPeriod = (e: { endAt: any; startAt: any; createdAt: any }) => {
+      if (fromMs === null && toMs === null) return true;
+      const t = conductedMs(e);
+      if (t === null) return false;
+      if (fromMs !== null && t < fromMs) return false;
+      if (toMs !== null && t > toMs) return false;
+      return true;
+    };
     const allExams = await db.select().from(schema.exams).where(and(eq(schema.exams.tenantId, tid), ne(schema.exams.status, "draft"))).orderBy(schema.exams.createdAt);
     const finishedExams = allExams.filter((e) => {
-      if (e.status === "finished") return true;
-      const end = e.endAt ? new Date(e.endAt).getTime() : null;
-      return end != null && !Number.isNaN(end) && nowMs > end;
+      const isFinished = e.status === "finished" || (() => {
+        const end = e.endAt ? new Date(e.endAt).getTime() : null;
+        return end != null && !Number.isNaN(end) && nowMs > end;
+      })();
+      return isFinished && inPeriod(e);
     });
     const examIds = finishedExams.map((e) => e.id);
     const atts = examIds.length ? await db.select().from(schema.attempts).where(inArray(schema.attempts.examId, examIds)) : [];

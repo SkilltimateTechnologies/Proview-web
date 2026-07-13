@@ -1,5 +1,6 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { GraduationCap } from "lucide-react";
+import { GraduationCap, CalendarDays } from "lucide-react";
 import { Link } from "wouter";
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, ResponsiveContainer, CartesianGrid } from "recharts";
 import { api } from "../lib/api";
@@ -11,14 +12,33 @@ export default function Dashboard() {
   const { me } = useSession();
   const brand = me?.tenant?.primaryColor ?? "#1e3a5f";
   const canSchedule = allowed(me, "exams");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const periodOn = !!(dateFrom || dateTo);
   const q = useQuery({
-    queryKey: ["dashboard"],
+    queryKey: ["dashboard", dateFrom, dateTo],
     queryFn: async () => {
-      const res = await api.dashboard.$get();
+      const res = await api.dashboard.$get({ query: { from: dateFrom || undefined, to: dateTo || undefined } });
       if (!res.ok) throw new Error("failed");
       return res.json();
     },
   });
+
+  const periodLabel = periodOn ? "selected period" : "all time";
+  const filterBar = (
+    <div className="card p-3 mb-4 flex flex-wrap items-center gap-2">
+      <span className="mono-label mr-1">Period</span>
+      <div className="flex items-center gap-1.5">
+        <CalendarDays size={15} className="text-[var(--color-muted)]" />
+        <input type="date" className="input w-auto" aria-label="From date" value={dateFrom} max={dateTo || undefined} onChange={(e) => setDateFrom(e.target.value)} />
+        <span className="text-[var(--color-muted)] text-sm">–</span>
+        <input type="date" className="input w-auto" aria-label="To date" value={dateTo} min={dateFrom || undefined} onChange={(e) => setDateTo(e.target.value)} />
+      </div>
+      {periodOn && (
+        <button className="btn-ghost text-sm" onClick={() => { setDateFrom(""); setDateTo(""); }}>Clear</button>
+      )}
+    </div>
+  );
 
   if (q.isLoading) return <Loader />;
   const d = q.data;
@@ -36,7 +56,11 @@ export default function Dashboard() {
             ) : undefined
           }
         />
-        <EmptyState title="No data yet" hint="Schedule and finish an assessment to see analytics." />
+        {filterBar}
+        <EmptyState
+          title={periodOn ? "No data for this period" : "No data yet"}
+          hint={periodOn ? "Try widening the date range or clearing the filter." : "Schedule and finish an assessment to see analytics."}
+        />
       </div>
     );
 
@@ -54,9 +78,11 @@ export default function Dashboard() {
         }
       />
 
+      {filterBar}
+
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard value={d.stats.totalStudents ?? 0} label="Students enrolled" icon={<GraduationCap size={16} />} />
-        <StatCard value={d.stats.avg} label="Institution avg · semester" />
+        <StatCard value={d.stats.totalStudents ?? 0} label="Students" icon={<GraduationCap size={16} />} />
+        <StatCard value={d.stats.avg} label={`Institution avg · ${periodLabel}`} />
         <StatCard value={`${d.stats.passRate}%`} label="Pass rate · finished exams" />
         <StatCard value={d.stats.completed} label="Assessments completed" />
       </div>
@@ -64,7 +90,7 @@ export default function Dashboard() {
       <div className="grid lg:grid-cols-2 gap-4 mt-4">
         <div className="card p-5">
           <div className="font-semibold text-[var(--color-ink)]">Class-wise average</div>
-          <div className="mono-label mt-0.5 mb-4">Finished assessments · this semester</div>
+          <div className="mono-label mt-0.5 mb-4">Finished assessments · {periodLabel}</div>
           {d.classAvg.length ? (
             <ResponsiveContainer width="100%" height={220}>
               <BarChart data={d.classAvg} margin={{ left: -20 }}>
