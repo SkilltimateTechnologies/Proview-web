@@ -21,7 +21,7 @@ export default function ReportDetail() {
   const [confirm, setConfirm] = useState<{ row: Row; action: "absent" | "remove" } | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkConfirm, setBulkConfirm] = useState(false);
-  const [statFilter, setStatFilter] = useState<"none" | "attempts" | "absent" | "passed">("none");
+  const [statFilter, setStatFilter] = useState<string>("all");
   const [sectionFilter, setSectionFilter] = useState<string>("all");
   const q = useQuery({
     queryKey: ["report", examId],
@@ -71,14 +71,18 @@ export default function ReportDetail() {
   const { exam, results } = q.data as { exam: { title: string; status: string }; results: Row[] };
   const topper = results[0];
 
-  const isPassed = (r: Row) => !r.absent && (r.score ?? 0) >= 40;
+  const BANDS = [90, 80, 70, 60, 50];
+  const bandCount = (min: number) => results.filter((r) => !r.absent && (r.score ?? 0) >= min).length;
+  const matchStat = (r: Row) => {
+    if (statFilter === "attempts") return !r.absent;
+    if (statFilter === "absent") return !!r.absent;
+    if (statFilter.startsWith("b")) return !r.absent && (r.score ?? 0) >= Number(statFilter.slice(1));
+    return true; // "all"
+  };
   const sections = Array.from(new Set(results.map((r) => r.section).filter(Boolean))).sort();
   const filtered = results.filter((r) => {
     if (sectionFilter !== "all" && r.section !== sectionFilter) return false;
-    if (statFilter === "attempts" && r.absent) return false;
-    if (statFilter === "absent" && !r.absent) return false;
-    if (statFilter === "passed" && !isPassed(r)) return false;
-    return true;
+    return matchStat(r);
   });
 
   const PS = 20;
@@ -131,11 +135,15 @@ export default function ReportDetail() {
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4">
         {(() => {
-          const setStat = (v: typeof statFilter) => { setStatFilter((prev) => (prev === v ? "none" : v)); setPage(1); };
+          const setStat = (v: string) => { setStatFilter((prev) => (prev === v ? "all" : v)); setPage(1); };
           const cardCls = (active: boolean) =>
             `card p-5 text-left w-full transition ${active ? "ring-2 ring-[var(--color-brand)]" : "hover:border-[var(--color-brand)]"}`;
           return (
             <>
+              <button type="button" onClick={() => setStat("all")} className={cardCls(statFilter === "all")}>
+                <div className="stat-num text-[1.8rem]">{results.length}</div>
+                <div className="mono-label mt-1">All students</div>
+              </button>
               <button type="button" onClick={() => setStat("attempts")} className={cardCls(statFilter === "attempts")}>
                 <div className="stat-num text-[1.8rem]">{results.filter((r) => !r.absent).length}</div>
                 <div className="mono-label mt-1">Attempts</div>
@@ -148,18 +156,30 @@ export default function ReportDetail() {
                 <div className="stat-num text-[1.8rem]">{topper?.score ?? "—"}</div>
                 <div className="mono-label mt-1">Highest score</div>
               </div>
-              <button type="button" onClick={() => setStat("passed")} className={cardCls(statFilter === "passed")}>
-                <div className="stat-num text-[1.8rem]">
-                  {results.filter((r) => !r.absent && (r.score ?? 0) >= 40).length}
-                </div>
-                <div className="mono-label mt-1">Passed</div>
-              </button>
             </>
           );
         })()}
       </div>
 
-      {(sections.length > 0 || statFilter !== "none") && (
+      <div className="flex flex-wrap items-center gap-2 mb-4">
+        <span className="mono-label">Score</span>
+        {BANDS.map((min) => {
+          const active = statFilter === `b${min}`;
+          return (
+            <button
+              key={min}
+              type="button"
+              onClick={() => { setStatFilter((prev) => (prev === `b${min}` ? "all" : `b${min}`)); setPage(1); }}
+              className={`px-3 py-1.5 rounded-full text-xs font-medium border transition ${active ? "bg-[var(--color-brand)] text-white border-[var(--color-brand)]" : "border-[var(--color-line)] text-[var(--color-ink2)] hover:border-[var(--color-brand)]"}`}
+              title={`Students scoring ${min}% or above`}
+            >
+              ≥{min}% <span className={active ? "opacity-90" : "text-[var(--color-muted)]"}>· {bandCount(min)}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {(sections.length > 0 || statFilter !== "all") && (
         <div className="flex flex-wrap items-center gap-2 mb-4">
           {sections.length > 0 && (
             <>
@@ -183,10 +203,10 @@ export default function ReportDetail() {
               ))}
             </>
           )}
-          {(statFilter !== "none" || sectionFilter !== "all") && (
+          {(statFilter !== "all" || sectionFilter !== "all") && (
             <button
               type="button"
-              onClick={() => { setStatFilter("none"); setSectionFilter("all"); setPage(1); }}
+              onClick={() => { setStatFilter("all"); setSectionFilter("all"); setPage(1); }}
               className="ml-auto text-xs text-[var(--color-muted)] underline"
             >
               Clear filters
