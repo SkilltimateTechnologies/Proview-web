@@ -1,12 +1,37 @@
 import { useState, useEffect, useRef, type CSSProperties } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, Link } from "wouter";
-import { ArrowLeft, Download, ChevronRight, Check, X, Sparkles, Lightbulb, MoreVertical, UserX, Trash2 } from "lucide-react";
+import { ArrowLeft, Download, ChevronRight, Check, X, Sparkles, Lightbulb, MoreVertical, UserX, Trash2, FileText, FileSpreadsheet, Files, ChevronDown, Loader2 } from "lucide-react";
+import JSZip from "jszip";
 import { api } from "../lib/api";
+import { useSession } from "../lib/session";
 import { PageHeader } from "../components/shell";
 import { Loader, Pill, Drawer, usePagination, Pager } from "../components/ui";
+import { sanitizeFile, type Brand } from "../lib/pdf/theme";
+import type { StudentAnswer } from "../lib/pdf/student-report";
 
 type Row = { attemptId: string; studentId: string; name: string; rollNo: string; email: string | null; section: string; score: number | null; status: string; submittedAt: string | number | null; absent?: boolean; disconnected?: boolean; answeredCount?: number };
+
+function saveBlob(blob: Blob, filename: string) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+
+/** Fetch one attempt's full answer sheet and shape it for the student PDF. */
+async function fetchStudentData(examId: string, row: Row) {
+  const res = await api.reports[":examId"].attempt[":attemptId"].$get({ param: { examId, attemptId: row.attemptId } });
+  if (!res.ok) throw new Error("Failed to load attempt");
+  const d = await res.json();
+  if ("message" in d) throw new Error("Attempt not available");
+  return {
+    student: { name: d.student.name, rollNo: d.student.rollNo, email: d.student.email, section: row.section },
+    attempt: { score: d.attempt.score, status: d.attempt.status, submittedAt: d.attempt.submittedAt },
+    answers: d.answers as StudentAnswer[],
+  };
+}
 
 function fmtSubmitted(t: string | number | null | undefined) {
   if (!t) return "—";
@@ -16,6 +41,7 @@ function fmtSubmitted(t: string | number | null | undefined) {
 export default function ReportDetail() {
   const { examId } = useParams<{ examId: string }>();
   const qc = useQueryClient();
+  const { me } = useSession();
   const [openAttempt, setOpenAttempt] = useState<Row | null>(null);
   const [page, setPage] = useState(1);
   const [confirm, setConfirm] = useState<{ row: Row; action: "absent" | "remove" } | null>(null);
@@ -23,6 +49,8 @@ export default function ReportDetail() {
   const [bulkConfirm, setBulkConfirm] = useState(false);
   const [statFilter, setStatFilter] = useState<string>("all");
   const [sectionFilter, setSectionFilter] = useState<string>("all");
+  const [busy, setBusy] = useState<string | null>(null);
+  const [bulk, setBulk] = useState<{ done: number; total: number } | null>(null);
   const q = useQuery({
     queryKey: ["report", examId],
     queryFn: async () => {
@@ -105,18 +133,97 @@ export default function ReportDetail() {
     });
   };
 
+  // Brand identity carried onto every generated PDF (matches the sidebar badge).
+  const brand: Brand = {
+    collegeName: me?.tenant?.name ?? "Proview",
+    logoUrl: `${window.location.origin}/skilltimate-logo.png`,
+    accent: me?.tenant?.primaryColor || "#1E3A5F",
+  };
+  // The section the exports describe: current section filter, or all sections.
+  const sectionLabel = sectionFilter === "all" ? "All sections" : sectionFilter;
+  const sectionRows = sectionFilter === "all" ? results : results.filter((r) => r.section === sectionFilter);
+  const fileBase = sanitizeFile(`${exam.title}_${sectionLabel}`);
+
   function exportCsv() {
-    const header = ["Name", "Roll No", "Section", "Score"];
-    const lines = results.map((r) => [
-      r.name, r.rollNo, r.section ?? "", r.absent ? "A" : r.score ?? "",
-    ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(","));
+    const header = ["Rank", "Name", "Roll No", "Section", "Status", "Score"];
+    const present = [...sectionRows].filter((r) => !r.absent && r.score != null).sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    const rankMap = new Map<string, number>();
+    let rk = 0, last: number | null = null;
+    for (const r of present) { if (r.score !== last) { rk++; last = r.score; } rankMap.set(r.attemptId, rk); }
+    const ordered = [...sectionRows].sort((a, b) => (a.absent ? 1 : 0) - (b.absent ? 1 : 0) || (b.score ?? -1) - (a.score ?? -1));
+    const lines = ordered.map((r) => {
+      const status = r.absent ? "Absent" : r.disconnected ? `Disconnected (${r.answeredCount ?? 0})` : r.status === "graded" ? "Submitted" : "Grading";
+      return [
+        r.absent ? "" : rankMap.get(r.attemptId) ?? "", r.name, r.rollNo, r.section ?? "", status, r.absent ? "A" : r.score ?? "",
+      ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",");
+    });
     const csv = [header.join(","), ...lines].join("\r\n");
-    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `${exam.title.replace(/[^\w]+/g, "_")}_report.csv`;
-    a.click();
-    URL.revokeObjectURL(a.href);
+    saveBlob(new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" }), `${fileBase}_report.csv`);
+  }
+
+  async function exportSectionPdf() {
+    setBusy("section");
+    try {
+      const { generateSectionReport } = await import("../lib/pdf/section-report");
+      const blob = await generateSectionReport({ brand, examTitle: exam.title, section: sectionLabel, rows: sectionRows });
+      saveBlob(blob, `${fileBase}_report.pdf`);
+    } catch (e) {
+      alert("Could not generate the section report PDF.");
+      console.error(e);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function exportStudentPdf(row: Row) {
+    setBusy(`one:${row.attemptId}`);
+    try {
+      const { generateStudentReport } = await import("../lib/pdf/student-report");
+      const d = await fetchStudentData(examId, row);
+      const blob = await generateStudentReport({ brand, examTitle: exam.title, totalQuestions, ...d });
+      saveBlob(blob, `${sanitizeFile(`${row.rollNo || row.name}_${exam.title}`)}.pdf`);
+    } catch (e) {
+      alert("Could not generate this student's answer sheet.");
+      console.error(e);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // Bulk: every appeared student in the current section → one PDF each, zipped.
+  async function exportAllStudentPdfs() {
+    const targets = sectionRows.filter((r) => !r.absent);
+    if (targets.length === 0) { alert("No appeared students to export in this section."); return; }
+    const { generateStudentReport } = await import("../lib/pdf/student-report");
+    const zip = new JSZip();
+    setBulk({ done: 0, total: targets.length });
+    let done = 0;
+    const pool = 4;
+    let idx = 0;
+    async function worker() {
+      while (idx < targets.length) {
+        const row = targets[idx++];
+        try {
+          const d = await fetchStudentData(examId, row);
+          const blob = await generateStudentReport({ brand, examTitle: exam.title, totalQuestions, ...d });
+          zip.file(`${sanitizeFile(`${row.rollNo || row.name}`)}.pdf`, blob);
+        } catch (e) {
+          console.error("skip", row.rollNo, e);
+        }
+        done++;
+        setBulk({ done, total: targets.length });
+      }
+    }
+    try {
+      await Promise.all(Array.from({ length: Math.min(pool, targets.length) }, worker));
+      const out = await zip.generateAsync({ type: "blob" });
+      saveBlob(out, `${fileBase}_answer_sheets.zip`);
+    } catch (e) {
+      alert("Could not generate the answer-sheet ZIP.");
+      console.error(e);
+    } finally {
+      setBulk(null);
+    }
   }
 
   return (
@@ -127,7 +234,14 @@ export default function ReportDetail() {
         title={exam.title}
         action={
           <div className="flex items-center gap-2">
-            <button className="btn btn-ghost" onClick={exportCsv}><Download size={16} /> Export CSV</button>
+            <ExportMenu
+              busy={busy}
+              bulk={bulk}
+              sectionLabel={sectionLabel}
+              onCsv={exportCsv}
+              onSectionPdf={exportSectionPdf}
+              onAllPdfs={exportAllStudentPdfs}
+            />
             <Pill label={exam.status.toUpperCase()} color="#2e7d5b" />
           </div>
         }
@@ -287,6 +401,8 @@ export default function ReportDetail() {
             )}
             <RowActions
               absent={!!r.absent}
+              downloading={busy === `one:${r.attemptId}`}
+              onDownload={() => exportStudentPdf(r)}
               onMarkAbsent={() => setConfirm({ row: r, action: "absent" })}
               onRemove={() => setConfirm({ row: r, action: "remove" })}
             />
@@ -316,7 +432,7 @@ export default function ReportDetail() {
         </div>
       )}
 
-      {openAttempt && <AttemptDrawer examId={examId} row={openAttempt} onClose={() => setOpenAttempt(null)} />}
+      {openAttempt && <AttemptDrawer examId={examId} row={openAttempt} brand={brand} examTitle={exam.title} totalQuestions={totalQuestions} onClose={() => setOpenAttempt(null)} />}
 
       {confirm && (
         <ConfirmDialog
@@ -334,7 +450,54 @@ export default function ReportDetail() {
   );
 }
 
-function RowActions({ absent, onMarkAbsent, onRemove }: { absent: boolean; onMarkAbsent: () => void; onRemove: () => void }) {
+function ExportMenu({ busy, bulk, sectionLabel, onCsv, onSectionPdf, onAllPdfs }: {
+  busy: string | null;
+  bulk: { done: number; total: number } | null;
+  sectionLabel: string;
+  onCsv: () => void;
+  onSectionPdf: () => void;
+  onAllPdfs: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+  const anyBusy = busy === "section" || !!bulk;
+  const run = (fn: () => void) => { setOpen(false); fn(); };
+  const Item = ({ icon: Icon, title, sub, onClick }: { icon: typeof FileText; title: string; sub: string; onClick: () => void }) => (
+    <button className="w-full flex items-start gap-2.5 px-3 py-2.5 text-left hover:bg-[var(--color-brand-soft)]" onClick={onClick}>
+      <Icon size={16} className="mt-0.5 text-[var(--brand)] shrink-0" />
+      <div className="min-w-0">
+        <div className="text-sm font-medium text-[var(--color-ink)]">{title}</div>
+        <div className="text-xs text-[var(--color-muted)] leading-snug">{sub}</div>
+      </div>
+    </button>
+  );
+  return (
+    <div ref={ref} className="relative">
+      <button className="btn btn-ghost" onClick={() => setOpen((v) => !v)} disabled={anyBusy}>
+        {anyBusy ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
+        {bulk ? `Zipping ${bulk.done}/${bulk.total}` : busy === "section" ? "Building PDF…" : "Download"}
+        {!anyBusy && <ChevronDown size={15} />}
+      </button>
+      {open && (
+        <div className="absolute right-0 top-11 z-30 w-72 rounded-xl border border-[var(--color-line)] bg-white shadow-lg py-1.5" style={{ boxShadow: "0 10px 34px rgba(0,0,0,.14)" }}>
+          <div className="px-3 pt-1.5 pb-1 text-[10px] uppercase tracking-wide text-[var(--color-muted)]" style={{ fontFamily: "var(--font-mono)" }}>{sectionLabel}</div>
+          <Item icon={FileText} title="Section report (PDF)" sub="Stats, graphs, top performers & full list" onClick={() => run(onSectionPdf)} />
+          <Item icon={FileSpreadsheet} title="Section report (CSV)" sub="Ranked marks sheet for Excel" onClick={() => run(onCsv)} />
+          <div className="my-1 border-t border-[var(--color-line)]" />
+          <Item icon={Files} title="All answer sheets (ZIP)" sub="One PDF per appeared student, with answers & explanations" onClick={() => run(onAllPdfs)} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RowActions({ absent, downloading, onDownload, onMarkAbsent, onRemove }: { absent: boolean; downloading: boolean; onDownload: () => void; onMarkAbsent: () => void; onRemove: () => void }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -350,10 +513,18 @@ function RowActions({ absent, onMarkAbsent, onRemove }: { absent: boolean; onMar
         onClick={() => setOpen((v) => !v)}
         title="Roster actions"
       >
-        <MoreVertical size={16} />
+        {downloading ? <Loader2 size={16} className="animate-spin" /> : <MoreVertical size={16} />}
       </button>
       {open && (
         <div className="absolute right-0 top-9 z-20 w-52 rounded-lg border border-[var(--color-line)] bg-white shadow-lg py-1" style={{ boxShadow: "0 8px 28px rgba(0,0,0,.12)" }}>
+          {!absent && (
+            <button
+              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-[var(--color-ink)] hover:bg-[var(--color-brand-soft)] text-left"
+              onClick={() => { setOpen(false); onDownload(); }}
+            >
+              <FileText size={15} /> Download answer sheet
+            </button>
+          )}
           {!absent && (
             <button
               className="w-full flex items-center gap-2 px-3 py-2 text-sm text-[var(--color-ink)] hover:bg-[var(--color-brand-soft)] text-left"
@@ -423,7 +594,8 @@ type AnswerRow = {
 
 const LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H"];
 
-function AttemptDrawer({ examId, row, onClose }: { examId: string; row: Row; onClose: () => void }) {
+function AttemptDrawer({ examId, row, brand, examTitle, totalQuestions, onClose }: { examId: string; row: Row; brand: Brand; examTitle: string; totalQuestions?: number; onClose: () => void }) {
+  const [dl, setDl] = useState(false);
   const q = useQuery({
     queryKey: ["attempt", examId, row.attemptId],
     queryFn: async () => {
@@ -436,8 +608,37 @@ function AttemptDrawer({ examId, row, onClose }: { examId: string; row: Row; onC
   const d = q.data && !("message" in q.data) ? q.data : null;
   const answers = (d?.answers ?? []) as AnswerRow[];
 
+  async function download() {
+    if (!d) return;
+    setDl(true);
+    try {
+      const { generateStudentReport } = await import("../lib/pdf/student-report");
+      const blob = await generateStudentReport({
+        brand,
+        examTitle,
+        totalQuestions,
+        student: { name: d.student.name, rollNo: d.student.rollNo, email: d.student.email, section: row.section },
+        attempt: { score: d.attempt.score, status: d.attempt.status, submittedAt: d.attempt.submittedAt },
+        answers: d.answers as StudentAnswer[],
+      });
+      saveBlob(blob, `${sanitizeFile(`${row.rollNo || row.name}_${examTitle}`)}.pdf`);
+    } catch (e) {
+      alert("Could not generate the answer sheet PDF.");
+      console.error(e);
+    } finally {
+      setDl(false);
+    }
+  }
+
   return (
     <Drawer eyebrow="Student report" title={row.name} subtitle={`${row.rollNo}${row.email ? " · " + row.email : ""}`} onClose={onClose} width="max-w-3xl">
+      <button
+        className="btn btn-ghost w-full mb-5 justify-center border border-[var(--color-line)]"
+        onClick={download}
+        disabled={!d || dl}
+      >
+        {dl ? <Loader2 size={16} className="animate-spin" /> : <FileText size={16} />} {dl ? "Preparing PDF…" : "Download answer sheet (PDF)"}
+      </button>
       <div className="grid grid-cols-2 gap-4 mb-6">
         <div className="card p-4">{row.status === "graded" ? (<div className="stat-num text-[1.6rem]" style={{ color: "var(--brand)" }}>{row.score != null ? `${row.score}/100` : "—"}</div>) : (<div className="stat-num text-[1.6rem]" style={{ color: "#b7791f" }}>Grading…</div>)}<div className="mono-label mt-1">Marks scored</div></div>
         <div className="card p-4"><div className="stat-num text-[1.6rem] text-[var(--color-ink)]">{fmtSubmitted(row.submittedAt)}</div><div className="mono-label mt-1">Submitted</div></div>
