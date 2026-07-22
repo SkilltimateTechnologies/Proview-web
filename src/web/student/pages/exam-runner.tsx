@@ -70,7 +70,7 @@ function loadCachedBundle(examId: string): Bundle | null {
 export function ExamRunner() {
   const { examId } = useParams();
   const [, navigate] = useLocation();
-  const { student } = useSession();
+  const { student, logout } = useSession();
   const online = useOnline();
 
   const [phase, setPhase] = useState<Phase>("brief");
@@ -85,7 +85,6 @@ export function ExamRunner() {
   // We poll the attempt status until it flips to "graded", then reveal the real
   // final score (the score returned inline at submit is objective-only/partial).
   const [gradeDone, setGradeDone] = useState(false);
-  const [gradedScore, setGradedScore] = useState<number | null>(null);
 
   const sessionRef = useRef<RunSession | null>(null);
   sessionRef.current = session;
@@ -445,7 +444,6 @@ export function ExamRunner() {
           submittedRef.current = false;
           setResult(null);
           setGradeDone(false);
-          setGradedScore(null);
           const saved = loadProgress(examId);
           const endAt = new Date(st.endAt).getTime();
           setSession({
@@ -469,7 +467,6 @@ export function ExamRunner() {
           return;
         }
         if (st.status === "graded") {
-          setGradedScore(typeof st.score === "number" ? st.score : null);
           setGradeDone(true);
           return;
         }
@@ -817,41 +814,21 @@ export function ExamRunner() {
   if (phase === "done" && result) {
     return (
       <div className="runner" style={{ alignItems: "center", justifyContent: "center" }}>
-        <div className="card" style={{ padding: 36, maxWidth: 480, width: "100%", textAlign: "center" }}>
-          <div style={{ width: 58, height: 58, borderRadius: 999, background: "#e7f5ee", color: "var(--color-success)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}><Icon name="check" size={30} /></div>
-          <h1 style={{ fontFamily: "var(--font-serif)", fontSize: 26, marginBottom: 6 }}>Exam submitted</h1>
-          <p style={{ color: "var(--color-ink2)", marginBottom: 20, lineHeight: 1.6 }}>Your answers were submitted successfully.</p>
+        <div className="card" style={{ padding: 40, maxWidth: 460, width: "100%", textAlign: "center" }}>
+          <div style={{ width: 62, height: 62, borderRadius: 999, background: "#e7f5ee", color: "var(--color-success)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 20px" }}><Icon name="check" size={32} /></div>
+          <h1 style={{ fontFamily: "var(--font-serif)", fontSize: 26, marginBottom: 12 }}>Thank you for taking the exam</h1>
+          <p style={{ color: "var(--color-ink2)", marginBottom: 28, lineHeight: 1.6, fontSize: 15 }}>Your answers were submitted successfully. Your score will be updated soon.</p>
 
-          {!gradeDone ? (
-            <div style={{ background: "var(--color-brand-soft)", borderRadius: 14, padding: "18px 14px", marginBottom: 12, display: "flex", alignItems: "center", gap: 12, justifyContent: "center" }}>
-              <Icon name="loader-circle" size={18} className="animate-spin" />
-              <span style={{ color: "var(--color-ink2)", fontSize: 13.5, lineHeight: 1.5, textAlign: "left" }}>Grading in progress… your final score will appear here in a moment.</span>
-            </div>
-          ) : gradedScore != null ? (
-            <div style={{ background: "#e7f5ee", borderRadius: 14, padding: "18px 14px", marginBottom: 12 }}>
-              <div className="mono-label" style={{ marginBottom: 4 }}>Your score</div>
-              <div style={{ fontFamily: "var(--font-serif)", fontSize: 40, fontWeight: 700, color: "var(--color-success)", lineHeight: 1 }}>{Math.round(gradedScore)}<span style={{ fontSize: 20, color: "var(--color-ink2)" }}>/100</span></div>
-            </div>
-          ) : (
-            <div style={{ background: "var(--color-brand-soft)", borderRadius: 14, padding: "16px 14px", marginBottom: 12, display: "flex", alignItems: "center", gap: 10, justifyContent: "center" }}>
-              <Icon name="check" size={16} />
-              <span style={{ color: "var(--color-ink2)", fontSize: 13.5, lineHeight: 1.5, textAlign: "left" }}>Grading complete. Your detailed result is available on your dashboard.</span>
-            </div>
-          )}
-
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 22 }}>
-            <div style={{ background: "#e7f5ee", borderRadius: 12, padding: "14px 10px" }}>
-              <div className="stat-num" style={{ fontSize: 22, color: "var(--color-success)" }}>{result.answered}</div>
-              <div className="mono-label">Answered</div>
-            </div>
-            <div style={{ background: "#fdf3e7", borderRadius: 12, padding: "14px 10px" }}>
-              <div className="stat-num" style={{ fontSize: 22, color: "var(--color-warn)" }}>{result.skipped}</div>
-              <div className="mono-label">Skipped</div>
-            </div>
-          </div>
-
-          <button className="btn btn-primary" style={{ width: "100%", padding: 12 }} onClick={() => { if (examId) clearProgress(examId); navigate("/"); }}>
-            <Icon name="layout-dashboard" /> Back to dashboard
+          <button
+            className="btn btn-primary"
+            style={{ width: "100%", padding: 12 }}
+            onClick={() => {
+              if (examId) clearProgress(examId);
+              logout();
+              window.location.replace(window.location.origin + "/px9k2m7/exit");
+            }}
+          >
+            <Icon name="log-out" /> Logout
           </button>
         </div>
       </div>
@@ -984,11 +961,6 @@ export function ExamRunner() {
                   <span><strong>{answeredCount}</strong> of {questions.length} answered</span>
                   {flagCount > 0 && <span style={{ color: "var(--color-warn)" }}><Icon name="flag" size={13} /> {flagCount} flagged for review</span>}
                 </div>
-                {flagCount > 0 && (
-                  <button className="btn btn-ghost" onClick={() => { const idx = questions.findIndex((qq) => session.flags[qq.id]); if (idx >= 0) navTo(idx); }}>
-                    <Icon name="flag" /> Review flagged questions
-                  </button>
-                )}
                 <button className="btn btn-primary" style={{ padding: 14, fontSize: 15 }} onClick={handleSubmitClick} disabled={submitting}>
                   {submitting ? <Icon name="loader-circle" className="animate-spin" /> : <Icon name="send" />} Submit exam
                 </button>
@@ -1003,9 +975,9 @@ export function ExamRunner() {
               <span><strong>{answeredCount}</strong>/{questions.length} answered</span>
               {flagCount > 0 && <span style={{ color: "var(--color-warn)" }}><Icon name="flag" size={12} /> {flagCount} flagged</span>}
             </div>
-            <button className="btn btn-primary" onClick={handleSubmitClick} disabled={submitting}>
-              {submitting ? <Icon name="loader-circle" className="animate-spin" /> : <Icon name="send" />} Finish exam
-            </button>
+            <div style={{ fontSize: 12.5, color: "var(--color-ink2)", lineHeight: 1.5 }}>
+              Use <strong>Previous</strong> and <strong>Next</strong> to move through the exam. Submit becomes available on the last question.
+            </div>
           </div>
           <div className="mono-label" style={{ marginBottom: 12 }}>Question palette</div>
           <div className="palette-grid" style={{ marginBottom: 18 }}>
@@ -1013,10 +985,10 @@ export function ExamRunner() {
               const answered = session.answers[qq.id] != null && String(session.answers[qq.id]).length > 0;
               const flagged = session.flags[qq.id];
               return (
-                <button key={qq.id} className={`pal-cell ${i === cur ? "cur" : ""} ${flagged ? "pal-flag" : answered ? "pal-answered" : ""}`} onClick={() => navTo(i)}>
+                <div key={qq.id} className={`pal-cell ${i === cur ? "cur" : ""} ${flagged ? "pal-flag" : answered ? "pal-answered" : ""}`} style={{ cursor: "default" }} aria-current={i === cur ? "true" : undefined}>
                   {i + 1}
                   {flagged && <span className="pal-flag-dot" />}
-                </button>
+                </div>
               );
             })}
           </div>
@@ -1030,7 +1002,7 @@ export function ExamRunner() {
               <div className="mono-label" style={{ marginBottom: 8 }}>Flagged for review</div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                 {questions.map((qq, i) => session.flags[qq.id] ? (
-                  <button key={qq.id} className="btn btn-sm btn-ghost" onClick={() => navTo(i)}>Q{i + 1}</button>
+                  <span key={qq.id} className="btn btn-sm btn-ghost" style={{ cursor: "default", pointerEvents: "none" }}>Q{i + 1}</span>
                 ) : null)}
               </div>
             </div>
