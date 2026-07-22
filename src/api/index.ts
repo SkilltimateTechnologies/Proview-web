@@ -211,8 +211,9 @@ const app = new Hono<{ Variables: Vars }>()
       .where(and(eq(schema.students.tenantId, tid), eq(schema.students.email, email)));
     if (dupEmail) return c.json({ message: "This email is already registered" }, 409);
 
+    const newStuId = id("stu");
     await db.insert(schema.students).values({
-      id: id("stu"),
+      id: newStuId,
       tenantId: tid,
       classId,
       rollNo: roll,
@@ -222,6 +223,36 @@ const app = new Hono<{ Variables: Vars }>()
       gender,
       password: await hashPassword("Welcome@123"),
     });
+
+    // Late-registrant enrolment: a student who registers after exams were set up
+    // must still land in the exam meant for their branch. Cohort matching already
+    // makes them eligible for section-targeted exams, but we ALSO write an explicit
+    // roster "add" so they're concretely enrolled — visible in the assigned count
+    // and robust even if the exam uses explicit "students" assignment. Scoped to
+    // exams that are running or scheduled and that target this student's section.
+    try {
+      const activeExams = await db
+        .select()
+        .from(schema.exams)
+        .where(and(eq(schema.exams.tenantId, tid), inArray(schema.exams.status, ["scheduled", "live"])));
+      const stu = { id: newStuId, classId };
+      const toEnroll = activeExams.filter((e) => {
+        const secIds = (e.sectionIds as string[] | null) ?? null;
+        // Cohort-mode exam that targets this student's section (or all sections).
+        if (e.assignMode !== "students" && matchesCohort({ classId: e.classId, sectionIds: secIds, assignMode: e.assignMode }, stu)) return true;
+        // Explicit "students"-mode exam that still carries this section in its scope.
+        if (e.assignMode === "students" && Array.isArray(secIds) && classId && secIds.includes(classId)) return true;
+        return false;
+      });
+      if (toEnroll.length) {
+        await db
+          .insert(schema.examRoster)
+          .values(toEnroll.map((e) => ({ id: id("rost"), examId: e.id, studentId: newStuId, mode: "add" as const, createdBy: null })));
+      }
+    } catch (e) {
+      console.error("[register] auto-enrol failed for", roll, e);
+    }
+
     return c.json({ ok: true, name, rollNo: roll }, 201);
   })
 
