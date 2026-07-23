@@ -386,6 +386,23 @@ const app = new Hono<{ Variables: Vars }>()
     await db.update(schema.account).set({ password: hash, updatedAt: new Date() }).where(eq(schema.account.id, acc.id));
     return c.json({ ok: true, password: newPassword }, 200);
   })
+  // Permanently delete a staff user (TPO / college admin) and their auth records.
+  .delete("/users/:id", requireAuth, requirePermission("users"), async (c) => {
+    const uid = c.req.param("id");
+    const me = c.get("profile")!;
+    if (uid === me.userId) return c.json({ message: "You cannot delete your own account." }, 400);
+    const [target] = await db.select().from(schema.profiles).where(eq(schema.profiles.userId, uid));
+    if (!target) return c.json({ message: "User not found" }, 404);
+    if (target.role === "super_admin") return c.json({ message: "The super admin account cannot be deleted." }, 403);
+    // Non-super-admins can only delete users within their own tenant.
+    if (me.role !== "super_admin" && target.tenantId !== me.tenantId) return c.json({ message: "Not allowed" }, 403);
+    // Remove auth rows first (session, credential account), then profile, then user.
+    await db.delete(schema.session).where(eq(schema.session.userId, uid));
+    await db.delete(schema.account).where(eq(schema.account.userId, uid));
+    await db.delete(schema.profiles).where(eq(schema.profiles.userId, uid));
+    await db.delete(schema.user).where(eq(schema.user.id, uid));
+    return c.json({ ok: true }, 200);
+  })
 
   // =================== CLASSES ===================
   .get("/classes", requireAuth, async (c) => {
@@ -563,6 +580,25 @@ const app = new Hono<{ Variables: Vars }>()
     await db.update(schema.students).set({ password: await hashPassword(newPassword), mustChangePassword: true }).where(eq(schema.students.id, sid));
     // Return the plaintext ONCE so the admin can hand it to the student; never stored/readable after.
     return c.json({ ok: true, password: newPassword }, 200);
+  })
+  // Permanently delete a student and everything attached to them (attempts,
+  // answers, integrity events, roster overrides). Irreversible.
+  .delete("/students/:id", requireAuth, requirePermission("users"), async (c) => {
+    const sid = c.req.param("id");
+    const me = c.get("profile")!;
+    const [stu] = await db.select().from(schema.students).where(eq(schema.students.id, sid));
+    if (!stu) return c.json({ message: "Student not found" }, 404);
+    if (me.role !== "super_admin" && stu.tenantId !== me.tenantId) return c.json({ message: "Not allowed" }, 403);
+    // Cascade: answers + integrity events hang off attempts, so clear those first.
+    const atts = await db.select({ id: schema.attempts.id }).from(schema.attempts).where(eq(schema.attempts.studentId, sid));
+    for (const a of atts) {
+      await db.delete(schema.answers).where(eq(schema.answers.attemptId, a.id));
+      await db.delete(schema.integrityEvents).where(eq(schema.integrityEvents.attemptId, a.id));
+    }
+    await db.delete(schema.attempts).where(eq(schema.attempts.studentId, sid));
+    await db.delete(schema.examRoster).where(eq(schema.examRoster.studentId, sid));
+    await db.delete(schema.students).where(eq(schema.students.id, sid));
+    return c.json({ ok: true }, 200);
   })
   // Student login verification for the Phase 2 desktop client. Public (no staff session).
   // Body: { identifier: rollNo|email, password }. Returns student (no hash) on success.

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useLocation } from "wouter";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Upload, X, Search, GraduationCap, UserCog, Mail, Sliders, KeyRound, Layers, Copy, Check, Pencil } from "lucide-react";
+import { Plus, Upload, X, Search, GraduationCap, UserCog, Mail, Sliders, KeyRound, Layers, Copy, Check, Pencil, Trash2, AlertTriangle } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Field, Drawer, usePagination, Pager } from "../components/ui";
@@ -62,6 +62,7 @@ export default function Users() {
   const [resetUser, setResetUser] = useState<{ kind: "staff" | "student"; id: string; name: string } | null>(null);
   const [editStudent, setEditStudent] = useState<StudentRow | null>(null);
   const [editUser, setEditUser] = useState<UserRow | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<{ kind: "staff" | "student"; id: string; name: string; sub: string } | null>(null);
 
   const list = useQuery({
     queryKey: ["users"],
@@ -83,6 +84,22 @@ export default function Users() {
   const toggleStudent = useMutation({
     mutationFn: async ({ id, enabled }: { id: string; enabled: boolean }) => api.students[":id"].$patch({ param: { id }, json: { enabled } }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["students"] }),
+  });
+  const removeUser = useMutation({
+    mutationFn: async (id: string) => {
+      const res = await api.users[":id"].$delete({ param: { id } });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { message?: string }).message || "Delete failed");
+      return res;
+    },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["users"] }); setConfirmDelete(null); },
+  });
+  const removeStudent = useMutation({
+    mutationFn: async (id: string) => {
+      const res = await api.students[":id"].$delete({ param: { id } });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { message?: string }).message || "Delete failed");
+      return res;
+    },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["students"] }); setConfirmDelete(null); },
   });
 
   const s = search.toLowerCase();
@@ -136,6 +153,37 @@ export default function Users() {
       {csv && <CsvUpload onClose={() => setCsv(false)} />}
       {permFor && <PermissionDrawer user={permFor} onClose={() => setPermFor(null)} />}
       {resetUser && <ResetPasswordDrawer target={resetUser} onClose={() => setResetUser(null)} />}
+      {confirmDelete && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-4" onClick={() => { if (!removeUser.isPending && !removeStudent.isPending) setConfirmDelete(null); }}>
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-start gap-4">
+              <div className="h-11 w-11 rounded-full flex items-center justify-center shrink-0" style={{ background: "#fdecea", color: "#c0453b" }}><AlertTriangle size={22} /></div>
+              <div className="min-w-0">
+                <h3 className="text-lg font-semibold text-[var(--color-ink)]">Delete {confirmDelete.kind === "student" ? "student" : "user"}?</h3>
+                <p className="text-sm text-[var(--color-ink2)] mt-1 leading-relaxed">
+                  <span className="font-medium text-[var(--color-ink)]">{confirmDelete.name}</span> <span className="mono-label">({confirmDelete.sub})</span> will be permanently removed
+                  {confirmDelete.kind === "student" ? ", along with all their exam attempts, answers and results." : " and will lose all access."} This cannot be undone.
+                </p>
+              </div>
+            </div>
+            {(removeUser.error || removeStudent.error) && (
+              <div className="mt-4 text-sm text-[#c0453b] bg-[#fdecea] rounded-lg px-3 py-2">
+                {(removeUser.error as Error)?.message || (removeStudent.error as Error)?.message}
+              </div>
+            )}
+            <div className="flex gap-2 justify-end mt-6">
+              <button className="btn btn-ghost" disabled={removeUser.isPending || removeStudent.isPending} onClick={() => setConfirmDelete(null)}>Cancel</button>
+              <button
+                className="btn btn-danger"
+                disabled={removeUser.isPending || removeStudent.isPending}
+                onClick={() => confirmDelete.kind === "student" ? removeStudent.mutate(confirmDelete.id) : removeUser.mutate(confirmDelete.id)}
+              >
+                <Trash2 size={16} /> {(removeUser.isPending || removeStudent.isPending) ? "Deleting…" : "Delete permanently"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Segmented filter (pills, not tabs) */}
       <div className="flex flex-col sm:flex-row gap-3 mb-5">
@@ -210,6 +258,7 @@ export default function Users() {
                             <button className={st.enabled ? "btn btn-danger !py-1.5 !px-3" : "btn btn-ghost !py-1.5 !px-3"} onClick={() => toggleStudent.mutate({ id: st.id, enabled: !st.enabled })}>
                               {st.enabled ? "Disable" : "Enable"}
                             </button>
+                            <button className="btn btn-ghost !py-1.5 !px-2.5 !text-[#c0453b]" title="Delete student" onClick={() => setConfirmDelete({ kind: "student", id: st.id, name: st.name, sub: st.rollNo })}><Trash2 size={15} /></button>
                           </div>
                         </td>
                       </tr>
@@ -270,6 +319,7 @@ export default function Users() {
                                     {u.enabled ? "Disable" : "Enable"}
                                   </button>
                                 )}
+                                {u.role !== "super_admin" && <button className="btn btn-ghost !py-1.5 !px-2.5 !text-[#c0453b]" title="Delete user" onClick={() => setConfirmDelete({ kind: "staff", id: u.userId, name: u.name, sub: u.displayId })}><Trash2 size={15} /></button>}
                               </div>
                             </td>
                           </tr>
