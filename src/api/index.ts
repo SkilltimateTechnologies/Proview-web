@@ -807,9 +807,16 @@ const app = new Hono<{ Variables: Vars }>()
     }
     // Mark the student as seen (drives Live Monitor online/offline).
     await db.update(schema.attempts).set({ lastSeenAt: new Date(now) }).where(eq(schema.attempts.id, attempt.id));
+    // Return the server-saved answers so a resume/reopen on a FRESH browser
+    // (cleared cache, different machine, SEB kiosk that wipes local storage)
+    // restores the student's prior work instead of showing a blank exam. The
+    // client merges these under its own local answers (local wins per-question).
+    const startSaved = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, attempt.id));
+    const startAnswers: Record<string, unknown> = {};
+    for (const a of startSaved) if (a.response != null) startAnswers[a.questionId] = a.response;
     // Absolute deadline includes admin extra-minutes + global hold time.
     const endAtMs = effectiveEndMs(exam, attempt, now);
-    return c.json({ attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), serverNow: new Date(now), durationMin: exam.durationMin, pausedMs: attempt.pausedMs ?? 0, held: !!exam.heldAt }, 200);
+    return c.json({ attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), serverNow: new Date(now), durationMin: exam.durationMin, pausedMs: attempt.pausedMs ?? 0, held: !!exam.heldAt, answers: startAnswers }, 200);
   })
 
   // Read-only status probe. Used by the client on mount to detect an in-progress
@@ -832,7 +839,13 @@ const app = new Hono<{ Variables: Vars }>()
       // return the live deadline. This is the only side effect here.
       await db.update(schema.attempts).set({ lastSeenAt: new Date(now) }).where(eq(schema.attempts.id, attempt.id));
       const endAtMs = effectiveEndMs(exam, attempt, now);
-      return c.json({ status: "in_progress", attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), serverNow: new Date(now), held: !!exam.heldAt }, 200);
+      // Include server-saved answers so a refresh/reopen resume on a fresh
+      // browser restores prior work rather than a blank exam (client merges
+      // these under its local answers).
+      const stSaved = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, attempt.id));
+      const stAnswers: Record<string, unknown> = {};
+      for (const a of stSaved) if (a.response != null) stAnswers[a.questionId] = a.response;
+      return c.json({ status: "in_progress", attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), serverNow: new Date(now), held: !!exam.heldAt, answers: stAnswers }, 200);
     }
     return c.json({ status: attempt.status, attemptId: attempt.id, startedAt: attempt.startedAt, endAt: null, serverNow: new Date(now), held: false, score: attempt.score }, 200);
   })

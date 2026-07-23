@@ -238,18 +238,23 @@ export function ExamRunner() {
       const start = await api.start(examId);
       // Restore any answers saved locally (offline-first: survives a crash/reload).
       const saved = loadProgress(examId);
+      // Merge server-saved answers UNDER local ones: on a fresh browser (cleared
+      // cache / different machine / SEB kiosk that wipes storage) local is empty,
+      // so the server copy repopulates the exam instead of showing blank. On the
+      // same browser, local is the latest autosave and wins per-question.
+      const mergedAnswers = { ...(start.answers ?? {}), ...(saved?.answers ?? {}) };
       // /start returns the server-anchored deadline already folding in any admin
       // hold time + extra minutes, so we use it directly.
       const endAt = new Date(start.endAt).getTime();
       setSession({
         attemptId: start.attemptId,
         endAt,
-        answers: saved?.answers ?? {},
+        answers: mergedAnswers,
         flags: saved?.flags ?? {},
         integrityEvents: [],
       });
       // Persist attemptId + absolute deadline so an offline refresh can resume.
-      saveProgress(examId, { attemptId: start.attemptId, endAt, answers: saved?.answers ?? {}, flags: saved?.flags ?? {}, cur: curRef.current });
+      saveProgress(examId, { attemptId: start.attemptId, endAt, answers: mergedAnswers, flags: saved?.flags ?? {}, cur: curRef.current });
       setHeld(!!start.held);
       enterRunning();
     } catch (e) {
@@ -311,18 +316,20 @@ export function ExamRunner() {
         }
         if (st.status !== "in_progress" || !st.endAt || !st.attemptId) return;
         // Rebuild the running session from server (attemptId + deadline) + local
-        // progress (answers/flags/current question).
+        // progress (answers/flags/current question). Merge server answers UNDER
+        // local so a fresh-browser resume repopulates prior work instead of blank.
         const saved = loadProgress(examId);
+        const merged = { ...(st.answers ?? {}), ...(saved?.answers ?? {}) };
         const endAt = new Date(st.endAt).getTime();
         setSession({
           attemptId: st.attemptId,
           endAt,
-          answers: saved?.answers ?? {},
+          answers: merged,
           flags: saved?.flags ?? {},
           integrityEvents: [],
         });
         // Refresh the persisted attemptId + deadline from the authoritative server.
-        saveProgress(examId, { attemptId: st.attemptId, endAt, answers: saved?.answers ?? {}, flags: saved?.flags ?? {}, cur: saved?.cur });
+        saveProgress(examId, { attemptId: st.attemptId, endAt, answers: merged, flags: saved?.flags ?? {}, cur: saved?.cur });
         if (typeof saved?.cur === "number" && Number.isFinite(saved.cur)) setCur(saved.cur);
         setHeld(!!st.held);
         const cfg = proctoringRef.current;
@@ -455,14 +462,15 @@ export function ExamRunner() {
           setGradeDone(false);
           const saved = loadProgress(examId);
           const endAt = new Date(st.endAt).getTime();
+          const merged = { ...(st.answers ?? {}), ...(saved?.answers ?? {}) };
           setSession({
             attemptId: st.attemptId,
             endAt,
-            answers: saved?.answers ?? {},
+            answers: merged,
             flags: saved?.flags ?? {},
             integrityEvents: [],
           });
-          saveProgress(examId, { attemptId: st.attemptId, endAt, answers: saved?.answers ?? {}, flags: saved?.flags ?? {}, cur: saved?.cur });
+          saveProgress(examId, { attemptId: st.attemptId, endAt, answers: merged, flags: saved?.flags ?? {}, cur: saved?.cur });
           if (typeof saved?.cur === "number" && Number.isFinite(saved.cur)) setCur(saved.cur);
           setHeld(!!st.held);
           const cfg = proctoringRef.current;
