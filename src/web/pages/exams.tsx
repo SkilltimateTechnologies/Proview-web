@@ -309,8 +309,21 @@ export function EditExam() {
           <div className="flex gap-2 mb-3 flex-wrap">
             <button className={`btn ${scope === "all" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("all")}>All sections</button>
             <button className={`btn ${scope === "specific" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("specific")}>Specific sections</button>
-            <button className={`btn ${scope === "students" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("students")}>Specific students</button>
+            <button className={`btn ${scope === "students" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("students")}>Only specific students</button>
           </div>
+          <p className="mb-3 text-xs text-[var(--color-ink2)]">
+            <b>All / Specific sections</b> assign by cohort. To keep your sections <i>and</i> add a few extra
+            students on top, leave the scope on sections and use <b>Roster overrides → Add student</b> below.
+            <br />
+            <b>Only specific students</b> is exclusive — it ignores all sections and assigns <i>only</i> the students you pick.
+          </p>
+          {scope === "students" && (
+            <div className="mb-3 rounded-lg border px-3 py-2 text-xs" style={{ borderColor: "#e0b400", background: "#fff8e1", color: "#8a6d00" }}>
+              Heads up: this mode ignores section cohorts entirely — only the students picked below can take this
+              assessment. To keep your sections and just add extra students on top, switch back to “All / Specific
+              sections” and use the <b>Roster overrides</b> panel below.
+            </div>
+          )}
           {scope === "specific" && (
             <div className="flex flex-wrap gap-2">
               {sections.length === 0 && <div className="text-sm text-[var(--color-ink2)]">No sections yet. Add classes in Users.</div>}
@@ -405,7 +418,7 @@ function RosterPanel({ examId }: { examId: string }) {
         <div>
           <div className="mono-label mb-1">Roster overrides</div>
           <p className="text-sm text-[var(--color-ink2)]">
-            Add a specific student onto this assessment, or remove one from it — beyond the section cohort.
+            Add an extra student <b>on top of</b> the assigned sections, or remove one — your section cohort stays intact.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -746,8 +759,21 @@ export function NewExam() {
           <div className="flex gap-2 mb-3 flex-wrap">
             <button className={`btn ${scope === "all" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("all")}>All sections</button>
             <button className={`btn ${scope === "specific" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("specific")}>Specific sections</button>
-            <button className={`btn ${scope === "students" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("students")}>Specific students</button>
+            <button className={`btn ${scope === "students" ? "btn-primary" : "btn-ghost"}`} onClick={() => setScope("students")}>Only specific students</button>
           </div>
+          <p className="mb-3 text-xs text-[var(--color-ink2)]">
+            <b>All / Specific sections</b> assign by cohort. To keep your sections <i>and</i> add a few extra students on
+            top, keep the scope on sections, save the assessment, then use <b>Roster overrides → Add student</b> on the edit screen.
+            <br />
+            <b>Only specific students</b> is exclusive — it ignores all sections and assigns <i>only</i> the students you pick.
+          </p>
+          {scope === "students" && (
+            <div className="mb-3 rounded-lg border px-3 py-2 text-xs" style={{ borderColor: "#e0b400", background: "#fff8e1", color: "#8a6d00" }}>
+              Heads up: this mode ignores section cohorts entirely — only the students picked below can take this
+              assessment. To keep your sections and just add extra students on top, use “All / Specific sections” and add
+              them via <b>Roster overrides</b> after saving.
+            </div>
+          )}
           {scope === "specific" && (
             <div className="flex flex-wrap gap-2">
               {sections.length === 0 && <div className="text-sm text-[var(--color-ink2)]">No sections yet. Add classes in Users.</div>}

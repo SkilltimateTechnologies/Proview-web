@@ -1581,12 +1581,16 @@ const app = new Hono<{ Variables: Vars }>()
     // full duration.
     let target = Math.max(sharedEnd, naturalEnd) + addMs;
 
-    // Only if the whole window has already closed (nothing left for anyone) do we
-    // grant a fresh writable window so the student can still finish: the added
-    // minutes if given, else the exam's normal duration.
-    const MIN_WRITABLE_MS = 60_000; // 1 min floor of usable time
+    // Always guarantee a real writable cushion after a reopen. A tiny floor (e.g.
+    // 1 min) caused a submit/reopen loop: the client's auto-submit-on-timeout
+    // fires again within a heartbeat, the admin reopens, and round it goes. Give
+    // at least MIN_WRITABLE_MS of usable time from now — the admin's added
+    // minutes if larger, else this floor (or a fresh duration if the whole
+    // window has already closed and no minutes were specified).
+    const MIN_WRITABLE_MS = 10 * 60_000; // 10 min floor of usable time
     if (target - now < MIN_WRITABLE_MS) {
-      const grantMin = addMinutes > 0 ? addMinutes : exam.durationMin;
+      const grantMin =
+        addMinutes > 0 ? Math.max(addMinutes, 10) : (target - now <= 0 ? exam.durationMin : 10);
       target = now + grantMin * 60_000;
     }
 

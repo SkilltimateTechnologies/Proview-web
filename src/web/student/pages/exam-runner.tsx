@@ -89,6 +89,11 @@ export function ExamRunner() {
   const sessionRef = useRef<RunSession | null>(null);
   sessionRef.current = session;
   const submittedRef = useRef(false);
+  // Wall-clock ms when the exam last (re)entered the running phase. Used to
+  // suppress an instant auto-submit right after a resume/reopen: if a session
+  // is rebuilt with a stale/zero deadline, we must NOT silently resubmit within
+  // the first few seconds — that was the submit↔reopen loop.
+  const runningSinceRef = useRef(0);
   const curRef = useRef(0);
   curRef.current = cur;
   // Guards the run-once resume-on-mount probe.
@@ -254,6 +259,7 @@ export function ExamRunner() {
   }, [examId, student, bundle, camReady, online]);
 
   function enterRunning() {
+    runningSinceRef.current = Date.now();
     setPhase("running");
     // Mark this exam as the active in-progress attempt so a forced logout
     // (e.g. internet loss) can bounce the student straight back to it on relogin.
@@ -587,7 +593,13 @@ export function ExamRunner() {
   useEffect(() => {
     // Auto-submit on timeout — only when the admin left the grace toggle on,
     // online, and NOT during an admin global hold (timer is frozen while held).
-    if (phase === "running" && session && online && !held && remaining <= 0 && proctoringRef.current.autoSubmitOnTimeout) void doSubmit();
+    // Guard: never fire within the first few seconds of (re)entering running.
+    // After an admin reopen the session is rebuilt with a fresh deadline; if that
+    // deadline is momentarily stale/zero we must not instantly resubmit — that
+    // was the submit↔reopen loop. A genuine end-of-exam timeout still fires once
+    // this short settle window passes.
+    const settled = Date.now() - runningSinceRef.current > 5_000;
+    if (phase === "running" && session && online && !held && remaining <= 0 && settled && proctoringRef.current.autoSubmitOnTimeout) void doSubmit();
   }, [phase, session, remaining, online, held, doSubmit]);
 
   // Persist answers/flags locally on every change while running, so a forced
