@@ -299,14 +299,27 @@ export async function sweepAutoSubmit() {
 /** Start the recurring auto-submit sweep (runs immediately, then on an interval). */
 export function startAutoSubmitSweep(intervalMs = 60_000) {
   if (autoSubmitTimer) return;
-  void sweepAutoSubmit();
-  autoSubmitTimer = setInterval(() => void sweepAutoSubmit(), intervalMs);
+  const tick = () => {
+    void sweepAutoSubmit();
+    // Also reconcile any attempts stuck at "submitted" (lost final flip, or
+    // still-ungraded answers) on the same cadence — not just at boot — so live
+    // batches self-heal as they finish instead of lingering until a restart.
+    void sweepPendingGrading();
+  };
+  tick();
+  autoSubmitTimer = setInterval(tick, intervalMs);
 }
 
 /**
- * Startup recovery: re-enqueue any "submitted" attempts that still have
- * ungraded subjective answers (e.g. server restarted mid-grading, or the AI
- * provider was rate-limited during a burst). Idempotent.
+ * Recovery sweep for "submitted" attempts that never reached "graded".
+ * Two failure modes are handled:
+ *  1. Still-ungraded subjective answers (restart mid-grading / provider
+ *     rate-limited during a burst) → re-enqueue for grading.
+ *  2. All answers ARE graded but the attempt's final status-flip write was lost
+ *     (e.g. a transient Turso hiccup during the submit burst hit the flip but
+ *     not the answer writes). The grading sweep would skip these forever since
+ *     they have no ungraded answers — so reconcile them straight to "graded"
+ *     here, recomputing the score from the answer rows. Idempotent.
  */
 export async function sweepPendingGrading() {
   try {
@@ -314,15 +327,25 @@ export async function sweepPendingGrading() {
     if (!subs.length) return;
     const provider = await getProvider();
     let queued = 0;
+    let reconciled = 0;
     for (const a of subs) {
       const ans = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, a.id));
       if (ans.some((x) => x.score == null && hasContent(x.response))) {
+        // Still has ungraded content → (re)grade it.
         queueAttemptGrading(a.id, provider);
         queued++;
+      } else {
+        // Nothing left to grade but the attempt is still "submitted" — the final
+        // flip was lost. Recompute the score and flip to "graded" directly.
+        const earned = ans.reduce((s, x) => s + (x.score ?? 0), 0);
+        const max = ans.reduce((s, x) => s + (x.maxScore ?? 0), 0);
+        const scorePct = max > 0 ? Math.round((earned / max) * 1000) / 10 : 0;
+        await db.update(schema.attempts).set({ status: "graded", score: scorePct }).where(eq(schema.attempts.id, a.id));
+        reconciled++;
       }
     }
-    if (queued) console.log(`[grade-queue] startup sweep re-queued ${queued} attempt(s) for grading`);
+    if (queued || reconciled) console.log(`[grade-queue] recovery sweep: re-queued ${queued}, reconciled-to-graded ${reconciled}`);
   } catch (e) {
-    console.error("[grade-queue] startup sweep failed:", e);
+    console.error("[grade-queue] recovery sweep failed:", e);
   }
 }
