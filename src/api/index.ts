@@ -1360,7 +1360,26 @@ const app = new Hono<{ Variables: Vars }>()
     // In "students" mode, the picked list IS the roster add-list. Reconcile the
     // exam's "add" overrides to exactly match the provided studentIds. Removing a
     // student also clears any attempt/answers/events so they aren't counted.
-    if (Array.isArray(b.studentIds)) {
+    //
+    // CRITICAL: this reconcile is DESTRUCTIVE (it purges add-rows + their attempts
+    // for anyone not in `studentIds`). It must ONLY run when the exam is actually
+    // in "students" assign mode. A cohort exam edited from the admin panel sends
+    // `studentIds: []` (the picker is hidden), and running the reconcile there
+    // would silently wipe every additive roster override AND their live answers.
+    // In cohort mode, roster add/remove is managed solely via the dedicated
+    // /roster endpoints — a PATCH must never touch it.
+    let effAssignMode: "students" | "cohort";
+    if (b.assignMode !== undefined) {
+      effAssignMode = b.assignMode === "students" ? "students" : "cohort";
+    } else {
+      const [exMode] = await db
+        .select({ assignMode: schema.exams.assignMode })
+        .from(schema.exams)
+        .where(eq(schema.exams.id, eid))
+        .limit(1);
+      effAssignMode = exMode?.assignMode === "students" ? "students" : "cohort";
+    }
+    if (effAssignMode === "students" && Array.isArray(b.studentIds)) {
       const p = c.get("profile")!;
       const want = new Set(b.studentIds.map((s: unknown) => String(s)).filter(Boolean) as string[]);
       const existing = await db.select().from(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.mode, "add")));

@@ -242,7 +242,11 @@ export function EditExam() {
           startAt,
           assignMode: scope === "students" ? "students" : "cohort",
           sectionIds: scope === "specific" ? sectionIds : [],
-          studentIds: scope === "students" ? studentIds : [],
+          // Only send the picked list in "students" scope. In cohort scope this
+          // must stay undefined — sending [] makes the server reconcile wipe every
+          // additive roster override (and their answers). Cohort roster is managed
+          // only via the Roster overrides panel.
+          studentIds: scope === "students" ? studentIds : undefined,
           questionIds: picked,
           status: startAt ? "scheduled" : "draft",
         },
