@@ -183,7 +183,16 @@ export async function finalizeAttempt(
   const qById = new Map(qs.map((q) => [q.id, q]));
   const pointsById = new Map(eqs.map((e) => [e.questionId, e.points]));
 
-  // Wipe any prior answers for idempotency, then insert fresh.
+  // Read any previously-saved answers BEFORE wiping. Per-answer autosave writes
+  // the student's work to this table as they go, so the server copy is the
+  // source of truth. A reopen/resume can trigger a re-submit whose client
+  // payload is empty or partial (local answers weren't reloaded) — blindly
+  // replacing would ERASE real work. We merge instead: the client response wins
+  // only when it has content, otherwise we fall back to what was already saved.
+  const prior = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, aid));
+  const priorRespByQ = new Map(prior.map((p) => [p.questionId, p.response]));
+
+  // Wipe any prior answers for idempotency, then insert the merged set fresh.
   await db.delete(schema.answers).where(eq(schema.answers.attemptId, aid));
 
   let earned = 0;
@@ -196,7 +205,12 @@ export async function finalizeAttempt(
     const maxScore = pointsById.get(eq2.questionId) ?? q.points ?? 1;
     max += maxScore;
     const given = respArr.find((r) => r.questionId === eq2.questionId);
-    const response = given?.response ?? null;
+    const clientResp = given?.response ?? null;
+    const priorResp = priorRespByQ.get(eq2.questionId) ?? null;
+    // Merge: keep the client's answer when it actually has content, else
+    // preserve the previously-saved answer so a blank/partial re-submit after a
+    // reopen never destroys autosaved work.
+    const response = hasContent(clientResp) ? clientResp : priorResp;
     let score: number | null = null;
     let autoGraded = false;
 
