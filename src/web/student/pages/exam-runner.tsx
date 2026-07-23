@@ -431,6 +431,9 @@ export function ExamRunner() {
   useEffect(() => {
     if (phase !== "done" || !result || !examId || gradeDone) return;
     let stop = false;
+    let polls = 0;
+    // Backstop so idle post-submit clients never poll forever (~16 min ceiling).
+    const MAX_POLLS = 40;
     const poll = async () => {
       try {
         const st = await api.status(examId);

@@ -122,9 +122,40 @@ export async function gradeAttempt(attemptId: string, providerArg?: string | nul
 
   const [att] = await db.select().from(schema.attempts).where(eq(schema.attempts.id, attemptId)).limit(1);
   // Never regress a re-opened / in-progress attempt.
-  if (att && (att.status === "submitted" || att.status === "graded")) {
-    await db.update(schema.attempts).set({ status: stillUngraded ? "submitted" : "graded", score: scorePct }).where(eq(schema.attempts.id, attemptId));
+  if (!att || (att.status !== "submitted" && att.status !== "graded")) return;
+
+  if (!stillUngraded) {
+    // Fully graded — flip to graded and clear retry bookkeeping.
+    retryCounts.delete(attemptId);
+    await db.update(schema.attempts).set({ status: "graded", score: scorePct }).where(eq(schema.attempts.id, attemptId));
+    return;
   }
+
+  // Some subjective answers are still ungraded (AI errored / rate-limited).
+  // Retry a bounded number of times with backoff instead of leaving the attempt
+  // stuck "submitted" forever — which makes every client poll /status
+  // indefinitely and the boot sweep re-queue it on every restart.
+  const tries = (retryCounts.get(attemptId) ?? 0) + 1;
+  if (tries < MAX_GRADE_RETRIES) {
+    retryCounts.set(attemptId, tries);
+    await db.update(schema.attempts).set({ score: scorePct }).where(eq(schema.attempts.id, attemptId));
+    const delay = Math.min(120_000, 20_000 * tries);
+    setTimeout(() => queueAttemptGrading(attemptId, provider), delay);
+    return;
+  }
+
+  // Give up: mark the answers we could never grade as 0 (best-effort) with a
+  // note for manual review, then flip the attempt to a terminal "graded" state
+  // so clients stop polling and the boot sweep stops re-queueing it.
+  retryCounts.delete(attemptId);
+  const ungraded = finalAnswers.filter((a) => a.score == null && hasContent(a.response));
+  for (const a of ungraded) {
+    await db.update(schema.answers)
+      .set({ score: 0, autoGraded: true, aiNotes: "Auto-grading failed after retries; needs manual review." })
+      .where(eq(schema.answers.id, a.id));
+  }
+  console.error(`[grade-queue] attempt ${attemptId}: gave up grading ${ungraded.length} answer(s) after ${tries} tries; marking graded (manual review needed).`);
+  await db.update(schema.attempts).set({ status: "graded", score: scorePct }).where(eq(schema.attempts.id, attemptId));
 }
 
 /**
