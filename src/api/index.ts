@@ -1948,19 +1948,22 @@ const app = new Hono<{ Variables: Vars }>()
         const engaged = atts.filter((a) => a.status !== "not_started");
         // Proctoring evidence per attempt: violation count + newest snapshot key.
         const engagedIds = engaged.map((a) => a.id);
-        const evRows: { attemptId: string; photoUrl: string | null; at: Date }[] = [];
+        const evRows: { attemptId: string; type: string; photoUrl: string | null; at: Date }[] = [];
         for (let i = 0; i < engagedIds.length; i += 100) {
           const chunk = engagedIds.slice(i, i + 100);
           const part = await db
-            .select({ attemptId: schema.integrityEvents.attemptId, photoUrl: schema.integrityEvents.photoUrl, at: schema.integrityEvents.at })
+            .select({ attemptId: schema.integrityEvents.attemptId, type: schema.integrityEvents.type, photoUrl: schema.integrityEvents.photoUrl, at: schema.integrityEvents.at })
             .from(schema.integrityEvents)
             .where(inArray(schema.integrityEvents.attemptId, chunk));
           evRows.push(...part);
         }
+        // Timed frames (`periodic_snapshot`) are evidence, NOT misconduct: they must
+        // never inflate the violation count, but they DO make the best live
+        // thumbnail — so they still feed `lastKey`.
         const evAgg = new Map<string, { count: number; lastKey: string | null; lastAt: number }>();
         for (const ev of evRows) {
           const cur = evAgg.get(ev.attemptId) ?? { count: 0, lastKey: null, lastAt: 0 };
-          cur.count += 1;
+          if (ev.type !== "periodic_snapshot") cur.count += 1;
           const ms = new Date(ev.at).getTime();
           if (ev.photoUrl && ms >= cur.lastAt) { cur.lastKey = ev.photoUrl; cur.lastAt = ms; }
           evAgg.set(ev.attemptId, cur);
@@ -2320,19 +2323,28 @@ const app = new Hono<{ Variables: Vars }>()
     const evRows = await db.select().from(schema.integrityEvents)
       .where(eq(schema.integrityEvents.attemptId, aid))
       .orderBy(desc(schema.integrityEvents.at));
+    // Two separate streams for the reviewer: `integrity` is misconduct (what needs a
+    // decision), `snapshots` is the routine timed camera trail (what proves the
+    // student sat there alone). Mixing them buries the real flags in noise.
+    const sign = async (ev: typeof evRows[number]) => {
+      let photo: string | null = null;
+      if (ev.photoUrl) { try { photo = await presignGet(ev.photoUrl); } catch { photo = null; } }
+      return { id: ev.id, type: ev.type, detail: ev.detail, at: ev.at, photo };
+    };
     const integrity = await Promise.all(
-      evRows.slice(0, 300).map(async (ev) => {
-        let photo: string | null = null;
-        if (ev.photoUrl) { try { photo = await presignGet(ev.photoUrl); } catch { photo = null; } }
-        return { id: ev.id, type: ev.type, detail: ev.detail, at: ev.at, photo };
-      }),
+      evRows.filter((ev) => ev.type !== "periodic_snapshot").slice(0, 300).map(sign),
     );
+    // Newest first, capped — a 3h attempt at one frame per 100s is ~110 frames.
+    const snapshots = (await Promise.all(
+      evRows.filter((ev) => ev.type === "periodic_snapshot" && ev.photoUrl).slice(0, 300).map(sign),
+    )).filter((s) => s.photo);
     return c.json({
       exam: { id: ex.id, title: ex.title },
       student: { name: stu?.name ?? "—", rollNo: stu?.rollNo ?? "", email: stu?.email ?? null },
       attempt: { score: att.score, status: att.status, submittedAt: att.submittedAt, startedAt: att.startedAt },
       answers,
       integrity,
+      snapshots,
     }, 200);
   })
 

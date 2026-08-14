@@ -158,6 +158,8 @@ export function ExamRunner() {
   const lastEventAtRef = useRef<Record<string, number>>({});
   const lockLeftRef = useRef(0);
   lockLeftRef.current = lockLeft;
+  const lockedRef = useRef(false);
+  lockedRef.current = locked;
 
   const attachVideo = useCallback((handle: WebcamHandle) => {
     if (videoRef.current) {
@@ -186,9 +188,8 @@ export function ExamRunner() {
 
   // Capture a webcam frame for the violation that just happened and upload it
   // straight to object storage. Returns the storage key, or null when snapshots
-  // are off / the camera can't produce a frame / the upload fails. Snapshots are
-  // taken ONLY on violations (never on a timer), so an exam stores a handful of
-  // images instead of thousands.
+  // are off / the camera can't produce a frame / the upload fails. Used both for
+  // violation evidence and for the timed frames below.
   const grabSnapshotKey = useCallback(async (): Promise<string | null> => {
     const s = sessionRef.current;
     if (!s?.attemptId || !navigator.onLine) return null;
@@ -240,6 +241,24 @@ export function ExamRunner() {
   }, [grabSnapshotKey]);
   const recordEventRef = useRef(recordEvent);
   recordEventRef.current = recordEvent;
+
+  // Capture one TIMED webcam frame and queue it as evidence.
+  //
+  // Deliberately does NOT touch session state: violation events ride along in the
+  // submit payload as a backstop, but timed frames would bloat that payload for no
+  // benefit — they are already durable on the server the moment they flush. Typed
+  // `periodic_snapshot` so it never counts as a violation in the admin UI.
+  const capturePeriodic = useCallback(async () => {
+    if (submittedRef.current) return;
+    const s = sessionRef.current;
+    if (!s?.attemptId) return;
+    const photoKey = await grabSnapshotKey();
+    if (!photoKey) return;
+    pendingEventsRef.current.push({ type: "periodic_snapshot", detail: "Timed webcam frame", at: Date.now(), photoKey });
+    flushEventsRef.current();
+  }, [grabSnapshotKey]);
+  const capturePeriodicRef = useRef(capturePeriodic);
+  capturePeriodicRef.current = capturePeriodic;
 
   // ---- Load bundle for the brief (title/meta + question data) ----
   // Offline-first: hydrate immediately from the local cache (so a refresh works
@@ -668,6 +687,49 @@ export function ExamRunner() {
     if (phase !== "running") return;
     const t = setInterval(() => flushEventsRef.current(), 10_000);
     return () => clearInterval(t);
+  }, [phase]);
+
+  // ---- Periodic webcam snapshots while running ----
+  // A candidate sitting still with a phone in their lap trips NO violation, so
+  // violation-only capture would leave an empty record for exactly the case an
+  // admin most wants to review. These timed frames give a reviewable trail of what
+  // the camera saw across the whole attempt.
+  //
+  // Load SHAPE matters more than volume here. Images go straight from the browser
+  // to object storage (the API only signs a URL — it never handles image bytes), so
+  // the risk isn't server CPU, it's 150 clients uploading on the same wall-clock
+  // tick and saturating home uplinks at once. Each client therefore jitters its own
+  // period by +/-25% and delays its FIRST capture by a random slice of one full
+  // interval, so uploads spread out instead of spiking. A failed capture is skipped
+  // silently and retried on the next tick — never in a tight loop, and never
+  // allowed to interrupt the exam.
+  useEffect(() => {
+    if (phase !== "running") return;
+    const cfg = proctoringRef.current;
+    if (!cfg.webcamSnapshots || !cfg.requireWebcam) return;
+    // Floor the interval so a mistyped setting can't turn into an upload storm.
+    const baseMs = Math.max(45, cfg.snapshotIntervalSec || 100) * 1000;
+    const nextDelay = () => baseMs * (0.75 + Math.random() * 0.5);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let stopped = false;
+
+    const tick = async () => {
+      if (stopped) return;
+      // Skip (don't stop) while the exam is locked, offline, or the camera is down
+      // — the next tick tries again once conditions recover.
+      const ready =
+        !submittedRef.current &&
+        !lockedRef.current &&
+        navigator.onLine &&
+        isCameraActive(webcamRef.current);
+      if (ready) {
+        try { await capturePeriodicRef.current(); } catch { /* never break the exam */ }
+      }
+      if (!stopped) timer = setTimeout(tick, nextDelay());
+    };
+
+    timer = setTimeout(tick, Math.random() * baseMs);
+    return () => { stopped = true; if (timer) clearTimeout(timer); };
   }, [phase]);
 
   // ---- Webcam lifecycle while running ----

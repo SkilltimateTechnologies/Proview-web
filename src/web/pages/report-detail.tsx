@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, type CSSProperties } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, Link } from "wouter";
-import { ArrowLeft, Download, ChevronRight, Check, X, Sparkles, Lightbulb, MoreVertical, UserX, Trash2, FileText, FileSpreadsheet, Files, ChevronDown, Loader2, ShieldAlert, VideoOff, MonitorX, Maximize, Copy, EyeOff } from "lucide-react";
+import { ArrowLeft, Download, ChevronRight, Check, X, Sparkles, Lightbulb, MoreVertical, UserX, Trash2, FileText, FileSpreadsheet, Files, ChevronDown, Loader2, ShieldAlert, VideoOff, MonitorX, Maximize, Copy, EyeOff, Camera } from "lucide-react";
 import JSZip from "jszip";
 import { api } from "../lib/api";
 import { useSession } from "../lib/session";
@@ -692,6 +692,51 @@ function IntegrityPanel({ events }: { events: IntegrityRow[] }) {
   );
 }
 
+/** Timed webcam frames captured throughout the attempt (not tied to any
+ *  violation). These are the trail that shows who was actually sitting there —
+ *  a quiet candidate reading answers off a phone leaves no violation, but they
+ *  do show up here. Newest first; collapsed to one row until expanded, because a
+ *  3h attempt produces ~100 frames. */
+function SnapshotGallery({ shots }: { shots: IntegrityRow[] }) {
+  const [open, setOpen] = useState(false);
+  if (shots.length === 0) return null;
+  const shown = open ? shots : shots.slice(0, 8);
+  return (
+    <div className="mb-6">
+      <div className="flex items-center justify-between mb-2">
+        <div className="mono-label">Webcam timeline ({shots.length} frames)</div>
+        {shots.length > 8 && (
+          <button className="btn btn-ghost text-xs px-2 py-1" onClick={() => setOpen((v) => !v)}>
+            {open ? "Show less" : `Show all ${shots.length}`}
+            <ChevronDown size={13} style={{ transform: open ? "rotate(180deg)" : undefined, transition: "transform .15s" }} />
+          </button>
+        )}
+      </div>
+      <div className="card p-3">
+        <div className="grid grid-cols-4 sm:grid-cols-6 gap-2">
+          {shown.map((s) => (
+            <a key={s.id} href={s.photo ?? undefined} target="_blank" rel="noreferrer" title={fmtEventTime(s.at)} className="block">
+              <img
+                src={s.photo ?? undefined}
+                alt={`Webcam frame ${fmtEventTime(s.at)}`}
+                loading="lazy"
+                className="w-full aspect-[4/3] rounded-lg object-cover border border-[var(--color-line)]"
+                style={{ transform: "scaleX(-1)" }}
+              />
+              <div className="mono-label mt-1 text-center" style={{ fontSize: "0.6rem" }}>
+                {new Date(s.at ?? 0).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" })}
+              </div>
+            </a>
+          ))}
+        </div>
+        <div className="flex items-center gap-1.5 mt-2 text-[var(--color-ink2)]" style={{ fontSize: "0.7rem" }}>
+          <Camera size={12} /> Captured automatically at intervals — not violations.
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AttemptDrawer({ examId, row, brand, examTitle, totalQuestions, onClose }: { examId: string; row: Row; brand: Brand; examTitle: string; totalQuestions?: number; onClose: () => void }) {
   const [dl, setDl] = useState(false);
   const q = useQuery({
@@ -749,6 +794,7 @@ function AttemptDrawer({ examId, row, brand, examTitle, totalQuestions, onClose 
       ) : (
         <>
           <IntegrityPanel events={(d.integrity ?? []) as IntegrityRow[]} />
+          <SnapshotGallery shots={((d as { snapshots?: unknown }).snapshots ?? []) as IntegrityRow[]} />
           <div className="mono-label mb-2">Answer breakdown ({answers.length})</div>
           {answers.length === 0 ? (
             <div className="card p-4 text-sm text-[var(--color-ink2)] mb-6">No stored answers for this attempt.</div>
