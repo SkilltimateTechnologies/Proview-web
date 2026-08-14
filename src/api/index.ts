@@ -142,17 +142,52 @@ const app = new Hono<{ Variables: Vars }>()
     return c.json({ url, key, publicUrl: `/api/files/${key}` }, 200);
   })
 
-  // ---- public file proxy (streams object from S3; no auth needed to view) ----
-  .get("/files/*", async (c) => {
+  // ---- authenticated file proxy (streams object from S3) ----
+  // Deliberately NOT public. Objects under `integrity/` are student webcam
+  // photos, so an unauthenticated reader holding (or guessing) a key could pull
+  // faces straight out of the bucket. Every read requires a signed-in staff
+  // session; snapshot keys additionally require the `reports` permission and are
+  // scoped to the caller's own college, so a TPO cannot read another college's
+  // evidence by key alone.
+  .get("/files/*", requireAuth, async (c) => {
     const key = c.req.path.replace(/^\/api\/files\//, "");
     if (!key) return c.text("Not found", 404);
+    // Reject traversal / absolute keys before they reach storage.
+    if (key.includes("..") || key.startsWith("/")) return c.text("Not found", 404);
+
+    if (key.startsWith("integrity/")) {
+      const profile = c.get("profile");
+      if (!profile) return c.json({ message: "Unauthorized" }, 401);
+      const staff =
+        profile.role === "super_admin" ||
+        profile.role === "college_admin" ||
+        (profile.role === "tpo" && profile.permissions?.reports === true);
+      if (!staff) return c.json({ message: "Forbidden" }, 403);
+      // Keys are written as `integrity/<attemptId>/<file>`; confirm the attempt
+      // belongs to this college before streaming the frame.
+      if (profile.role !== "super_admin") {
+        const attemptId = key.split("/")[1] ?? "";
+        if (!attemptId) return c.text("Not found", 404);
+        const [own] = await db
+          .select({ tenantId: schema.exams.tenantId })
+          .from(schema.attempts)
+          .innerJoin(schema.exams, eq(schema.attempts.examId, schema.exams.id))
+          .where(eq(schema.attempts.id, attemptId))
+          .limit(1);
+        if (!own || own.tenantId !== profile.tenantId) return c.json({ message: "Forbidden" }, 403);
+      }
+    }
+
     try {
       const out = await getObject(key);
       if (!out.Body) return c.text("Not found", 404);
       const buf = await out.Body.transformToByteArray();
       return c.body(buf, 200, {
         "Content-Type": out.ContentType ?? "application/octet-stream",
-        "Cache-Control": "public, max-age=31536000, immutable",
+        // `private`: the response is authorised per-session, so shared/proxy
+        // caches must never hold a copy. Browser caching is still fine —
+        // object keys are content-addressed and never rewritten.
+        "Cache-Control": "private, max-age=31536000, immutable",
       });
     } catch {
       return c.text("Not found", 404);

@@ -3,7 +3,8 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, Link } from "wouter";
 import { ArrowLeft, Download, ChevronRight, Check, X, Sparkles, Lightbulb, MoreVertical, UserX, Trash2, FileText, FileSpreadsheet, Files, ChevronDown, Loader2, ShieldAlert, VideoOff, MonitorX, Maximize, Copy, EyeOff, Camera } from "lucide-react";
 import JSZip from "jszip";
-import { api } from "../lib/api";
+import { api, getScope } from "../lib/api";
+import { getBearer } from "../lib/auth";
 import { useSession } from "../lib/session";
 import { PageHeader } from "../components/shell";
 import { Loader, Pill, Drawer, usePagination, Pager } from "../components/ui";
@@ -752,10 +753,17 @@ function SnapshotsPanel({ shots, label }: { shots: IntegrityRow[]; label: string
         const s = asc[i];
         // Prefer the same-origin proxy: a fetch() straight at the presigned
         // Tigris URL is a cross-origin read and gets blocked without a bucket
-        // CORS policy.
+        // CORS policy. The proxy is session-authorised, so it needs the same
+        // bearer token and college scope the API client sends — a bare fetch()
+        // would come back 401.
         const url = s.proxy ?? s.photo;
         if (!url) continue;
-        const res = await fetch(url);
+        const token = getBearer();
+        const scope = getScope();
+        const headers: Record<string, string> = {};
+        if (s.proxy && token) headers.Authorization = `Bearer ${token}`;
+        if (s.proxy && scope) headers["X-Tenant-Id"] = scope;
+        const res = await fetch(url, { headers });
         if (!res.ok) throw new Error(`frame ${i + 1} returned ${res.status}`);
         const name = `${String(i + 1).padStart(3, "0")}_${fmtStamp(s.at)}.jpg`;
         zip.file(name, await res.arrayBuffer());
