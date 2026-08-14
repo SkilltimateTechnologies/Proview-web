@@ -61,6 +61,16 @@ export const REQUIRED_UNIQUE_INDEXES: IndexSpec[] = [
     columns: ["exam_id", "student_id"],
     guards: "duplicate attempts splitting one student's work and breaking Live Monitor",
   },
+  {
+    // Expression columns, not plain ones: roll numbers arrived from CSV imports and
+    // a public registration page with inconsistent case and padding, so "23k91a0491"
+    // and " 23K91A0491 " must collide with "23K91A0491". SQLite indexes expressions
+    // fine, and the GROUP BY duplicate check below uses the same expressions.
+    name: "students_tenant_roll_uq",
+    table: "students",
+    columns: ["tenant_id", "upper(trim(roll_no))"],
+    guards: "duplicate student records splitting one student's results across two rows",
+  },
 ];
 
 export type IndexState = {
@@ -79,11 +89,33 @@ export const INDEX_STATE: IndexState = {
   failed: [],
 };
 
-async function indexExists(name: string): Promise<boolean> {
-  const rows = await db.all<{ name: string }>(
-    sql`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ${name}`,
+/** The stored CREATE INDEX statement, or null when the index does not exist. */
+async function indexDefinition(name: string): Promise<string | null> {
+  const rows = await db.all<{ sql: string | null }>(
+    sql`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ${name}`,
   );
-  return rows.length > 0;
+  if (!rows.length) return null;
+  return rows[0]?.sql ?? "";
+}
+
+/** Strip quoting/whitespace so two spellings of the same index compare equal. */
+function normalizeSql(s: string): string {
+  return s.replace(/[`"\[\]]/g, "").replace(/\s+/g, "").toLowerCase();
+}
+
+/**
+ * True when an existing index actually enforces what the spec requires.
+ *
+ * Name equality is NOT enough. `schema.ts` can only declare the plain-column
+ * approximation of an expression index, so a database created with `db:push`
+ * comes up with `students_tenant_roll_uq ON students(tenant_id, roll_no)` — the
+ * right NAME wrapping a WEAKER guarantee, which would let "23k91a0491" and
+ * " 23K91A0491 " both insert. Compare the definition, not the name.
+ */
+function definitionSatisfies(spec: IndexSpec, definition: string): boolean {
+  const norm = normalizeSql(definition);
+  if (!/createuniqueindex/.test(norm)) return false;
+  return spec.columns.every((col) => norm.includes(normalizeSql(col)));
 }
 
 /** Count logical keys that already have more than one row. */
@@ -112,14 +144,16 @@ export async function ensureDatabaseInvariants(): Promise<IndexState> {
 
   for (const spec of REQUIRED_UNIQUE_INDEXES) {
     try {
-      if (await indexExists(spec.name)) {
+      const existing = await indexDefinition(spec.name);
+      if (existing !== null && definitionSatisfies(spec, existing)) {
         INDEX_STATE.present.push(spec.name);
         continue;
       }
 
-      // Missing. Creating a UNIQUE index fails if duplicates already exist, so
-      // report the exact blast radius rather than a bare SQLite error — whoever
-      // reads this needs to know a dedupe has to run first.
+      // Missing — or present but enforcing less than it should (see
+      // definitionSatisfies). Creating a UNIQUE index fails if duplicates already
+      // exist, so report the exact blast radius rather than a bare SQLite error —
+      // whoever reads this needs to know a dedupe has to run first.
       const dupes = await countDuplicateGroups(spec);
       if (dupes > 0) {
         const msg =
@@ -130,12 +164,24 @@ export async function ensureDatabaseInvariants(): Promise<IndexState> {
         continue;
       }
 
+      // A same-named but weaker index has to go first: CREATE ... IF NOT EXISTS
+      // would otherwise see the name, do nothing, and leave the gap open. Dropping
+      // is safe — an index carries no data, and the duplicate check above already
+      // proved the stricter version can be built.
+      if (existing !== null) {
+        console.warn(
+          `[invariants] ${spec.name} exists but does not enforce ` +
+            `${spec.table}(${spec.columns.join(", ")}) — replacing it. Found: ${existing}`,
+        );
+        await db.run(sql`DROP INDEX IF EXISTS ${sql.raw(spec.name)}`);
+      }
+
       await db.run(
         sql`CREATE UNIQUE INDEX IF NOT EXISTS ${sql.raw(spec.name)} ON ${sql.raw(spec.table)} (${sql.raw(spec.columns.join(", "))})`,
       );
       console.warn(
-        `[invariants] created missing unique index ${spec.name} on ${spec.table}(${spec.columns.join(", ")}) ` +
-          `— guards against ${spec.guards}`,
+        `[invariants] ${existing === null ? "created missing" : "replaced weaker"} unique index ${spec.name} ` +
+          `on ${spec.table}(${spec.columns.join(", ")}) — guards against ${spec.guards}`,
       );
       INDEX_STATE.created.push(spec.name);
     } catch (e) {

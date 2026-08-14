@@ -11,8 +11,9 @@ import type { SessionUser, ProfileCtx } from "./middleware/auth";
 import { id, displayId, computeYear, effectiveEndMs } from "./lib/util";
 import { generateQuestions, gradeSubjective } from "./lib/ai";
 import { finalizeAttempt, hasContent } from "./lib/grade-queue";
-import { presignPut, presignGet, getObject } from "./lib/s3";
+import { presignPut, presignGet, presignGetCached, getObject } from "./lib/s3";
 import { signStudentToken, verifyStudentToken } from "./lib/student-token";
+import { normalizeRoll, rollNoProblem, isDuplicateRollError } from "./lib/students";
 import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
 import { isEligible, matchesCohort, loadRoster, loadRosters, ensureOptInOnlyLoaded, invalidateOptInOnlyCache, isOptInOnlyCode } from "./lib/roster";
 
@@ -111,6 +112,246 @@ async function persistIntegrityEvents(attemptId: string, raw: unknown): Promise<
   return rows.length;
 }
 
+/** Find a student in a tenant by roll number, ignoring case and padding. */
+async function findStudentByRoll(tid: string, roll: string) {
+  const [row] = await db
+    .select({ id: schema.students.id, rollNo: schema.students.rollNo, name: schema.students.name })
+    .from(schema.students)
+    .where(and(eq(schema.students.tenantId, tid), dsql`upper(trim(${schema.students.rollNo})) = ${roll}`))
+    .limit(1);
+  return row ?? null;
+}
+
+/**
+ * Live Monitor payload, built once per tenant and shared between callers.
+ *
+ * Extracted from the route handler so the result can be cached and so concurrent
+ * invigilators coalesce onto a single build. See getMonitorSnapshot below.
+ */
+async function buildMonitorSnapshot(tid: string) {
+  const now = Date.now();
+  // An exam is effectively live when its DB status is "live", OR when it is
+  // still "scheduled" but its start time has already passed (students can start
+  // it at that point). This mirrors the "LIVE / In progress" badge on the
+  // Schedule Assessment list, which is derived the same way. Without this, a
+  // scheduled exam whose start time passed would show as live on the list but
+  // never appear in the Live Monitor.
+  const startMs = (e: { startAt: Date | number | string | null }) => {
+    if (e.startAt == null) return null;
+    const ms = typeof e.startAt === "number" ? e.startAt : new Date(e.startAt).getTime();
+    return Number.isNaN(ms) ? null : ms;
+  };
+  const dbLive = await db.select().from(schema.exams).where(and(eq(schema.exams.tenantId, tid), eq(schema.exams.status, "live")));
+  const scheduled = await db
+    .select()
+    .from(schema.exams)
+    .where(and(eq(schema.exams.tenantId, tid), eq(schema.exams.status, "scheduled")))
+    .orderBy(schema.exams.startAt);
+  const startedScheduled = scheduled.filter((e) => {
+    const ms = startMs(e);
+    return ms !== null && now >= ms;
+  });
+  // An exam is OVER once its window (endAt + any admin extra time + total hold
+  // time) has fully elapsed. A currently-held exam is paused, not over. Over
+  // exams must drop off the Live Monitor entirely — there is nothing live.
+  const isOver = (e: { endAt: number | string | Date | null; extraMin?: number | null; holdMs?: number | null; heldAt?: number | string | Date | null }) => {
+    if (e.heldAt) return false;
+    if (e.endAt == null) return false;
+    const end = e.endAt instanceof Date ? e.endAt.getTime() : typeof e.endAt === "number" ? e.endAt : new Date(e.endAt).getTime();
+    if (Number.isNaN(end)) return false;
+    const extra = (e.extraMin ?? 0) * 60_000 + (e.holdMs ?? 0);
+    return now > end + extra;
+  };
+  const liveExams = [...dbLive, ...startedScheduled].filter((e) => !isOver(e));
+
+  // Next scheduled exam (for empty-state messaging when nothing is live).
+  let nextScheduled: { examId: string; title: string; startAt: number | null } | null = null;
+  if (!liveExams.length) {
+    const upcoming = scheduled
+      .filter((e) => {
+        const ms = startMs(e);
+        return ms !== null && ms >= now;
+      })
+      .sort((a, b) => startMs(a)! - startMs(b)!)[0];
+    if (upcoming) nextScheduled = { examId: upcoming.id, title: upcoming.title, startAt: startMs(upcoming) };
+  }
+
+  // Every student in the tenant, INCLUDING disabled ones — one query, used for
+  // two purposes:
+  //   * `studentById` resolves an attempt's student name/roll. It must include
+  //     disabled students because someone can be disabled mid-term while their
+  //     attempt still exists. Resolving from this map instead of querying per
+  //     attempt turns ~1200 round trips into one.
+  //   * `allStudents` (enabled only) is the assignable cohort, used to work out
+  //     who has not started yet.
+  // These used to be two separate full-table reads of the same ~1200 rows on
+  // every 5s poll; one read plus an in-memory filter is equivalent and halves
+  // the cost.
+  const tenantStudents = await db.select().from(schema.students).where(eq(schema.students.tenantId, tid));
+  const studentById = new Map(tenantStudents.map((s) => [s.id, s]));
+  const allStudents = tenantStudents.filter((s) => s.enabled);
+  // Resolve a student's classId to a readable section code (e.g. "CSE-C").
+  const allClasses = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, tid));
+  const classCodeById = new Map(allClasses.map((cl) => [cl.id, cl.code]));
+  const sectionOf = (classId: string | null) => (classId ? classCodeById.get(classId) ?? "" : "");
+  const liveRosters = await loadRosters(liveExams.map((e) => e.id));
+  const assignedStudents = (e: { id: string; classId: string | null; sectionIds: string[] | null }) =>
+    allStudents.filter((stu) => isEligible(e, stu, liveRosters.get(e.id)));
+
+  const out = await Promise.all(
+    liveExams.map(async (ex) => {
+      const atts = await db.select().from(schema.attempts).where(eq(schema.attempts.examId, ex.id));
+      // Everyone who has engaged with the exam (in progress or already submitted/graded).
+      const engaged = atts.filter((a) => a.status !== "not_started");
+      // Proctoring evidence per attempt: violation count + newest snapshot key.
+      //
+      // PERFORMANCE — this is what used to hang the Live Monitor.
+      // The old code SELECTed every integrity_events row for every engaged
+      // attempt and aggregated in JS. On "Elite Assessment – 1" that is 27,153
+      // rows (~1.7 MB of photo keys alone) pulled over the network EVERY 5s
+      // poll, doubled because two exams were live at once. A poll took longer
+      // than the poll interval, so requests piled up and the page froze.
+      //
+      // The database can do both aggregations itself and return ONE row per
+      // attempt (a few hundred, not tens of thousands). Filtering by exam_id via
+      // a join also removes the chunked 100-id IN lists entirely.
+      //
+      // Timed frames are evidence, NOT misconduct: they must never inflate the
+      // violation count, but they DO make the best live thumbnail — so they are
+      // excluded from the count while still feeding `lastKey`.
+      const nonViolationList = dsql.join([...NON_VIOLATION_TYPES].map((t) => dsql`${t}`), dsql`, `);
+      const countRows = await db.all<{ attemptId: string; violations: number }>(dsql`
+        SELECT ie.attempt_id AS attemptId, COUNT(*) AS violations
+        FROM integrity_events ie
+        JOIN attempts a ON a.id = ie.attempt_id
+        WHERE a.exam_id = ${ex.id}
+          AND a.status <> 'not_started'
+          AND ie.type NOT IN (${nonViolationList})
+        GROUP BY ie.attempt_id
+      `);
+      // Newest snapshot per attempt. ROW_NUMBER() picks one winner per attempt
+      // inside SQLite, so only ~N rows cross the wire instead of ~N x 100.
+      const photoRows = await db.all<{ attemptId: string; photoUrl: string | null }>(dsql`
+        SELECT attemptId, photoUrl FROM (
+          SELECT ie.attempt_id AS attemptId,
+                 ie.photo_url  AS photoUrl,
+                 ROW_NUMBER() OVER (PARTITION BY ie.attempt_id ORDER BY ie.at DESC, ie.rowid DESC) AS rn
+          FROM integrity_events ie
+          JOIN attempts a ON a.id = ie.attempt_id
+          WHERE a.exam_id = ${ex.id}
+            AND a.status <> 'not_started'
+            AND ie.photo_url IS NOT NULL
+            AND ie.photo_url <> ''
+        ) WHERE rn = 1
+      `);
+      const evAgg = new Map<string, { count: number; lastKey: string | null }>();
+      for (const r of countRows) evAgg.set(r.attemptId, { count: Number(r.violations) || 0, lastKey: null });
+      for (const r of photoRows) {
+        const cur = evAgg.get(r.attemptId) ?? { count: 0, lastKey: null };
+        cur.lastKey = r.photoUrl;
+        evAgg.set(r.attemptId, cur);
+      }
+      const enriched = await Promise.all(
+        engaged.map(async (a) => {
+          const stu = studentById.get(a.studentId);
+          const status = a.status === "in_progress" ? "in_progress" : "finished";
+          // Online = a heartbeat within the last 40s (heartbeat interval is ~15s).
+          const online = a.status === "in_progress" && !!a.lastSeenAt && now - new Date(a.lastSeenAt).getTime() < 40_000;
+          // Latest violation snapshot, as a short-lived presigned URL.
+          const agg = evAgg.get(a.id);
+          let snapshot: string | null = null;
+          if (agg?.lastKey) {
+            // Cached: the same key is re-signed on every 5s poll otherwise, and
+            // the URL is valid for 24h regardless.
+            try { snapshot = await presignGetCached(agg.lastKey); } catch { snapshot = null; }
+          }
+          return {
+            attemptId: a.id,
+            examId: ex.id,
+            student: stu?.name ?? "—",
+            rollNo: stu?.rollNo ?? "",
+            section: sectionOf(stu?.classId ?? null),
+            status,
+            online,
+            lastSeenAt: a.lastSeenAt,
+            startedAt: a.startedAt,
+            submittedAt: a.submittedAt,
+            score: a.status === "graded" ? a.score : null,
+            graded: a.status === "graded",
+            snapshot,
+            violations: agg?.count ?? 0,
+          };
+        }),
+      );
+      // Assigned students who have not started. If the exam window has closed
+      // (now > endAt) they never showed up → "absent"; otherwise they can still
+      // begin → "not_started".
+      const endMs = ex.endAt ? new Date(ex.endAt).getTime() : null;
+      const windowClosed = endMs !== null && !Number.isNaN(endMs) && now > endMs;
+      const engagedStudentIds = new Set(engaged.map((a) => a.studentId));
+      const notStarted = assignedStudents(ex)
+        .filter((stu) => !engagedStudentIds.has(stu.id))
+        .map((stu) => ({
+          attemptId: `ns-${stu.id}`,
+          examId: ex.id,
+          student: stu.name ?? "—",
+          rollNo: stu.rollNo ?? "",
+          section: sectionOf(stu.classId ?? null),
+          status: (windowClosed ? "absent" : "not_started") as "absent" | "not_started",
+          online: false,
+          lastSeenAt: null as string | null,
+          startedAt: null as string | null,
+          submittedAt: null as string | null,
+          snapshot: null as string | null,
+          violations: 0,
+        }));
+      const absentCount = windowClosed ? notStarted.length : 0;
+      return {
+        examId: ex.id,
+        title: ex.title,
+        held: !!ex.heldAt,
+        heldAt: ex.heldAt,
+        extraMin: ex.extraMin ?? 0,
+        active: engaged.filter((a) => a.status === "in_progress").length,
+        online: enriched.filter((s) => s.online).length,
+        submitted: engaged.filter((a) => a.status !== "in_progress").length,
+        notStarted: windowClosed ? 0 : notStarted.length,
+        absent: absentCount,
+        students: [...enriched, ...notStarted],
+      };
+    }),
+  );
+  return { live: out, nextScheduled };
+}
+
+/** How long a built snapshot may be reused. Well under the 5s client poll. */
+const MONITOR_CACHE_MS = 3000;
+type MonitorSnapshot = Awaited<ReturnType<typeof buildMonitorSnapshot>>;
+const monitorCache = new Map<string, { at: number; data: MonitorSnapshot }>();
+const monitorInFlight = new Map<string, Promise<MonitorSnapshot>>();
+
+async function getMonitorSnapshot(tid: string): Promise<MonitorSnapshot> {
+  const cached = monitorCache.get(tid);
+  if (cached && Date.now() - cached.at < MONITOR_CACHE_MS) return cached.data;
+
+  // A build is already running for this tenant: join it instead of starting a
+  // second identical one. Without this, five open monitor tabs meant five
+  // concurrent full scans of attempts + integrity_events every 5 seconds.
+  const running = monitorInFlight.get(tid);
+  if (running) return running;
+
+  const task = buildMonitorSnapshot(tid)
+    .then((data) => {
+      monitorCache.set(tid, { at: Date.now(), data });
+      return data;
+    })
+    .finally(() => {
+      monitorInFlight.delete(tid);
+    });
+  monitorInFlight.set(tid, task);
+  return task;
+}
+
 const app = new Hono<{ Variables: Vars }>()
   .use(cors({ origin: (origin) => origin ?? "*", credentials: true, exposeHeaders: ["set-auth-token"] }))
   .on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw))
@@ -155,8 +396,38 @@ const app = new Hono<{ Variables: Vars }>()
            WHERE a.status IN ('graded','submitted')
              AND (SELECT COALESCE(SUM(COALESCE(x.max_score,0)),0) FROM answers x WHERE x.attempt_id = a.id) <> e.total_points`,
     ))[0]?.c ?? 0);
+    // HEURISTIC (informational, does not affect `ok`): the same person entered twice
+    // under two different roll numbers. The unique index cannot catch this — the roll
+    // numbers genuinely differ, usually by one mistyped character — so the only signal
+    // is an identical name inside the same section. Surfaced so a TPO can review and
+    // merge instead of finding out when a student appears twice in a report.
+    const suspects = await db.all<{ classId: string; name: string; rolls: string; n: number }>(dsql`
+      SELECT class_id AS classId, lower(trim(name)) AS name,
+             group_concat(roll_no) AS rolls, COUNT(*) AS n
+      FROM students
+      GROUP BY tenant_id, class_id, lower(trim(name))
+      HAVING COUNT(*) > 1
+      ORDER BY n DESC
+      LIMIT 50
+    `);
+    // Roll numbers that cannot be right — a pasted email is the usual culprit.
+    const malformedRolls = await db.all<{ id: string; rollNo: string; name: string }>(dsql`
+      SELECT id, roll_no AS rollNo, name FROM students
+      WHERE roll_no LIKE '%@%'
+         OR roll_no <> trim(roll_no)
+         OR roll_no <> upper(roll_no)
+      LIMIT 50
+    `);
     const ok = indexes.every((i) => i.present && i.duplicateGroups === 0) && impossible === 0 && denomMismatch === 0;
-    return c.json({ ok, bootCheck: INDEX_STATE, indexes, attemptsWithImpossibleScore: impossible, attemptsWithDenominatorMismatch: denomMismatch }, ok ? 200 : 500);
+    return c.json({
+      ok,
+      bootCheck: INDEX_STATE,
+      indexes,
+      attemptsWithImpossibleScore: impossible,
+      attemptsWithDenominatorMismatch: denomMismatch,
+      duplicateStudentSuspects: suspects.map((s) => ({ ...s, n: Number(s.n) })),
+      malformedRollNumbers: malformedRolls,
+    }, ok ? 200 : 500);
   })
 
   // ---- TEMP diagnostic: verify DB connectivity + env presence ----
@@ -314,7 +585,7 @@ const app = new Hono<{ Variables: Vars }>()
     const tid = rt.id;
     const b = await c.req.json();
 
-    const roll = String(b.rollNo ?? "").trim().replace(/\s+/g, "").toUpperCase();
+    const roll = normalizeRoll(b.rollNo);
     const name = String(b.name ?? "")
       .trim()
       .replace(/\s+/g, " ")
@@ -325,7 +596,8 @@ const app = new Hono<{ Variables: Vars }>()
     const gender = String(b.gender ?? "").trim().toLowerCase();
     const classId = b.classId ? String(b.classId) : null;
 
-    if (!roll) return c.json({ message: "Roll number is required" }, 400);
+    const rollBad = rollNoProblem(roll);
+    if (rollBad) return c.json({ message: rollBad }, 400);
     if (!name) return c.json({ message: "Name is required" }, 400);
     if (!classId) return c.json({ message: "Please select your section" }, 400);
     if (!email || !/^\S+@\S+\.\S+$/.test(email)) return c.json({ message: "A valid email is required" }, 400);
@@ -339,11 +611,9 @@ const app = new Hono<{ Variables: Vars }>()
       .where(and(eq(schema.classes.id, classId), eq(schema.classes.tenantId, tid)));
     if (!cls) return c.json({ message: "Invalid section" }, 400);
 
-    // Block duplicates by roll number (case-insensitive; already upper-cased).
-    const [dupRoll] = await db
-      .select({ id: schema.students.id })
-      .from(schema.students)
-      .where(and(eq(schema.students.tenantId, tid), eq(schema.students.rollNo, roll)));
+    // Block duplicates by roll number, ignoring case and padding of what is ALREADY
+    // stored — an exact match here missed rows saved before normalisation existed.
+    const dupRoll = await findStudentByRoll(tid, roll);
     if (dupRoll) return c.json({ message: "This roll number is already registered", exists: true }, 409);
 
     // Block duplicate email within the tenant.
@@ -354,17 +624,26 @@ const app = new Hono<{ Variables: Vars }>()
     if (dupEmail) return c.json({ message: "This email is already registered" }, 409);
 
     const newStuId = id("stu");
-    await db.insert(schema.students).values({
-      id: newStuId,
-      tenantId: tid,
-      classId,
-      rollNo: roll,
-      name,
-      email,
-      phone: phone.replace(/\D/g, "").slice(-10),
-      gender,
-      password: await hashPassword("Welcome@123"),
-    });
+    try {
+      await db.insert(schema.students).values({
+        id: newStuId,
+        tenantId: tid,
+        classId,
+        rollNo: roll,
+        name,
+        email,
+        phone: phone.replace(/\D/g, "").slice(-10),
+        gender,
+        password: await hashPassword("Welcome@123"),
+      });
+    } catch (e) {
+      // The check above and this insert are two separate statements, so two students
+      // submitting the same roll at the same moment both pass the check. The unique
+      // index is the real guarantee; translate its error into the same 409 rather
+      // than a 500, so the second one just sees "already registered".
+      if (isDuplicateRollError(e)) return c.json({ message: "This roll number is already registered", exists: true }, 409);
+      throw e;
+    }
 
     // Late-registrant enrolment: a student who registers after exams were set up
     // must still land in the exam meant for their branch. Cohort matching already
@@ -628,14 +907,31 @@ const app = new Hono<{ Variables: Vars }>()
     const b = await c.req.json();
     const tid = p.role === "super_admin" ? (b.tenantId ?? p.tenantId) : p.tenantId;
     const plain = b.password && String(b.password).length >= 6 ? String(b.password) : "Welcome@123";
-    const [row] = await db
+
+    // This endpoint used to insert whatever it was given, with NO duplicate check
+    // of any kind — the main source of duplicate student records. Normalise, reject
+    // obvious junk, and refuse a roll number the tenant already has.
+    const roll = normalizeRoll(b.rollNo);
+    const rollBad = rollNoProblem(roll);
+    if (rollBad) return c.json({ message: rollBad }, 400);
+    const name = String(b.name ?? "").trim().replace(/\s+/g, " ");
+    if (!name) return c.json({ message: "Name is required" }, 400);
+    if (!tid) return c.json({ message: "No tenant" }, 400);
+    const clash = await findStudentByRoll(tid, roll);
+    if (clash) {
+      return c.json({ message: `Roll number ${roll} already exists (${clash.name})`, existingId: clash.id }, 409);
+    }
+
+    let row;
+    try {
+      [row] = await db
       .insert(schema.students)
       .values({
         id: id("stu"),
         tenantId: tid!,
         classId: b.classId ?? null,
-        rollNo: b.rollNo,
-        name: b.name,
+        rollNo: roll,
+        name,
         email: b.email ?? null,
         password: await hashPassword(plain),
       })
@@ -649,6 +945,12 @@ const app = new Hono<{ Variables: Vars }>()
         enabled: schema.students.enabled,
         createdAt: schema.students.createdAt,
       });
+    } catch (e) {
+      // Same select-then-insert race as registration: the unique index has the
+      // final say, so surface it as a clean 409.
+      if (isDuplicateRollError(e)) return c.json({ message: `Roll number ${roll} already exists` }, 409);
+      throw e;
+    }
     return c.json({ student: row }, 201);
   })
   .post("/students/bulk", requireAuth, requirePermission("users"), async (c) => {
@@ -669,12 +971,19 @@ const app = new Hono<{ Variables: Vars }>()
     const classes = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, tid));
     const codeMap = new Map(classes.map((cl) => [cl.code, cl.id]));
 
-    // Existing roll numbers for this tenant — used to skip already-registered students.
+    // Existing roll numbers for this tenant — used to skip already-registered
+    // students. Normalised with the SAME function the rows below go through, so a
+    // stored "23k91a0491" and an imported " 23K91A0491 " are recognised as one.
     const existing = await db.select({ rollNo: schema.students.rollNo }).from(schema.students).where(eq(schema.students.tenantId, tid));
-    const seenRolls = new Set(existing.map((e) => e.rollNo.trim().toUpperCase()));
+    const seenRolls = new Set(existing.map((e) => normalizeRoll(e.rollNo)));
 
     const clean = (b.rows as Array<Record<string, string>>)
-      .map((r) => ({ name: String(r.name ?? "").trim(), rollNo: String(r.rollNo ?? "").trim(), email: String(r.email ?? "").trim(), code: normCode(r.classCode ?? "") }))
+      .map((r) => ({
+        name: String(r.name ?? "").trim().replace(/\s+/g, " "),
+        rollNo: normalizeRoll(r.rollNo),
+        email: String(r.email ?? "").trim(),
+        code: normCode(r.classCode ?? ""),
+      }))
       .filter((r) => r.name && r.rollNo);
 
     // Hash the default password ONCE — hashing per row (scrypt) would hang the
@@ -682,10 +991,18 @@ const app = new Hono<{ Variables: Vars }>()
     const defaultHash = await hashPassword("Welcome@123");
 
     let inserted = 0, skipped = 0, createdSections = 0;
+    // Rows the import refused to trust, returned to the caller so a TPO can see
+    // WHY a row did not land instead of silently ending up with fewer students
+    // than the file had. Previously every rejection was an anonymous "skipped".
+    const rejected: { rollNo: string; name: string; reason: string }[] = [];
     const values: (typeof schema.students.$inferInsert)[] = [];
     for (const r of clean) {
-      const key = r.rollNo.toUpperCase();
-      if (seenRolls.has(key)) { skipped++; continue; }
+      const key = r.rollNo;
+      // Junk roll numbers (pasted emails, stray punctuation) used to be imported
+      // verbatim and then never matched anything.
+      const bad = rollNoProblem(key);
+      if (bad) { skipped++; rejected.push({ rollNo: r.rollNo, name: r.name, reason: bad }); continue; }
+      if (seenRolls.has(key)) { skipped++; rejected.push({ rollNo: r.rollNo, name: r.name, reason: "Already registered" }); continue; }
       seenRolls.add(key); // guard against duplicates within the same file
 
       // Auto-create the section if the class code is present but unknown.
@@ -715,11 +1032,14 @@ const app = new Hono<{ Variables: Vars }>()
       });
       inserted++;
     }
-    // Insert in chunks to stay well under SQLite's variable limit.
+    // Insert in chunks to stay well under SQLite's variable limit. `onConflictDoNothing`
+    // targets the roll-number unique index, so a concurrent import of the same file
+    // (double-clicked upload) cannot create duplicates — the second one is a no-op
+    // instead of a 500 that aborts the whole batch halfway through.
     for (let i = 0; i < values.length; i += 200) {
-      await db.insert(schema.students).values(values.slice(i, i + 200));
+      await db.insert(schema.students).values(values.slice(i, i + 200)).onConflictDoNothing();
     }
-    return c.json({ inserted, skipped, createdSections }, 201);
+    return c.json({ inserted, skipped, createdSections, rejected }, 201);
   })
   .patch("/students/:id", requireAuth, requirePermission("users"), async (c) => {
     const sid = c.req.param("id");
@@ -728,8 +1048,37 @@ const app = new Hono<{ Variables: Vars }>()
     for (const k of ["name", "rollNo", "email", "classId", "enabled"]) {
       if (k in b) patch[k] = b[k];
     }
-    const [row] = await db.update(schema.students).set(patch).where(eq(schema.students.id, sid)).returning();
-    return c.json({ student: row }, 200);
+
+    // Editing a roll number could previously produce a duplicate just as easily as
+    // creating one — the edit form was in fact how the pasted-email roll numbers got
+    // "fixed" into a second copy of an existing student. Normalise and check.
+    const [before] = await db.select().from(schema.students).where(eq(schema.students.id, sid));
+    if (!before) return c.json({ message: "Student not found" }, 404);
+    if ("rollNo" in patch) {
+      const roll = normalizeRoll(patch.rollNo);
+      const bad = rollNoProblem(roll);
+      if (bad) return c.json({ message: bad }, 400);
+      if (roll !== normalizeRoll(before.rollNo)) {
+        const clash = await findStudentByRoll(before.tenantId, roll);
+        if (clash && clash.id !== sid) {
+          return c.json({ message: `Roll number ${roll} already belongs to ${clash.name}`, existingId: clash.id }, 409);
+        }
+      }
+      patch.rollNo = roll;
+    }
+    if ("name" in patch) {
+      const name = String(patch.name ?? "").trim().replace(/\s+/g, " ");
+      if (!name) return c.json({ message: "Name is required" }, 400);
+      patch.name = name;
+    }
+
+    try {
+      const [row] = await db.update(schema.students).set(patch).where(eq(schema.students.id, sid)).returning();
+      return c.json({ student: row }, 200);
+    } catch (e) {
+      if (isDuplicateRollError(e)) return c.json({ message: "Another student already has that roll number" }, 409);
+      throw e;
+    }
   })
   // ============ SPECIAL COHORTS (ELITE) ============
   // A special cohort is a section that is OPT-IN ONLY: students in it are skipped by
@@ -2010,168 +2359,16 @@ const app = new Hono<{ Variables: Vars }>()
     const p = c.get("profile")!;
     const tid = p.tenantId;
     if (!tid) return c.json({ live: [], nextScheduled: null }, 200);
-    const now = Date.now();
-    // An exam is effectively live when its DB status is "live", OR when it is
-    // still "scheduled" but its start time has already passed (students can start
-    // it at that point). This mirrors the "LIVE / In progress" badge on the
-    // Schedule Assessment list, which is derived the same way. Without this, a
-    // scheduled exam whose start time passed would show as live on the list but
-    // never appear in the Live Monitor.
-    const startMs = (e: { startAt: Date | number | string | null }) => {
-      if (e.startAt == null) return null;
-      const ms = typeof e.startAt === "number" ? e.startAt : new Date(e.startAt).getTime();
-      return Number.isNaN(ms) ? null : ms;
-    };
-    const dbLive = await db.select().from(schema.exams).where(and(eq(schema.exams.tenantId, tid), eq(schema.exams.status, "live")));
-    const scheduled = await db
-      .select()
-      .from(schema.exams)
-      .where(and(eq(schema.exams.tenantId, tid), eq(schema.exams.status, "scheduled")))
-      .orderBy(schema.exams.startAt);
-    const startedScheduled = scheduled.filter((e) => {
-      const ms = startMs(e);
-      return ms !== null && now >= ms;
-    });
-    // An exam is OVER once its window (endAt + any admin extra time + total hold
-    // time) has fully elapsed. A currently-held exam is paused, not over. Over
-    // exams must drop off the Live Monitor entirely — there is nothing live.
-    const isOver = (e: { endAt: number | string | Date | null; extraMin?: number | null; holdMs?: number | null; heldAt?: number | string | Date | null }) => {
-      if (e.heldAt) return false;
-      if (e.endAt == null) return false;
-      const end = e.endAt instanceof Date ? e.endAt.getTime() : typeof e.endAt === "number" ? e.endAt : new Date(e.endAt).getTime();
-      if (Number.isNaN(end)) return false;
-      const extra = (e.extraMin ?? 0) * 60_000 + (e.holdMs ?? 0);
-      return now > end + extra;
-    };
-    const liveExams = [...dbLive, ...startedScheduled].filter((e) => !isOver(e));
 
-    // Next scheduled exam (for empty-state messaging when nothing is live).
-    let nextScheduled: { examId: string; title: string; startAt: number | null } | null = null;
-    if (!liveExams.length) {
-      const upcoming = scheduled
-        .filter((e) => {
-          const ms = startMs(e);
-          return ms !== null && ms >= now;
-        })
-        .sort((a, b) => startMs(a)! - startMs(b)!)[0];
-      if (upcoming) nextScheduled = { examId: upcoming.id, title: upcoming.title, startAt: startMs(upcoming) };
-    }
-
-    // All enabled students in the tenant — used to compute the assigned cohort
-    // per exam so we can surface who hasn't started yet.
-    const allStudents = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, tid), eq(schema.students.enabled, true)));
-    // Every student in the tenant (including disabled ones) indexed by id. An
-    // attempt can belong to a student who was disabled mid-term, so this map is
-    // built WITHOUT the enabled filter. Resolving names from this map instead of
-    // querying per attempt turns ~1200 round trips into one — the Live Monitor
-    // was timing out on large exams because of that N+1.
-    const tenantStudents = await db.select().from(schema.students).where(eq(schema.students.tenantId, tid));
-    const studentById = new Map(tenantStudents.map((s) => [s.id, s]));
-    // Resolve a student's classId to a readable section code (e.g. "CSE-C").
-    const allClasses = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, tid));
-    const classCodeById = new Map(allClasses.map((cl) => [cl.id, cl.code]));
-    const sectionOf = (classId: string | null) => (classId ? classCodeById.get(classId) ?? "" : "");
-    const liveRosters = await loadRosters(liveExams.map((e) => e.id));
-    const assignedStudents = (e: { id: string; classId: string | null; sectionIds: string[] | null }) =>
-      allStudents.filter((stu) => isEligible(e, stu, liveRosters.get(e.id)));
-
-    const out = await Promise.all(
-      liveExams.map(async (ex) => {
-        const atts = await db.select().from(schema.attempts).where(eq(schema.attempts.examId, ex.id));
-        // Everyone who has engaged with the exam (in progress or already submitted/graded).
-        const engaged = atts.filter((a) => a.status !== "not_started");
-        // Proctoring evidence per attempt: violation count + newest snapshot key.
-        const engagedIds = engaged.map((a) => a.id);
-        const evRows: { attemptId: string; type: string; photoUrl: string | null; at: Date }[] = [];
-        for (let i = 0; i < engagedIds.length; i += 100) {
-          const chunk = engagedIds.slice(i, i + 100);
-          const part = await db
-            .select({ attemptId: schema.integrityEvents.attemptId, type: schema.integrityEvents.type, photoUrl: schema.integrityEvents.photoUrl, at: schema.integrityEvents.at })
-            .from(schema.integrityEvents)
-            .where(inArray(schema.integrityEvents.attemptId, chunk));
-          evRows.push(...part);
-        }
-        // Timed frames are evidence, NOT misconduct: they must never inflate the
-        // violation count, but they DO make the best live thumbnail — so they still
-        // feed `lastKey`.
-        const evAgg = new Map<string, { count: number; lastKey: string | null; lastAt: number }>();
-        for (const ev of evRows) {
-          const cur = evAgg.get(ev.attemptId) ?? { count: 0, lastKey: null, lastAt: 0 };
-          if (!NON_VIOLATION_TYPES.has(ev.type)) cur.count += 1;
-          const ms = new Date(ev.at).getTime();
-          if (ev.photoUrl && ms >= cur.lastAt) { cur.lastKey = ev.photoUrl; cur.lastAt = ms; }
-          evAgg.set(ev.attemptId, cur);
-        }
-        const enriched = await Promise.all(
-          engaged.map(async (a) => {
-            const stu = studentById.get(a.studentId);
-            const status = a.status === "in_progress" ? "in_progress" : "finished";
-            // Online = a heartbeat within the last 40s (heartbeat interval is ~15s).
-            const online = a.status === "in_progress" && !!a.lastSeenAt && now - new Date(a.lastSeenAt).getTime() < 40_000;
-            // Latest violation snapshot, as a short-lived presigned URL.
-            const agg = evAgg.get(a.id);
-            let snapshot: string | null = null;
-            if (agg?.lastKey) {
-              try { snapshot = await presignGet(agg.lastKey); } catch { snapshot = null; }
-            }
-            return {
-              attemptId: a.id,
-              examId: ex.id,
-              student: stu?.name ?? "—",
-              rollNo: stu?.rollNo ?? "",
-              section: sectionOf(stu?.classId ?? null),
-              status,
-              online,
-              lastSeenAt: a.lastSeenAt,
-              startedAt: a.startedAt,
-              submittedAt: a.submittedAt,
-              score: a.status === "graded" ? a.score : null,
-              graded: a.status === "graded",
-              snapshot,
-              violations: agg?.count ?? 0,
-            };
-          }),
-        );
-        // Assigned students who have not started. If the exam window has closed
-        // (now > endAt) they never showed up → "absent"; otherwise they can still
-        // begin → "not_started".
-        const endMs = ex.endAt ? new Date(ex.endAt).getTime() : null;
-        const windowClosed = endMs !== null && !Number.isNaN(endMs) && now > endMs;
-        const engagedStudentIds = new Set(engaged.map((a) => a.studentId));
-        const notStarted = assignedStudents(ex)
-          .filter((stu) => !engagedStudentIds.has(stu.id))
-          .map((stu) => ({
-            attemptId: `ns-${stu.id}`,
-            examId: ex.id,
-            student: stu.name ?? "—",
-            rollNo: stu.rollNo ?? "",
-            section: sectionOf(stu.classId ?? null),
-            status: (windowClosed ? "absent" : "not_started") as "absent" | "not_started",
-            online: false,
-            lastSeenAt: null as string | null,
-            startedAt: null as string | null,
-            submittedAt: null as string | null,
-            snapshot: null as string | null,
-            violations: 0,
-          }));
-        const absentCount = windowClosed ? notStarted.length : 0;
-        return {
-          examId: ex.id,
-          title: ex.title,
-          held: !!ex.heldAt,
-          heldAt: ex.heldAt,
-          extraMin: ex.extraMin ?? 0,
-          active: engaged.filter((a) => a.status === "in_progress").length,
-          online: enriched.filter((s) => s.online).length,
-          submitted: engaged.filter((a) => a.status !== "in_progress").length,
-          notStarted: windowClosed ? 0 : notStarted.length,
-          absent: absentCount,
-          students: [...enriched, ...notStarted],
-        };
-      }),
-    );
-    return c.json({ live: out, nextScheduled }, 200);
+    // Every open Live Monitor tab polls this endpoint every 5s, and during an exam
+    // several invigilators watch at once. The payload is identical for everyone in
+    // the tenant, so build it ONCE and share it: concurrent callers join the
+    // in-flight promise, and callers within the cache window get the last result.
+    // This is what stops N invigilators turning into N x the database load — the
+    // single biggest reason the monitor seized up during a live exam.
+    return c.json(await getMonitorSnapshot(tid), 200);
   })
+
 
   // =================== DASHBOARD ===================
   .get("/dashboard", requireAuth, requirePermission("dashboard"), async (c) => {

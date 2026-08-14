@@ -71,7 +71,20 @@ export const students = sqliteTable(
     enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
     createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
   },
-  (t) => [index("students_tenant_idx").on(t.tenantId), index("students_class_idx").on(t.classId)],
+  (t) => [
+    index("students_tenant_idx").on(t.tenantId),
+    index("students_class_idx").on(t.classId),
+    // One student = one row per tenant. Enforced in the DB because every
+    // application-level check is a select-then-insert that a concurrent request can
+    // slip past, and because roll numbers arrive from three different write paths.
+    //
+    // The LIVE index is on the EXPRESSION `upper(trim(roll_no))` so that case and
+    // padding variants collide; drizzle cannot express that here, so this
+    // declaration is the plain-column approximation and
+    // `src/api/database/invariants.ts` creates the real one at boot.
+    // Declaring it here does NOT guarantee it exists on a given database.
+    uniqueIndex("students_tenant_roll_uq").on(t.tenantId, t.rollNo),
+  ],
 );
 
 /** Question bank. */

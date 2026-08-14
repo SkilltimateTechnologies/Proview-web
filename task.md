@@ -172,3 +172,127 @@ being able to come back, because two things still made recurrence possible:
   cleaned up (`{"e":0,"a":0,"ans":0}`).
 - `bun run build` (typecheck + tests + vite) passes **with `DATABASE_URL` unset**,
   so adding tests to the build cannot break the Railway deploy.
+
+---
+
+## Incident 2 — Live Monitor froze during live exams (14 Aug 2026)
+
+### What was reported
+The Live Monitor page hung / stopped updating while exams were running.
+
+### Root cause (measured, not guessed)
+`src/web/pages/monitor.tsx` polls `GET /api/monitor` every **5 s**. On every poll
+the handler did, per live exam:
+
+1. `SELECT *` from `integrity_events` for **every** engaged attempt, in chunked
+   100-id `IN` lists, and aggregated the violation count + newest snapshot **in
+   JS**. On *Elite Assessment – 1* that is **27,153 rows, 1,712,100 bytes of photo
+   keys alone**, pulled over the network on every poll. *Weekly Assessment – 1*
+   was another 17,731 rows / 1,125,605 bytes.
+2. Re-signed **268** S3 URLs — one per attempt — even though a presigned GET is
+   valid for 24 h.
+3. Read the full ~1,124-row `students` table **twice**.
+
+Two exams were live at once, so all of that was doubled. Measured against the
+production database: the integrity aggregation alone took **3,079 ms + 841 ms**
+and the double students read **2,066 ms** — over **6 s of work inside a 5 s poll**.
+Polls therefore overlapped, requests stacked up, and the page stopped responding.
+
+### Fix
+- **Aggregate in SQL, not in JS.** Two statements per exam now return **one row
+  per attempt**: a `COUNT(*) ... GROUP BY attempt_id` for violations (excluding
+  `NON_VIOLATION_TYPES`) and a `ROW_NUMBER() OVER (PARTITION BY attempt_id ORDER
+  BY at DESC, rowid DESC)` for the newest snapshot. Joining `attempts` on
+  `exam_id` also removes the chunked `IN` lists. **27,153 rows → 427 rows.**
+- **`presignGetCached()`** in `lib/s3.ts` — same key, same URL, cached for half the
+  URL lifetime (bounded map, oldest-20% eviction). 268 keys: **171 ms → 0 ms** warm.
+- **One students read** plus an in-memory `enabled` filter instead of two full
+  reads: **2,066 ms → 248 ms**.
+- **`getMonitorSnapshot(tid)`** — 3 s per-tenant response cache **plus in-flight
+  coalescing**, so N invigilator tabs cause at most one build, not N.
+
+### Verified (not assumed)
+- **Parity, query level** (`old JS aggregation` vs `new SQL`, both against the
+  production database, both heavy exams): identical attempt counts, identical
+  per-attempt violation counts, identical newest-photo keys, identical totals
+  (725 and 368). **0 mismatches.** Confirms `ROW_NUMBER()` works on libsql.
+- **Parity, endpoint level**: a load-test clone of the worst exam (268 attempts,
+  27,153 integrity events, 1,124 students, exam forced live) served by the old
+  code (git worktree at `HEAD`) and the new code on the same database returned a
+  **byte-identical payload** (294,704 bytes; equal after stripping the presigned
+  URL signature params).
+- **Timing on that clone**: cold **331 ms → 270 ms**, warm **~80 ms**;
+  **10 concurrent polls 1,870 ms → 135 ms** (14x). The clone is a local file DB, so
+  it understates the win — the real cost was network round trips, which the
+  query-level numbers above measure.
+
+---
+
+## Incident 3 — Duplicate student records (14 Aug 2026)
+
+### Root cause
+Three write paths, three different dedupe rules, and **no unique index** to catch
+what they missed:
+
+| Path | Old behaviour |
+| --- | --- |
+| `POST /students` (TPO adds one) | **no duplicate check at all** |
+| `POST /students/bulk` (CSV import) | exact-string match only |
+| `POST /register/:code` (public self-registration) | exact-string match, and accepted a pasted college **email** as the roll number |
+
+So `23k91a0491`, ` 23K91A0491 ` and `23K91A0491@TKRCET.COM` were three different
+students, splitting one person's results across rows and duplicating them in
+reports and the Live Monitor.
+
+### Fix — validation *and* a database constraint
+- **`src/api/lib/students.ts`** — one shared implementation: `normalizeRoll()`
+  (trim, strip inner whitespace, upper-case), `rollNoProblem()` (rejects a pasted
+  email, junk characters, absurd lengths) and `isDuplicateRollError()`. Used by
+  every write path, including `PATCH /students/:id` — the edit form was how the
+  email-shaped rolls got "fixed" into second copies.
+- **`students_tenant_roll_uq`** — `UNIQUE (tenant_id, upper(trim(roll_no)))`, an
+  **expression** index so case and padding variants collide. Created and, when
+  weaker than required, **replaced** at boot by `ensureDatabaseInvariants()`.
+- **Boot check now compares the index DEFINITION, not just its name.** Drizzle
+  cannot express an expression index, so `db:push` creates
+  `students_tenant_roll_uq ON students(tenant_id, roll_no)` — right name, weaker
+  guarantee. The old name-only check would have accepted it and the bug would be
+  back on any freshly provisioned database.
+- **Bulk import now reports what it refused** (`rejected[]` with a reason per row)
+  instead of silently skipping, and inserts with `onConflictDoNothing()`.
+- **`GET /api/admin/invariants`** additionally reports `duplicateStudentSuspects`
+  (same name + same section) and `malformedRollNumbers`. Same-name pairs are
+  **reported, never auto-deleted** — real namesakes exist.
+
+### Data repair
+`scripts/merge-duplicate-students.ts`, dry-run by default, explicit action list,
+refuses to delete a row that has attempts or to merge two rows that sat the same
+exam. Applied: 2 merges (`23K91A0491@TKRCET.COM` → `23K91A0491`,
+`24K95A0503@TKRCET.COM` → `24K95A0503`, moving their attempts) and 8 zero-attempt
+ghost rows deleted. Backup written to `student-merge-backup-*.json`.
+`23K91A0539` was left alone — a genuinely different student who happens to share
+a name.
+
+### Verified (not assumed)
+- Against a clone of production, through the HTTP API — **12/12 guards pass**:
+  exact duplicate → 409, case/padding variant → 409, pasted email → 400, new roll
+  stored normalised, same roll twice → 409, `PATCH` into a collision → 409,
+  `PATCH` to a free roll → 200, bulk import of 4 rows inserts 1 and reports 3 with
+  reasons, and **6 simultaneous identical creates → exactly one student**
+  (`201, 409 x5`).
+- Public self-registration, same clone — **4/4**, including **6 simultaneous
+  registrations → exactly one student**.
+- That race first returned `201 + 5x500`: drizzle wraps the SQLite error in a
+  `DrizzleQueryError` whose own message hides the constraint, so
+  `isDuplicateRollError()` now walks the `cause` chain. The index was always
+  correct — only the HTTP status was wrong.
+- **Boot-time self-heal proven**: pointed the server at a `db:push`-created
+  database carrying the weak plain-column index; it logged `exists but does not
+  enforce ... replacing it` and the expression index was in place afterwards.
+- `bun run verify:db` gained a `really enforces` check per index and **fails** on
+  that weak index (mutation-tested, not decoration), plus malformed-roll and
+  orphaned-attempt checks. Production: **all PASS**, 1 same-name group flagged as
+  a NOTE for manual review.
+- `src/api/lib/students.test.ts` — 12 tests wired into `bun run build`.
+  Mutation-tested: dropping `toUpperCase()` fails 1, dropping the `cause` walk
+  fails 2.

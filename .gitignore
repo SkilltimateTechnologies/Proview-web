@@ -45,3 +45,4 @@ orphan-answers-backup-*.json
 # one-off DB maintenance scratch scripts
 _*.ts
 _*.json
+student-merge-backup-*.json

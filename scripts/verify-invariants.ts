@@ -38,11 +38,30 @@ console.log("=== database invariants ===");
 const REQUIRED = [
   { name: "answers_attempt_question_uq", table: "answers", cols: ["attempt_id", "question_id"] },
   { name: "attempts_exam_student_uq", table: "attempts", cols: ["exam_id", "student_id"] },
+  // Expression index: case/padding variants of a roll number must collide.
+  { name: "students_tenant_roll_uq", table: "students", cols: ["tenant_id", "upper(trim(roll_no))"] },
 ];
 
+/** Strip quoting/whitespace so two spellings of the same index compare equal. */
+const normSql = (s: string) => s.replace(/[`"\[\]]/g, "").replace(/\s+/g, "").toLowerCase();
+
 for (const idx of REQUIRED) {
-  const present = (await q("select name from sqlite_master where type='index' and name=?", [idx.name])).length > 0;
+  const rows = (await q("select sql from sqlite_master where type='index' and name=?", [idx.name])) as unknown as { sql: string | null }[];
+  const present = rows.length > 0;
   check(`unique index ${idx.name} exists`, present, present ? "" : "MISSING — duplicates can reappear");
+
+  // Presence by NAME is not enough. `db:push` creates the plain-column version of
+  // students_tenant_roll_uq — same name, weaker guarantee — which would let case
+  // and padding variants of a roll number both insert.
+  if (present) {
+    const def = rows[0]?.sql ?? "";
+    const enforces = /createuniqueindex/.test(normSql(def)) && idx.cols.every((c) => normSql(def).includes(normSql(c)));
+    check(
+      `${idx.name} really enforces ${idx.table}(${idx.cols.join(", ")})`,
+      enforces,
+      enforces ? "" : `weaker than required: ${def}`,
+    );
+  }
 
   const dupes = Number(
     (await q(`select count(*) c from (select 1 from ${idx.table} group by ${idx.cols.join(",")} having count(*) > 1)`))[0]
@@ -69,6 +88,36 @@ const lostAll = Number(
                                 and x.response is not null and length(trim(x.response)) > 0)`))[0]?.c ?? 0,
 );
 check("no attempt reports answers but has none stored", lostAll === 0, `${lostAll} attempt(s)`);
+
+// ---- duplicate student records ----
+// The unique index above catches exact/case/padding duplicates. These checks catch
+// the shapes it cannot: a roll number that is not a roll number at all, and the
+// same person entered twice under two genuinely different (mistyped) roll numbers.
+const badRolls = await q(
+  `select id, roll_no from students
+   where roll_no like '%@%' or roll_no <> trim(roll_no) or roll_no <> upper(roll_no) or roll_no like '% %'`,
+);
+check(
+  "no malformed roll numbers (pasted emails, stray case/whitespace)",
+  badRolls.length === 0,
+  badRolls.length ? `${badRolls.length}: ${badRolls.slice(0, 5).map((r: any) => r.roll_no).join(", ")}` : "",
+);
+
+const orphanAttempts = Number(
+  (await q(`select count(*) c from attempts a
+            where not exists (select 1 from students s where s.id = a.student_id)`))[0]?.c ?? 0,
+);
+check("no attempt points at a deleted student", orphanAttempts === 0, `${orphanAttempts} attempt(s)`);
+
+// Heuristic, so it reports rather than fails: identical name inside one section.
+const nameDupes = await q(
+  `select class_id, lower(trim(name)) nm, count(*) n, group_concat(roll_no) rolls
+   from students group by tenant_id, class_id, lower(trim(name)) having n > 1 order by n desc`,
+);
+if (nameDupes.length) {
+  console.log(`  NOTE  ${nameDupes.length} same-name-same-section group(s) to review manually (not a failure — can be real namesakes):`);
+  for (const r of nameDupes.slice(0, 10)) console.log(`          ${(r as any).nm}: ${(r as any).rolls}`);
+}
 
 // ---- concurrency proof against a real server ----
 if (RACE_URL) {
@@ -161,6 +210,55 @@ if (RACE_URL) {
     );
     const clean = Object.values(left as any).every((v) => Number(v) === 0);
     check("race fixture fully cleaned up", clean, JSON.stringify(left));
+  }
+
+  // ---- Live Monitor latency ----
+  // The monitor page polls /api/monitor every 5s. If a single poll takes longer
+  // than the interval, requests stack up and the page freezes — which is exactly
+  // what happened once one exam accumulated 27k integrity_events. Budget: the
+  // response must land well inside the poll interval, with margin for a slower
+  // network than this checker's.
+  const POLL_MS = 5000;
+  const BUDGET_MS = POLL_MS / 2;
+  const email = process.env.VERIFY_ADMIN_EMAIL, pw = process.env.VERIFY_ADMIN_PASSWORD;
+  if (!email || !pw) {
+    console.log("\n  SKIP  live monitor latency — set VERIFY_ADMIN_EMAIL / VERIFY_ADMIN_PASSWORD to enable");
+  } else {
+    console.log(`\n=== live monitor latency vs ${RACE_URL} ===`);
+    const login = await fetch(`${RACE_URL}/api/auth/sign-in/email`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email, password: pw }),
+    });
+    const cookie = (login.headers.getSetCookie?.() ?? []).map((c) => c.split(";")[0]).join("; ");
+    check("admin sign-in for monitor check", login.ok && !!cookie, `HTTP ${login.status}`);
+    if (login.ok && cookie) {
+      // First call may build the snapshot; subsequent ones should hit the shared
+      // cache. Both are measured — a cold build is what freezes the page.
+      const timings: number[] = [];
+      let lastStatus = 0, students = 0;
+      for (let i = 0; i < 3; i++) {
+        const t0 = Date.now();
+        const res = await fetch(`${RACE_URL}/api/monitor`, { headers: { cookie } });
+        const body: any = await res.json().catch(() => ({}));
+        timings.push(Date.now() - t0);
+        lastStatus = res.status;
+        students = (body?.live ?? []).reduce((n: number, e: any) => n + (e.students?.length ?? 0), 0);
+        if (i === 0) await new Promise((r) => setTimeout(r, 200));
+      }
+      check("/api/monitor returns 200", lastStatus === 200, `HTTP ${lastStatus}`);
+      const cold = timings[0], warm = Math.min(...timings.slice(1));
+      check(
+        `/api/monitor cold build under ${BUDGET_MS}ms`,
+        cold < BUDGET_MS,
+        `${cold}ms (poll interval ${POLL_MS}ms, ${students} student rows)`,
+      );
+      check(
+        "/api/monitor repeat call served from shared cache",
+        warm <= cold,
+        `cold ${cold}ms -> warm ${warm}ms`,
+      );
+    }
   }
 }
 
