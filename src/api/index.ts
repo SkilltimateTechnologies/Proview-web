@@ -2329,7 +2329,12 @@ const app = new Hono<{ Variables: Vars }>()
     const sign = async (ev: typeof evRows[number]) => {
       let photo: string | null = null;
       if (ev.photoUrl) { try { photo = await presignGet(ev.photoUrl); } catch { photo = null; } }
-      return { id: ev.id, type: ev.type, detail: ev.detail, at: ev.at, photo };
+      // Same-origin proxy path for the same object. The presigned URL above is
+      // fine for <img>, but a cross-origin fetch() to Tigris is blocked unless
+      // the bucket carries a CORS policy — so bulk download (ZIP) reads through
+      // our own /api/files/* route instead, which also never expires.
+      const proxy = ev.photoUrl ? `/api/files/${ev.photoUrl}` : null;
+      return { id: ev.id, type: ev.type, detail: ev.detail, at: ev.at, photo, proxy };
     };
     const integrity = await Promise.all(
       evRows.filter((ev) => ev.type !== "periodic_snapshot").slice(0, 300).map(sign),

@@ -626,7 +626,7 @@ type AnswerRow = {
 const LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H"];
 
 // ---- Proctoring evidence ----
-type IntegrityRow = { id: string; type: string; detail: string | null; at: string | number | null; photo: string | null };
+type IntegrityRow = { id: string; type: string; detail: string | null; at: string | number | null; photo: string | null; proxy?: string | null };
 
 const EVENT_META: Record<string, { label: string; icon: typeof ShieldAlert; color: string }> = {
   camera_lost: { label: "Camera turned off", icon: VideoOff, color: "#c0453b" },
@@ -692,46 +692,148 @@ function IntegrityPanel({ events }: { events: IntegrityRow[] }) {
   );
 }
 
+const ms = (t: string | number | null | undefined) => (t ? new Date(t).getTime() : 0);
+
+/** "1m 39s" / "47s" — the wait between two consecutive frames. */
+function fmtGap(gap: number) {
+  const s = Math.round(gap / 1000);
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+}
+
+/** Clock time only, IST — used under each tile. */
+function fmtClock(t: string | number | null | undefined) {
+  if (!t) return "—";
+  return new Date(t).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: "Asia/Kolkata" });
+}
+
+/** Sortable, filesystem-safe IST stamp for ZIP entry names: 2026-08-14_16-36-21 */
+function fmtStamp(t: string | number | null | undefined) {
+  if (!t) return "unknown";
+  const d = new Date(t);
+  const date = d.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+  const clock = d.toLocaleTimeString("en-GB", { hour12: false, timeZone: "Asia/Kolkata" }).replace(/:/g, "-");
+  return `${date}_${clock}`;
+}
+
 /** Timed webcam frames captured throughout the attempt (not tied to any
  *  violation). These are the trail that shows who was actually sitting there —
  *  a quiet candidate reading answers off a phone leaves no violation, but they
- *  do show up here. Newest first; collapsed to one row until expanded, because a
- *  3h attempt produces ~100 frames. */
-function SnapshotGallery({ shots }: { shots: IntegrityRow[] }) {
-  const [open, setOpen] = useState(false);
-  if (shots.length === 0) return null;
-  const shown = open ? shots : shots.slice(0, 8);
-  return (
-    <div className="mb-6">
-      <div className="flex items-center justify-between mb-2">
-        <div className="mono-label">Webcam timeline ({shots.length} frames)</div>
-        {shots.length > 8 && (
-          <button className="btn btn-ghost text-xs px-2 py-1" onClick={() => setOpen((v) => !v)}>
-            {open ? "Show less" : `Show all ${shots.length}`}
-            <ChevronDown size={13} style={{ transform: open ? "rotate(180deg)" : undefined, transition: "transform .15s" }} />
-          </button>
-        )}
+ *  do show up here. Newest first, as the API returns them.
+ *
+ *  Gaps matter as much as the frames: the capture interval is jittered per
+ *  client, so a gap far larger than the configured interval means the tab was
+ *  backgrounded, the camera dropped, or the machine was asleep. Each tile shows
+ *  the gap to the frame before it so a reviewer can spot that hole without
+ *  doing arithmetic. */
+function SnapshotsPanel({ shots, label }: { shots: IntegrityRow[]; label: string }) {
+  const [zipping, setZipping] = useState(false);
+  const [done, setDone] = useState(0);
+
+  // Chronological order for numbering, gap maths and the ZIP.
+  const asc = [...shots].sort((a, b) => ms(a.at) - ms(b.at));
+  const gaps = asc.map((s, i) => (i === 0 ? null : ms(s.at) - ms(asc[i - 1].at)));
+  const seq = new Map(asc.map((s, i) => [s.id, i]));
+  const gapOf = new Map(asc.map((s, i) => [s.id, gaps[i]]));
+  const real = gaps.filter((g): g is number => g != null && g > 0).sort((a, b) => a - b);
+  const median = real.length ? real[Math.floor(real.length / 2)] : null;
+  const widest = real.length ? real[real.length - 1] : null;
+  // A gap over twice the typical cadence is a hole worth flagging in amber.
+  const holeAt = median ? median * 2 : null;
+  const span = asc.length > 1 ? ms(asc[asc.length - 1].at) - ms(asc[0].at) : 0;
+
+  async function downloadZip() {
+    setZipping(true);
+    setDone(0);
+    try {
+      const zip = new JSZip();
+      const lines = [`Webcam snapshot trail — ${label}`, `${asc.length} frames`, ""];
+      for (let i = 0; i < asc.length; i++) {
+        const s = asc[i];
+        // Prefer the same-origin proxy: a fetch() straight at the presigned
+        // Tigris URL is a cross-origin read and gets blocked without a bucket
+        // CORS policy.
+        const url = s.proxy ?? s.photo;
+        if (!url) continue;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`frame ${i + 1} returned ${res.status}`);
+        const name = `${String(i + 1).padStart(3, "0")}_${fmtStamp(s.at)}.jpg`;
+        zip.file(name, await res.arrayBuffer());
+        const g = gaps[i];
+        lines.push(`${name}   ${fmtEventTime(s.at)}   ${g == null ? "first frame" : `+${fmtGap(g)}`}`);
+        setDone(i + 1);
+      }
+      zip.file("index.txt", lines.join("\n"));
+      const blob = await zip.generateAsync({ type: "blob" });
+      saveBlob(blob, `${safeName(label)} - webcam snapshots ${fmtFileDate()}.zip`);
+    } catch (e) {
+      alert("Could not build the snapshot ZIP. Some frames may have expired from storage.");
+      console.error(e);
+    } finally {
+      setZipping(false);
+    }
+  }
+
+  if (shots.length === 0) {
+    return (
+      <div>
+        <div className="mono-label mb-2">Snapshots (0)</div>
+        <div className="card p-6 text-center">
+          <Camera size={22} className="mx-auto mb-2 text-[var(--color-muted)]" />
+          <div className="text-sm text-[var(--color-ink)] font-medium">No webcam frames for this attempt</div>
+          <div className="text-xs text-[var(--color-ink2)] mt-1 max-w-sm mx-auto leading-relaxed">
+            Timed capture records a frame every interval once the student grants camera access. Nothing here means the attempt ran before snapshots were enabled, or the camera was never started.
+          </div>
+        </div>
       </div>
-      <div className="card p-3">
-        <div className="grid grid-cols-4 sm:grid-cols-6 gap-2">
-          {shown.map((s) => (
-            <a key={s.id} href={s.photo ?? undefined} target="_blank" rel="noreferrer" title={fmtEventTime(s.at)} className="block">
+    );
+  }
+
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-3 mb-2">
+        <div className="mono-label">Snapshots ({shots.length})</div>
+        <button className="btn btn-ghost text-xs px-2 py-1 border border-[var(--color-line)]" onClick={downloadZip} disabled={zipping}>
+          {zipping ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+          {zipping ? `Zipping ${done}/${asc.length}…` : "Download all (ZIP)"}
+        </button>
+      </div>
+
+      <div className="grid grid-cols-3 gap-3 mb-4">
+        <div className="card p-3"><div className="stat-num text-[1.15rem] text-[var(--color-ink)]">{fmtClock(asc[0]?.at)}</div><div className="mono-label mt-1">First frame</div></div>
+        <div className="card p-3"><div className="stat-num text-[1.15rem] text-[var(--color-ink)]">{span > 0 ? fmtGap(span) : "—"}</div><div className="mono-label mt-1">Covered span</div></div>
+        <div className="card p-3">
+          <div className="stat-num text-[1.15rem]" style={{ color: widest && holeAt && widest > holeAt ? "#b7791f" : "var(--color-ink)" }}>{median ? fmtGap(median) : "—"}</div>
+          <div className="mono-label mt-1">Typical gap{widest && holeAt && widest > holeAt ? ` · max ${fmtGap(widest)}` : ""}</div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        {shots.map((s) => {
+          const g = gapOf.get(s.id) ?? null;
+          const hole = g != null && holeAt != null && g > holeAt;
+          return (
+            <a key={s.id} href={s.photo ?? undefined} target="_blank" rel="noreferrer" title={`Frame ${(seq.get(s.id) ?? 0) + 1} · ${fmtEventTime(s.at)}`} className="card p-2 block hover:border-[var(--brand)] transition-colors">
               <img
                 src={s.photo ?? undefined}
                 alt={`Webcam frame ${fmtEventTime(s.at)}`}
                 loading="lazy"
-                className="w-full aspect-[4/3] rounded-lg object-cover border border-[var(--color-line)]"
+                className="w-full aspect-[4/3] rounded-lg object-cover border border-[var(--color-line)] bg-[var(--color-line)]"
                 style={{ transform: "scaleX(-1)" }}
               />
-              <div className="mono-label mt-1 text-center" style={{ fontSize: "0.6rem" }}>
-                {new Date(s.at ?? 0).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" })}
+              <div className="flex items-center justify-between gap-1 mt-1.5">
+                <span className="mono-label" style={{ fontSize: "0.62rem" }}>#{(seq.get(s.id) ?? 0) + 1} · {fmtClock(s.at)}</span>
+                <span className="mono-label" style={{ fontSize: "0.62rem", color: hole ? "#b7791f" : undefined }}>
+                  {g == null ? "start" : `+${fmtGap(g)}`}
+                </span>
               </div>
             </a>
-          ))}
-        </div>
-        <div className="flex items-center gap-1.5 mt-2 text-[var(--color-ink2)]" style={{ fontSize: "0.7rem" }}>
-          <Camera size={12} /> Captured automatically at intervals — not violations.
-        </div>
+          );
+        })}
+      </div>
+
+      <div className="flex items-center gap-1.5 mt-3 text-[var(--color-ink2)]" style={{ fontSize: "0.7rem" }}>
+        <Camera size={12} /> Captured automatically at intervals — these are not violations. Frames are mirrored to match the student's own self-view.
       </div>
     </div>
   );
@@ -739,6 +841,7 @@ function SnapshotGallery({ shots }: { shots: IntegrityRow[] }) {
 
 function AttemptDrawer({ examId, row, brand, examTitle, totalQuestions, onClose }: { examId: string; row: Row; brand: Brand; examTitle: string; totalQuestions?: number; onClose: () => void }) {
   const [dl, setDl] = useState(false);
+  const [tab, setTab] = useState<"overview" | "snapshots">("overview");
   const q = useQuery({
     queryKey: ["attempt", examId, row.attemptId],
     queryFn: async () => {
@@ -773,38 +876,88 @@ function AttemptDrawer({ examId, row, brand, examTitle, totalQuestions, onClose 
     }
   }
 
-  return (
-    <Drawer eyebrow="Student report" title={row.name} subtitle={`${row.rollNo}${row.email ? " · " + row.email : ""}`} onClose={onClose} width="max-w-3xl">
-      <button
-        className="btn btn-ghost w-full mb-5 justify-center border border-[var(--color-line)]"
-        onClick={download}
-        disabled={!d || dl}
-      >
-        {dl ? <Loader2 size={16} className="animate-spin" /> : <FileText size={16} />} {dl ? "Preparing PDF…" : "Download answer sheet (PDF)"}
-      </button>
-      <div className="grid grid-cols-2 gap-4 mb-6">
-        <div className="card p-4">{row.status === "graded" ? (<div className="stat-num text-[1.6rem]" style={{ color: "var(--brand)" }}>{row.score != null ? `${row.score}/100` : "—"}</div>) : (<div className="stat-num text-[1.6rem]" style={{ color: "#b7791f" }}>Grading…</div>)}<div className="mono-label mt-1">Marks scored</div></div>
-        <div className="card p-4"><div className="stat-num text-[1.6rem] text-[var(--color-ink)]">{fmtSubmitted(row.submittedAt)}</div><div className="mono-label mt-1">Submitted</div></div>
-      </div>
+  const shots = ((d as { snapshots?: unknown } | null)?.snapshots ?? []) as IntegrityRow[];
+  const TABS = [
+    { key: "overview" as const, label: "Overview", icon: FileText, count: null as number | null },
+    { key: "snapshots" as const, label: "Snapshots", icon: Camera, count: shots.length },
+  ];
 
-      {q.isLoading ? (
-        <Loader />
-      ) : !d ? (
-        <div className="card p-6 text-center text-sm text-[var(--color-ink2)]">Detailed breakdown not available for this attempt.</div>
-      ) : (
-        <>
-          <IntegrityPanel events={(d.integrity ?? []) as IntegrityRow[]} />
-          <SnapshotGallery shots={((d as { snapshots?: unknown }).snapshots ?? []) as IntegrityRow[]} />
-          <div className="mono-label mb-2">Answer breakdown ({answers.length})</div>
-          {answers.length === 0 ? (
-            <div className="card p-4 text-sm text-[var(--color-ink2)] mb-6">No stored answers for this attempt.</div>
-          ) : (
-            <div className="space-y-4 mb-6">
-              {answers.map((a, i) => <AnswerCard key={a.id} a={a} index={i} />)}
+  return (
+    <Drawer
+      eyebrow="Student report"
+      title={row.name}
+      subtitle={`${row.rollNo}${row.email ? " · " + row.email : ""}`}
+      onClose={onClose}
+      width="max-w-4xl"
+      bodyClass="flex-1 min-h-0 flex"
+    >
+      {/* Left tab rail — fixed while the pane on the right scrolls, so the
+          reviewer can jump between the answer sheet and the camera trail
+          without scrolling back up through ~50 answer cards. */}
+      <nav className="w-[170px] shrink-0 border-r border-[var(--color-line)] py-5 px-3 space-y-1">
+        {TABS.map((t) => {
+          const active = tab === t.key;
+          const TabIcon = t.icon;
+          return (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-left text-sm transition-colors"
+              style={{
+                background: active ? "var(--brand)" : "transparent",
+                color: active ? "#fff" : "var(--color-ink2)",
+                fontWeight: active ? 600 : 500,
+              }}
+            >
+              <TabIcon size={15} className="shrink-0" />
+              <span className="min-w-0 truncate">{t.label}</span>
+              {t.count != null && t.count > 0 && (
+                <span className="ml-auto mono-label" style={{ fontSize: "0.62rem", color: active ? "rgba(255,255,255,.85)" : "var(--color-muted)" }}>{t.count}</span>
+              )}
+            </button>
+          );
+        })}
+      </nav>
+
+      <div className="flex-1 min-w-0 overflow-y-auto px-6 py-5">
+        {tab === "overview" ? (
+          <>
+            <button
+              className="btn btn-ghost w-full mb-5 justify-center border border-[var(--color-line)]"
+              onClick={download}
+              disabled={!d || dl}
+            >
+              {dl ? <Loader2 size={16} className="animate-spin" /> : <FileText size={16} />} {dl ? "Preparing PDF…" : "Download answer sheet (PDF)"}
+            </button>
+            <div className="grid grid-cols-2 gap-4 mb-6">
+              <div className="card p-4">{row.status === "graded" ? (<div className="stat-num text-[1.6rem]" style={{ color: "var(--brand)" }}>{row.score != null ? `${row.score}/100` : "—"}</div>) : (<div className="stat-num text-[1.6rem]" style={{ color: "#b7791f" }}>Grading…</div>)}<div className="mono-label mt-1">Marks scored</div></div>
+              <div className="card p-4"><div className="stat-num text-[1.6rem] text-[var(--color-ink)]">{fmtSubmitted(row.submittedAt)}</div><div className="mono-label mt-1">Submitted</div></div>
             </div>
-          )}
-        </>
-      )}
+
+            {q.isLoading ? (
+              <Loader />
+            ) : !d ? (
+              <div className="card p-6 text-center text-sm text-[var(--color-ink2)]">Detailed breakdown not available for this attempt.</div>
+            ) : (
+              <>
+                <IntegrityPanel events={(d.integrity ?? []) as IntegrityRow[]} />
+                <div className="mono-label mb-2">Answer breakdown ({answers.length})</div>
+                {answers.length === 0 ? (
+                  <div className="card p-4 text-sm text-[var(--color-ink2)] mb-6">No stored answers for this attempt.</div>
+                ) : (
+                  <div className="space-y-4 mb-6">
+                    {answers.map((a, i) => <AnswerCard key={a.id} a={a} index={i} />)}
+                  </div>
+                )}
+              </>
+            )}
+          </>
+        ) : q.isLoading ? (
+          <Loader />
+        ) : (
+          <SnapshotsPanel shots={shots} label={`${row.name} - ${row.rollNo}`} />
+        )}
+      </div>
     </Drawer>
   );
 }

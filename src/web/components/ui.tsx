@@ -54,7 +54,7 @@ export function Eyebrow({ children }: { children: ReactNode }) {
 }
 
 /** Right-side slide-over drawer. */
-export function Drawer({ eyebrow, title, subtitle, onClose, children, width = "max-w-3xl" }: { eyebrow?: string; title: string; subtitle?: ReactNode; onClose: () => void; children: ReactNode; width?: string }) {
+export function Drawer({ eyebrow, title, subtitle, onClose, children, width = "max-w-3xl", bodyClass = "flex-1 overflow-y-auto px-6 py-5" }: { eyebrow?: string; title: string; subtitle?: ReactNode; onClose: () => void; children: ReactNode; width?: string; bodyClass?: string }) {
   // Lock body scroll while open.
   useEffect(() => {
     const prev = document.body.style.overflow;
@@ -77,7 +77,10 @@ export function Drawer({ eyebrow, title, subtitle, onClose, children, width = "m
           </div>
           <button onClick={onClose} className="ml-3 mt-1"><X size={20} className="text-[var(--color-muted)]" /></button>
         </div>
-        <div className="flex-1 overflow-y-auto px-6 py-5">{children}</div>
+        {/* Default body scrolls as one padded column. Callers that need their own
+            internal layout (e.g. a fixed left tab rail beside a scrolling pane)
+            override `bodyClass` and handle padding/overflow themselves. */}
+        <div className={bodyClass}>{children}</div>
       </div>
     </div>,
     document.body,
