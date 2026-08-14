@@ -1,6 +1,15 @@
 import { generateText } from "ai";
 import { gateway, modelFor } from "./gateway";
 
+/**
+ * Hard ceiling on a single AI call. Grading runs behind a small global
+ * semaphore, so a request that hangs forever would permanently occupy a slot
+ * and stall every other student's grading with no error ever logged. Time it
+ * out instead and let the queue's retry/give-up path handle it.
+ */
+const AI_TIMEOUT_MS = 90_000;
+const AI_RETRIES = 2;
+
 function extractJson<T>(text: string, fallback: T): T {
   try {
     const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -48,7 +57,12 @@ Rules by type:
 
 Return ONLY a JSON array. Each item: { "type", "prompt", "options"?, "correct"?, "points", "difficulty", "meta"? }.`;
 
-  const { text } = await generateText({ model: gateway(modelFor(provider)), prompt });
+  const { text } = await generateText({
+    model: gateway(modelFor(provider)),
+    prompt,
+    abortSignal: AbortSignal.timeout(AI_TIMEOUT_MS),
+    maxRetries: AI_RETRIES,
+  });
   const items = extractJson<GeneratedQuestion[]>(text, []);
   return Array.isArray(items) ? items.slice(0, count) : [];
 }
@@ -101,7 +115,12 @@ Max points: ${maxPoints}.
 Evaluate correctness, completeness and clarity. If the answer is correct and complete, award full marks. Deduct only for genuine errors or missing required content — not for phrasing or brevity.
 Return ONLY JSON: { "score": <number 0-${maxPoints}>, "notes": "<2-3 sentence feedback>" }.`;
 
-  const { text } = await generateText({ model: gateway(modelFor(provider)), prompt });
+  const { text } = await generateText({
+    model: gateway(modelFor(provider)),
+    prompt,
+    abortSignal: AbortSignal.timeout(AI_TIMEOUT_MS),
+    maxRetries: AI_RETRIES,
+  });
   const res = extractJson<{ score: number; notes: string }>(text, { score: 0, notes: "Could not grade automatically." });
   const score = Math.max(0, Math.min(maxPoints, Number(res.score) || 0));
   return { score, notes: res.notes || "" };

@@ -6,10 +6,13 @@
     ".": "./src/api/index.ts"
   },
   "scripts": {
-    "build": "tsc --noEmit && vite build",
+    "build": "bun run typecheck:api && vite build",
     "dev": "vite",
     "start": "bun src/server.ts",
-    "typecheck": "tsc --noEmit",
+    "//typecheck": "Root tsconfig.json is `files: []` + project references, so a bare `tsc --noEmit` type-checks NOTHING. It exited 0 while two undefined identifiers (retryCounts, gradeSubjective) were live in production. Always point tsc at a real project.",
+    "typecheck": "bun run typecheck:api",
+    "typecheck:api": "tsc --noEmit -p tsconfig.node.json",
+    "typecheck:web": "tsc --noEmit -p tsconfig.app.json",
     "preview": "bun run build && vite preview",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",

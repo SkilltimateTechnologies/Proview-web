@@ -15,9 +15,19 @@ import * as schema from "../database/schema";
 import { gradeSubjective } from "./ai";
 import { autoGrade, effectiveEndMs, id } from "./util";
 
-const MAX_CONCURRENT = 3;
+// Global cap on in-flight AI grading calls. A whole class submitting at the
+// deadline funnels ~20 subjective answers per student through this semaphore, so
+// too low a value turns into hours of backlog: at 3 slots and ~5s per call we
+// measured 38 answers/min, i.e. ~4h for a 454-student batch. Tunable per
+// deployment in case the provider starts rate-limiting.
+const MAX_CONCURRENT = Number(process.env.GRADE_CONCURRENCY) || 12;
 let active = 0;
 const waiters: Array<() => void> = [];
+
+/** Bounded retries per attempt before we give up and flag for manual review. */
+const MAX_GRADE_RETRIES = 3;
+/** attemptId -> consecutive failed grading passes. In-memory: resets on deploy. */
+const retryCounts = new Map<string, number>();
 
 function acquire(): Promise<void> {
   return new Promise((resolve) => {

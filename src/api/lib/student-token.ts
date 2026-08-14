@@ -45,7 +45,9 @@ export async function verifyStudentToken(token: string | undefined | null): Prom
     if (!payloadB64 || !sigB64) return null;
     const payloadBytes = fromB64url(payloadB64);
     const key = await hmacKey();
-    const ok = await crypto.subtle.verify("HMAC", key, fromB64url(sigB64), payloadBytes);
+    // Casts: TS models Uint8Array<ArrayBufferLike> as incompatible with BufferSource
+    // (which requires an ArrayBuffer-backed view). Runtime-identical.
+    const ok = await crypto.subtle.verify("HMAC", key, fromB64url(sigB64) as unknown as BufferSource, payloadBytes as unknown as BufferSource);
     if (!ok) return null;
     const payload = new TextDecoder().decode(payloadBytes);
     const [studentId] = payload.split(".");

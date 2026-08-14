@@ -51,3 +51,41 @@ deploy needs the index (SQLite ON CONFLICT requires the constraint to exist).
 Dedupe + rescore changes published student marks -> waiting on user approval.
 Plan written to _dedupe_plan.json (110 attempts, keeper rule: content > scored >
 higher score > lowest id).
+
+## 15 Aug — grading "stall" was two undefined identifiers + a false-green build
+
+Reported symptom: re-queued attempts never reached `graded`; suspected AI outage
+(`settings.ai_used` was 0).
+
+Findings:
+1. `ai_used` is a red herring — only `/questions/generate` and `/ai/grade` bump it.
+   The grading queue never does. Gateway was healthy the whole time.
+2. `src/api/lib/grade-queue.ts` used `retryCounts` and `MAX_GRADE_RETRIES` which
+   were **never declared anywhere**. `gradeAttempt` threw
+   `ReferenceError: retryCounts is not defined` on line 129 — the FIRST statement
+   of its success path. So gradeAttempt could never flip an attempt to "graded";
+   every graded attempt only got there via the 60s `sweepPendingGrading`
+   reconcile. The retry-with-backoff and give-up-after-N paths were dead code
+   that threw, so a genuinely un-gradeable answer stuck its attempt at
+   "submitted" forever while the sweep re-queued it every 60s.
+   Verified against prod: attempt stayed `submitted` before the fix, flips to
+   `graded` after.
+3. `src/api/index.ts` `/ai/grade` referenced `gradeSubjective` without importing
+   it, and queried `schema.settings.tenantId` which does not exist (settings is a
+   single global row). Endpoint 500'd on every call — prod curl 500 in 0.55s,
+   200 in 4.2s after the fix.
+4. **Why it shipped:** root `tsconfig.json` is `"files": []` + project
+   references, so `tsc --noEmit` (used by both `build` and `typecheck`) checked
+   NOTHING and exited 0. `tsc -p tsconfig.node.json` reported 23 errors including
+   all of the above. Scripts now point at real projects; `build` runs
+   `typecheck:api`, which is at 0 errors.
+5. Throughput, not a stall, for the rest: `MAX_CONCURRENT = 3` at ~5s/call =
+   38.4 answers/min measured, i.e. ~4h for a 454-student batch. Now
+   `GRADE_CONCURRENCY` env, default 12 → measured 163.7 answers/min (4.3x).
+6. Added `AbortSignal.timeout(90s)` + `maxRetries: 2` to both `generateText`
+   calls. Previously a hung request would hold a semaphore slot forever and
+   silently stall all grading with nothing logged.
+
+Known debt: `tsc -p tsconfig.app.json` (web) has 57 pre-existing errors, mostly
+Hono RPC response-union narrowing (`{ message: string }` variants not narrowed).
+Not gated yet — `typecheck:web` runs it.

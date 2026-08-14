@@ -7,9 +7,9 @@ import { db } from "./database";
 import * as schema from "./database/schema";
 import { authMiddleware, requireAuth, requireSuperAdmin, requirePermission } from "./middleware/auth";
 import type { SessionUser, ProfileCtx } from "./middleware/auth";
-import { id, displayId, autoGrade, computeYear, effectiveEndMs } from "./lib/util";
-import { generateQuestions } from "./lib/ai";
-import { queueAttemptGrading, finalizeAttempt, hasContent } from "./lib/grade-queue";
+import { id, displayId, computeYear, effectiveEndMs } from "./lib/util";
+import { generateQuestions, gradeSubjective } from "./lib/ai";
+import { finalizeAttempt, hasContent } from "./lib/grade-queue";
 import { presignPut, presignGet, getObject } from "./lib/s3";
 import { signStudentToken, verifyStudentToken } from "./lib/student-token";
 import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
@@ -202,7 +202,9 @@ const app = new Hono<{ Variables: Vars }>()
       const out = await getObject(key);
       if (!out.Body) return c.text("Not found", 404);
       const buf = await out.Body.transformToByteArray();
-      return c.body(buf, 200, {
+      // Cast: transformToByteArray gives Uint8Array<ArrayBufferLike>, Hono wants
+      // an ArrayBuffer-backed view. Same bytes, no copy.
+      return c.body(buf as unknown as Uint8Array<ArrayBuffer>, 200, {
         "Content-Type": out.ContentType ?? "application/octet-stream",
         // `private`: the response is authorised per-session, so shared/proxy
         // caches must never hold a copy. Browser caching is still fine —
@@ -1973,7 +1975,7 @@ const app = new Hono<{ Variables: Vars }>()
     // Schedule Assessment list, which is derived the same way. Without this, a
     // scheduled exam whose start time passed would show as live on the list but
     // never appear in the Live Monitor.
-    const startMs = (e: { startAt: number | string | null }) => {
+    const startMs = (e: { startAt: Date | number | string | null }) => {
       if (e.startAt == null) return null;
       const ms = typeof e.startAt === "number" ? e.startAt : new Date(e.startAt).getTime();
       return Number.isNaN(ms) ? null : ms;
@@ -2261,23 +2263,23 @@ const app = new Hono<{ Variables: Vars }>()
     // exam whose start time has passed is effectively live, so include it for
     // non-TPO roles too (mirrors the Live Monitor / Schedule list behaviour).
     const now = Date.now();
-    const startMs = (e: { startAt: number | string | null }) => {
+    const startMs = (e: { startAt: Date | number | string | null }) => {
       if (e.startAt == null) return null;
       const ms = typeof e.startAt === "number" ? e.startAt : new Date(e.startAt).getTime();
       return Number.isNaN(ms) ? null : ms;
     };
-    const isStarted = (e: { startAt: number | string | null }) => {
+    const isStarted = (e: { startAt: Date | number | string | null }) => {
       const ms = startMs(e);
       return ms !== null && now >= ms;
     };
-    const endMs = (e: { endAt: number | string | null }) => {
+    const endMs = (e: { endAt: Date | number | string | null }) => {
       if (e.endAt == null) return null;
       const ms = typeof e.endAt === "number" ? e.endAt : new Date(e.endAt).getTime();
       return Number.isNaN(ms) ? null : ms;
     };
     // A scheduled exam whose start time has passed is effectively LIVE — until its
     // window (endAt + admin extra time + hold time) closes, after which it has ENDED.
-    const effStatus = (e: { status: string; startAt: number | string | null; endAt: number | string | null; extraMin?: number | null; holdMs?: number | null; heldAt?: number | string | Date | null }) => {
+    const effStatus = (e: { status: string; startAt: Date | number | string | null; endAt: Date | number | string | null; extraMin?: number | null; holdMs?: number | null; heldAt?: number | string | Date | null }) => {
       if (e.status === "draft" || e.status === "finished") return e.status;
       const end = endMs(e);
       if (!e.heldAt && end !== null) {
@@ -2622,14 +2624,13 @@ const app = new Hono<{ Variables: Vars }>()
 
   // =================== AI EVALUATION (manual re-grade demo) ===================
   .post("/ai/grade", requireAuth, requirePermission("questionBank"), async (c) => {
-    const p = c.get("profile")!;
     const b = await c.req.json();
-    let provider: string | null = null;
-    if (p.tenantId) {
-      const [s] = await db.select().from(schema.settings).where(eq(schema.settings.tenantId, p.tenantId));
-      provider = s?.aiProvider ?? null;
-      await db.update(schema.settings).set({ aiUsed: dsql`${schema.settings.aiUsed} + 1` }).where(eq(schema.settings.tenantId, p.tenantId));
-    }
+    // Settings are a single global row keyed by id — there is no per-tenant
+    // settings row (an earlier per-tenant lookup here referenced a column that
+    // does not exist and 500'd this endpoint on every call).
+    const s = await getGlobalSettings();
+    const provider: string | null = s?.aiProvider ?? null;
+    await db.update(schema.settings).set({ aiUsed: dsql`${schema.settings.aiUsed} + 1` }).where(eq(schema.settings.id, GLOBAL_SETTINGS));
     const res = await gradeSubjective({
       question: b.question,
       rubric: b.rubric,

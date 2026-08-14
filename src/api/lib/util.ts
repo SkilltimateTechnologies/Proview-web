@@ -3,7 +3,6 @@ export function id(prefix = ""): string {
   return prefix ? `${prefix}_${s}` : s;
 }
 
-let counters: Record<string, number> = {};
 export function displayId(prefix: string, n: number): string {
   return `${prefix}-${String(n).padStart(4, "0")}`;
 }

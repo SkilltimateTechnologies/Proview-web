@@ -149,10 +149,6 @@ class Judge0Queue {
     }
   }
 
-  private timedOut(w: Waiter) {
-    return Date.now() - w.enqueuedAt >= MAX_WAIT_MS;
-  }
-
   private failWaiter(w: Waiter, message: string, httpStatus = 502) {
     w.resolve({ ok: false, stdout: "", stderr: "", compileOutput: "", status: "Error", time: null, memory: null, message, httpStatus });
   }
