@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useLocation } from "wouter";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Upload, X, Search, GraduationCap, UserCog, Mail, Sliders, KeyRound, Layers, Copy, Check, Pencil, Trash2, AlertTriangle } from "lucide-react";
+import { Plus, Upload, X, Search, GraduationCap, UserCog, Mail, Sliders, KeyRound, Layers, Copy, Check, Pencil, Trash2, AlertTriangle, Star, Undo2 } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Field, Drawer, usePagination, Pager } from "../components/ui";
@@ -35,10 +35,12 @@ type StudentRow = {
   email: string | null;
   enabled: boolean;
   classId: string | null;
+  originalClassId?: string | null;
 };
 type ClassRow = { id: string; code: string };
+type EliteRow = { id: string; rollNo: string; name: string; enabled: boolean; originalSection: string };
 
-type Filter = "students" | "tpo";
+type Filter = "students" | "tpo" | "elite";
 
 const ROLE_META: Record<string, { label: string; color: string }> = {
   super_admin: { label: "Super Admin", color: "#1e3a5f" },
@@ -57,6 +59,7 @@ export default function Users() {
   const [search, setSearch] = useState("");
   const [sectionFilter, setSectionFilter] = useState("all");
   const [add, setAdd] = useState(false);
+  const [eliteAdd, setEliteAdd] = useState(false);
   const [csv, setCsv] = useState(false);
   const [permFor, setPermFor] = useState<UserRow | null>(null);
   const [resetUser, setResetUser] = useState<{ kind: "staff" | "student"; id: string; name: string } | null>(null);
@@ -75,6 +78,10 @@ export default function Users() {
   const classesQ = useQuery({
     queryKey: ["classes"],
     queryFn: async () => (await api.classes.$get()).json() as Promise<{ classes: ClassRow[] }>,
+  });
+  const eliteQ = useQuery({
+    queryKey: ["elite"],
+    queryFn: async () => (await api.cohorts.elite.$get()).json() as Promise<{ eliteClassId: string | null; students: EliteRow[] }>,
   });
 
   const toggle = useMutation({
@@ -127,8 +134,12 @@ export default function Users() {
   const studentPg = usePagination(filteredStudents);
   const staffPg = usePagination(staffRows);
 
+  const eliteStudents = eliteQ.data?.students ?? [];
+  const eliteClassId = eliteQ.data?.eliteClassId ?? null;
+
   const FILTERS: Array<{ k: Filter; label: string; count: number; icon: React.ElementType }> = [
     { k: "students", label: "Students", count: students.length, icon: GraduationCap },
+    { k: "elite", label: "Elite batch", count: eliteStudents.length, icon: Star },
     { k: "tpo", label: "TPOs", count: tpos.length, icon: UserCog },
   ];
 
@@ -142,6 +153,7 @@ export default function Users() {
             {filter === "students" && <button className="btn btn-ghost" onClick={() => navigate("/sections")}><Layers size={16} /> Sections</button>}
             {filter === "students" && <button className="btn btn-ghost" onClick={() => setCsv(true)}><Upload size={16} /> Bulk upload CSV</button>}
             {filter === "students" && <button className="btn btn-primary" onClick={() => setAdd(true)}><Plus size={16} /> Add student</button>}
+            {filter === "elite" && <button className="btn btn-primary" onClick={() => setEliteAdd(true)}><Plus size={16} /> Add to Elite batch</button>}
             {filter === "tpo" && <button className="btn btn-primary" onClick={() => setAdd(true)}><Plus size={16} /> Add TPO</button>}
           </div>
         }
@@ -150,6 +162,7 @@ export default function Users() {
       {add && (filter === "students" ? <AddStudent classes={classes} onClose={() => setAdd(false)} /> : <AddUser role="tpo" onClose={() => setAdd(false)} />)}
       {editStudent && <AddStudent classes={classes} initial={editStudent} onClose={() => setEditStudent(null)} />}
       {editUser && <AddUser role={editUser.role === "college_admin" ? "college_admin" : "tpo"} initial={editUser} onClose={() => setEditUser(null)} />}
+      {eliteAdd && <AddToElite students={students} classes={classes} eliteClassId={eliteClassId} onClose={() => setEliteAdd(false)} />}
       {csv && <CsvUpload onClose={() => setCsv(false)} />}
       {permFor && <PermissionDrawer user={permFor} onClose={() => setPermFor(null)} />}
       {resetUser && <ResetPasswordDrawer target={resetUser} onClose={() => setResetUser(null)} />}
@@ -194,7 +207,7 @@ export default function Users() {
             return (
               <button
                 key={f.k}
-                onClick={() => { setFilter(f.k); setAdd(false); setCsv(false); setEditStudent(null); setEditUser(null); }}
+                onClick={() => { setFilter(f.k); setAdd(false); setEliteAdd(false); setCsv(false); setEditStudent(null); setEditUser(null); }}
                 className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm font-medium transition-colors shrink-0 ${active ? "bg-white shadow-sm text-[var(--color-ink)]" : "text-[var(--color-muted)] hover:text-[var(--color-ink)]"}`}
               >
                 <Icon size={16} className={active ? "text-[var(--brand)]" : ""} />
@@ -206,7 +219,7 @@ export default function Users() {
         </div>
         <div className="relative flex-1">
           <Search size={17} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--color-muted)]" />
-          <input className="input pl-10" placeholder={filter === "students" ? "Search name or roll no…" : "Search name, ID or email…"} value={search} onChange={(e) => setSearch(e.target.value)} />
+          <input className="input pl-10" placeholder={filter === "tpo" ? "Search name, ID or email…" : "Search name or roll no…"} value={search} onChange={(e) => setSearch(e.target.value)} />
         </div>
         {filter === "students" && (
           <select className="input sm:w-56" value={sectionFilter} onChange={(e) => setSectionFilter(e.target.value)}>
@@ -217,7 +230,9 @@ export default function Users() {
         )}
       </div>
 
-      {filter === "students" ? (
+      {filter === "elite" ? (
+        <EliteBatch rows={eliteStudents} classes={classes} loading={eliteQ.isLoading} search={s} onAdd={() => setEliteAdd(true)} />
+      ) : filter === "students" ? (
         studentsQ.isLoading ? (
           <Loader />
         ) : filteredStudents.length === 0 ? (
@@ -335,6 +350,245 @@ export default function Users() {
         })()
       )}
     </div>
+  );
+}
+
+/**
+ * ELITE batch panel. Elite is an opt-in-only cohort: students inside it leave
+ * their regular section, so regular-section exams (including "All sections")
+ * never match them. An exam must explicitly target ELITE for them to see it.
+ * Their home section is remembered so they can be restored any time.
+ */
+function EliteBatch({ rows, classes, loading, search, onAdd }: { rows: EliteRow[]; classes: ClassRow[]; loading: boolean; search: string; onAdd: () => void }) {
+  const qc = useQueryClient();
+  const [sel, setSel] = useState<Record<string, boolean>>({});
+  const [moveTo, setMoveTo] = useState("");
+  const [msg, setMsg] = useState("");
+
+  const remove = useMutation({
+    mutationFn: async ({ studentIds, classId }: { studentIds: string[]; classId?: string }) => {
+      const res = await api.cohorts.elite.remove.$post({ json: classId ? { studentIds, classId } : { studentIds } });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { message?: string }).message || "Failed");
+      return res.json() as Promise<{ restoredCount: number; restored: { rollNo: string; to: string }[]; noOriginal: string[] }>;
+    },
+    onSuccess: (d) => {
+      qc.invalidateQueries({ queryKey: ["elite"] });
+      qc.invalidateQueries({ queryKey: ["students"] });
+      setSel({});
+      setMsg(
+        `Moved ${d.restoredCount} student${d.restoredCount === 1 ? "" : "s"} out of Elite` +
+        (d.noOriginal.length ? ` — ${d.noOriginal.length} had no original section on record (${d.noOriginal.join(", ")}); pick a section below to move them.` : "."),
+      );
+    },
+    onError: (e: Error) => setMsg(e.message),
+  });
+
+  const shown = rows.filter((r) => !search || r.name.toLowerCase().includes(search) || r.rollNo.toLowerCase().includes(search));
+  const pg = usePagination(shown);
+  const selIds = Object.keys(sel).filter((k) => sel[k]);
+  const allShownChecked = shown.length > 0 && shown.every((r) => sel[r.id]);
+
+  if (loading) return <Loader />;
+
+  return (
+    <>
+      <div className="card p-4 mb-4 flex flex-wrap items-start gap-3 justify-between">
+        <div className="flex items-start gap-3 min-w-0">
+          <div className="h-9 w-9 rounded-lg flex items-center justify-center shrink-0" style={{ background: "#fff6dd", color: "#a8790b" }}><Star size={18} /></div>
+          <div className="text-sm text-[var(--color-ink2)] leading-relaxed max-w-2xl">
+            <span className="font-semibold text-[var(--color-ink)]">Opt-in cohort.</span> Elite students are excluded from every regular exam — even ones assigned to
+            “All sections”. They only get exams where <span className="mono-label">ELITE</span> is picked as a section. Past results keep showing their original section.
+          </div>
+        </div>
+        {rows.length === 0 && <button className="btn btn-primary shrink-0" onClick={onAdd}><Plus size={16} /> Add to Elite batch</button>}
+      </div>
+
+      {msg && (
+        <div className="mb-4 text-sm rounded-lg px-3 py-2 bg-[var(--color-brand-soft)] text-[var(--color-ink)] flex items-start gap-2">
+          <Check size={16} className="mt-0.5 shrink-0 text-[var(--brand)]" /> <span>{msg}</span>
+        </div>
+      )}
+
+      {rows.length === 0 ? (
+        <EmptyState title="No students in the Elite batch yet" hint="Add students by roll number or pick them from a section." />
+      ) : (
+        <>
+          <div className="flex flex-wrap items-center gap-3 mb-2">
+            <div className="mono-label">{shown.length} student{shown.length === 1 ? "" : "s"} in Elite</div>
+            {selIds.length > 0 && (
+              <div className="flex flex-wrap items-center gap-2 ml-auto">
+                <span className="mono-label">{selIds.length} selected</span>
+                <select className="input !py-1.5 w-auto" value={moveTo} onChange={(e) => setMoveTo(e.target.value)}>
+                  <option value="">Restore to original section</option>
+                  {classes.filter((c) => c.code.toUpperCase() !== "ELITE").map((c) => <option key={c.id} value={c.id}>Move to {c.code}</option>)}
+                </select>
+                <button className="btn btn-danger !py-1.5" disabled={remove.isPending} onClick={() => remove.mutate({ studentIds: selIds, classId: moveTo || undefined })}>
+                  <Undo2 size={15} /> {remove.isPending ? "Moving…" : "Remove from Elite"}
+                </button>
+              </div>
+            )}
+          </div>
+          <div className="table-wrap">
+            <div className="table-scroll">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th className="w-10">
+                      <input
+                        type="checkbox"
+                        checked={allShownChecked}
+                        onChange={(e) => {
+                          const next: Record<string, boolean> = { ...sel };
+                          for (const r of shown) next[r.id] = e.target.checked;
+                          setSel(next);
+                        }}
+                      />
+                    </th>
+                    <th>Student</th>
+                    <th>Roll No</th>
+                    <th>Original section</th>
+                    <th>Status</th>
+                    <th className="text-right">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pg.pageItems.map((r) => (
+                    <tr key={r.id}>
+                      <td><input type="checkbox" checked={!!sel[r.id]} onChange={(e) => setSel({ ...sel, [r.id]: e.target.checked })} /></td>
+                      <td>
+                        <div className="flex items-center gap-3">
+                          <div className="h-9 w-9 rounded-full flex items-center justify-center text-white text-xs font-semibold shrink-0" style={{ background: "#a8790b", fontFamily: "var(--font-mono)" }}>{initials(r.name)}</div>
+                          <span className="font-medium text-[var(--color-ink)] whitespace-nowrap">{r.name}</span>
+                        </div>
+                      </td>
+                      <td><span className="mono-label whitespace-nowrap">{r.rollNo}</span></td>
+                      <td>{r.originalSection ? <Pill label={r.originalSection} color="#1e3a5f" /> : <span className="text-[var(--color-muted)]">—</span>}</td>
+                      <td><Pill label={r.enabled ? "Active" : "Disabled"} color={r.enabled ? "#2e7d5b" : "#c0453b"} /></td>
+                      <td className="text-right">
+                        <button className="btn btn-ghost !py-1.5 !px-3" title={r.originalSection ? `Restore to ${r.originalSection}` : "No original section on record"} disabled={remove.isPending || !r.originalSection} onClick={() => remove.mutate({ studentIds: [r.id] })}>
+                          <Undo2 size={15} /> Restore{r.originalSection ? ` to ${r.originalSection}` : ""}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <Pager {...pg} onChange={pg.setPage} unit="students" />
+        </>
+      )}
+    </>
+  );
+}
+
+/** Add students to ELITE — either by pasting roll numbers or picking from a section. */
+function AddToElite({ students, classes, eliteClassId, onClose }: { students: StudentRow[]; classes: ClassRow[]; eliteClassId: string | null; onClose: () => void }) {
+  const qc = useQueryClient();
+  const [tab, setTab] = useState<"pick" | "paste">("pick");
+  const [sectionFilter, setSectionFilter] = useState("all");
+  const [q, setQ] = useState("");
+  const [sel, setSel] = useState<Record<string, boolean>>({});
+  const [paste, setPaste] = useState("");
+  const [result, setResult] = useState<{ movedCount: number; notFound: string[]; alreadyElite: string[] } | null>(null);
+  const [err, setErr] = useState("");
+
+  const classMap = new Map(classes.map((c) => [c.id, c.code]));
+  const pool = students
+    .filter((s) => !eliteClassId || s.classId !== eliteClassId)
+    .filter((s) => sectionFilter === "all" || s.classId === sectionFilter)
+    .filter((s) => !q || s.name.toLowerCase().includes(q.toLowerCase()) || s.rollNo.toLowerCase().includes(q.toLowerCase()))
+    .sort((a, b) => (classMap.get(a.classId ?? "") ?? "zzz").localeCompare(classMap.get(b.classId ?? "") ?? "zzz") || a.rollNo.localeCompare(b.rollNo));
+
+  const rolls = paste.split(/[\s,;]+/).map((r) => r.trim()).filter(Boolean);
+  const selIds = Object.keys(sel).filter((k) => sel[k]);
+
+  const addM = useMutation({
+    mutationFn: async () => {
+      const json = tab === "paste" ? { rollNos: rolls } : { studentIds: selIds };
+      const res = await api.cohorts.elite.add.$post({ json });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({})) as { message?: string }).message || "Failed");
+      return res.json() as Promise<{ movedCount: number; notFound: string[]; alreadyElite: string[] }>;
+    },
+    onSuccess: (d) => {
+      qc.invalidateQueries({ queryKey: ["elite"] });
+      qc.invalidateQueries({ queryKey: ["students"] });
+      qc.invalidateQueries({ queryKey: ["classes"] });
+      setResult(d);
+      setSel({});
+      setPaste("");
+    },
+    onError: (e: Error) => setErr(e.message),
+  });
+
+  const count = tab === "paste" ? rolls.length : selIds.length;
+
+  return (
+    <Drawer eyebrow="Elite batch" title="Add students to Elite" subtitle="They leave their current section and stop receiving regular exams. Their home section is saved so you can restore them later." onClose={onClose}>
+      <div className="flex gap-1 p-1 rounded-xl bg-[var(--color-brand-soft)] w-fit mb-4">
+        {([["pick", "Pick from sections"], ["paste", "Paste roll numbers"]] as const).map(([k, label]) => (
+          <button key={k} onClick={() => { setTab(k); setResult(null); setErr(""); }} className={`px-3.5 py-2 rounded-lg text-sm font-medium ${tab === k ? "bg-white shadow-sm text-[var(--color-ink)]" : "text-[var(--color-muted)]"}`}>{label}</button>
+        ))}
+      </div>
+
+      {result && (
+        <div className="mb-4 text-sm rounded-lg px-3 py-2 bg-[#e8f5ee] text-[#1d5c3f]">
+          Added {result.movedCount} student{result.movedCount === 1 ? "" : "s"} to Elite.
+          {result.alreadyElite.length > 0 && ` ${result.alreadyElite.length} were already in Elite.`}
+          {result.notFound.length > 0 && ` Not found: ${result.notFound.join(", ")}.`}
+        </div>
+      )}
+      {err && <div className="mb-4 text-sm text-[#c0453b] bg-[#fdecea] rounded-lg px-3 py-2">{err}</div>}
+
+      {tab === "paste" ? (
+        <Field label="Roll numbers (one per line, or comma separated)">
+          <textarea className="input min-h-[220px]" style={{ fontFamily: "var(--font-mono)" }} value={paste} onChange={(e) => setPaste(e.target.value)} placeholder={"23K91A0501\n23K91A0502"} />
+        </Field>
+      ) : (
+        <>
+          <div className="flex flex-col sm:flex-row gap-3 mb-3">
+            <div className="relative flex-1">
+              <Search size={17} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--color-muted)]" />
+              <input className="input pl-10" placeholder="Search name or roll no…" value={q} onChange={(e) => setQ(e.target.value)} />
+            </div>
+            <select className="input sm:w-52" value={sectionFilter} onChange={(e) => setSectionFilter(e.target.value)}>
+              <option value="all">All sections</option>
+              {classes.filter((c) => c.id !== eliteClassId).map((c) => <option key={c.id} value={c.id}>{c.code}</option>)}
+            </select>
+            <button
+              className="btn btn-ghost"
+              onClick={() => {
+                const next: Record<string, boolean> = { ...sel };
+                const on = !pool.every((s) => sel[s.id]);
+                for (const s of pool) next[s.id] = on;
+                setSel(next);
+              }}
+            >
+              {pool.every((s) => sel[s.id]) && pool.length > 0 ? "Clear" : "Select"} all shown ({pool.length})
+            </button>
+          </div>
+          <div className="border border-[var(--color-line)] rounded-xl max-h-[45vh] overflow-y-auto divide-y divide-[var(--color-line)]">
+            {pool.length === 0 ? (
+              <div className="p-6 text-center text-sm text-[var(--color-muted)]">No matching students.</div>
+            ) : pool.map((s) => (
+              <label key={s.id} className="flex items-center gap-3 px-3 py-2.5 cursor-pointer hover:bg-[var(--color-brand-soft)]">
+                <input type="checkbox" checked={!!sel[s.id]} onChange={(e) => setSel({ ...sel, [s.id]: e.target.checked })} />
+                <span className="font-medium text-[var(--color-ink)] flex-1 min-w-0 truncate">{s.name}</span>
+                <span className="mono-label">{s.rollNo}</span>
+                <span className="mono-label w-16 text-right">{classMap.get(s.classId ?? "") ?? "—"}</span>
+              </label>
+            ))}
+          </div>
+        </>
+      )}
+
+      <div className="flex justify-end gap-2 mt-5">
+        <button className="btn btn-ghost" onClick={onClose}>Close</button>
+        <button className="btn btn-primary" disabled={count === 0 || addM.isPending} onClick={() => { setErr(""); addM.mutate(); }}>
+          <Star size={16} /> {addM.isPending ? "Adding…" : `Add ${count || ""} to Elite`}
+        </button>
+      </div>
+    </Drawer>
   );
 }
 

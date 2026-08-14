@@ -56,6 +56,10 @@ export const students = sqliteTable(
     id: text("id").primaryKey(),
     tenantId: text("tenant_id").notNull(),
     classId: text("class_id"),
+    // The student's home/regular section before they were promoted into a special
+    // cohort (e.g. ELITE). Set when moving into Elite so the move is reversible and
+    // reports can show where they came from. Null = never moved.
+    originalClassId: text("original_class_id"),
     rollNo: text("roll_no").notNull(),   // STU-21CS102
     name: text("name").notNull(),
     email: text("email"),
@@ -199,6 +203,10 @@ export const attempts = sqliteTable(
     // the student started but never submitted (lost connection through the
     // cutoff). Lets reports show a distinct "Disconnected" status vs true Absent.
     disconnected: integer("disconnected", { mode: "boolean" }).notNull().default(false),
+    // Section code (e.g. "CSM-C") captured at attempt time. Reports read this so a
+    // later section change (e.g. promotion into ELITE) never retroactively relabels
+    // historical results. Null on old rows -> reports fall back to current section.
+    sectionSnapshot: text("section_snapshot"),
     submittedAt: integer("submitted_at", { mode: "timestamp_ms" }),
     createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
   },

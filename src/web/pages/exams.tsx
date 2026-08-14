@@ -320,6 +320,8 @@ export function EditExam() {
             students on top, leave the scope on sections and use <b>Roster overrides → Add student</b> below.
             <br />
             <b>Only specific students</b> is exclusive — it ignores all sections and assigns <i>only</i> the students you pick.
+            <br />
+            <b>ELITE</b> is opt-in only — Elite-batch students are skipped by <b>All sections</b> and are only assigned when you pick <b>ELITE</b> under Specific sections.
           </p>
           {scope === "students" && (
             <div className="mb-3 rounded-lg border px-3 py-2 text-xs" style={{ borderColor: "#e0b400", background: "#fff8e1", color: "#8a6d00" }}>
@@ -770,6 +772,8 @@ export function NewExam() {
             top, keep the scope on sections, save the assessment, then use <b>Roster overrides → Add student</b> on the edit screen.
             <br />
             <b>Only specific students</b> is exclusive — it ignores all sections and assigns <i>only</i> the students you pick.
+            <br />
+            <b>ELITE</b> is opt-in only — Elite-batch students are skipped by <b>All sections</b> and are only assigned when you pick <b>ELITE</b> under Specific sections.
           </p>
           {scope === "students" && (
             <div className="mb-3 rounded-lg border px-3 py-2 text-xs" style={{ borderColor: "#e0b400", background: "#fff8e1", color: "#8a6d00" }}>

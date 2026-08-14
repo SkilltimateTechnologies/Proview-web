@@ -13,7 +13,7 @@ import { queueAttemptGrading, finalizeAttempt, hasContent } from "./lib/grade-qu
 import { presignPut, getObject } from "./lib/s3";
 import { signStudentToken, verifyStudentToken } from "./lib/student-token";
 import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
-import { isEligible, matchesCohort, loadRoster, loadRosters } from "./lib/roster";
+import { isEligible, matchesCohort, loadRoster, loadRosters, ensureOptInOnlyLoaded, invalidateOptInOnlyCache, isOptInOnlyCode } from "./lib/roster";
 
 type Vars = { user: SessionUser | null; profile: ProfileCtx | null };
 
@@ -235,6 +235,9 @@ const app = new Hono<{ Variables: Vars }>()
         .select()
         .from(schema.exams)
         .where(and(eq(schema.exams.tenantId, tid), inArray(schema.exams.status, ["scheduled", "live"])));
+      // Make sure opt-in-only cohorts (ELITE) are known before cohort matching, so a
+      // student registering into ELITE is not auto-enrolled into regular exams.
+      await ensureOptInOnlyLoaded();
       const stu = { id: newStuId, classId };
       const toEnroll = activeExams.filter((e) => {
         const secIds = (e.sectionIds as string[] | null) ?? null;
@@ -417,29 +420,41 @@ const app = new Hono<{ Variables: Vars }>()
     const p = c.get("profile")!;
     const b = await c.req.json();
     const tid = p.role === "super_admin" ? (b.tenantId ?? p.tenantId) : p.tenantId;
-    const code = `${b.branch}-${b.section}`;
+    // A section letter is optional: branch-wide cohorts (CIVIL, EEE, ELITE) have no
+    // letter and their code is just the branch name.
+    const sec = String(b.section ?? "").trim();
+    const code = sec ? `${b.branch}-${sec}` : String(b.branch).trim();
     const [row] = await db
       .insert(schema.classes)
-      .values({ id: id("cls"), tenantId: tid!, branch: b.branch, batchStartYear: b.batchStartYear, section: b.section, code })
+      .values({ id: id("cls"), tenantId: tid!, branch: b.branch, batchStartYear: b.batchStartYear, section: sec, code })
       .returning();
+    // A new ELITE-style cohort changes who is opt-in-only — drop the cache.
+    if (isOptInOnlyCode(code) || isOptInOnlyCode(b.branch)) invalidateOptInOnlyCache();
     return c.json({ class: row }, 201);
   })
   .patch("/classes/:id", requireAuth, requirePermission("users"), async (c) => {
     const cid = c.req.param("id");
     const b = await c.req.json();
-    const code = `${b.branch}-${b.section}`;
+    const sec = String(b.section ?? "").trim();
+    const code = sec ? `${b.branch}-${sec}` : String(b.branch).trim();
     const [row] = await db
       .update(schema.classes)
-      .set({ branch: b.branch, section: b.section, batchStartYear: b.batchStartYear, code })
+      .set({ branch: b.branch, section: sec, batchStartYear: b.batchStartYear, code })
       .where(eq(schema.classes.id, cid))
       .returning();
+    // Renaming a class can add/remove ELITE status — always drop the cache.
+    invalidateOptInOnlyCache();
     return c.json({ class: row }, 200);
   })
   .delete("/classes/:id", requireAuth, requirePermission("users"), async (c) => {
     const cid = c.req.param("id");
-    // Unassign any students in this section, then delete it.
+    // Unassign any students in this section, then delete it. Students promoted OUT of
+    // this section keep their originalClassId pointer, so clear those too to avoid
+    // dangling references breaking "restore to original section".
     await db.update(schema.students).set({ classId: null }).where(eq(schema.students.classId, cid));
+    await db.update(schema.students).set({ originalClassId: null }).where(eq(schema.students.originalClassId, cid));
     await db.delete(schema.classes).where(eq(schema.classes.id, cid));
+    invalidateOptInOnlyCache();
     return c.json({ ok: true }, 200);
   })
 
@@ -454,6 +469,7 @@ const app = new Hono<{ Variables: Vars }>()
         id: schema.students.id,
         tenantId: schema.students.tenantId,
         classId: schema.students.classId,
+        originalClassId: schema.students.originalClassId,
         rollNo: schema.students.rollNo,
         name: schema.students.name,
         email: schema.students.email,
@@ -573,6 +589,126 @@ const app = new Hono<{ Variables: Vars }>()
     const [row] = await db.update(schema.students).set(patch).where(eq(schema.students.id, sid)).returning();
     return c.json({ student: row }, 200);
   })
+  // ============ SPECIAL COHORTS (ELITE) ============
+  // A special cohort is a section that is OPT-IN ONLY: students in it are skipped by
+  // every regular-section assessment (including "All sections") and only receive
+  // assessments that explicitly target the cohort. Moving a student in records their
+  // previous section in originalClassId so the move is fully reversible.
+
+  // Resolve (or create) the tenant's ELITE cohort section.
+  .post("/cohorts/elite/ensure", requireAuth, requirePermission("users"), async (c) => {
+    const p = c.get("profile")!;
+    const tid = p.tenantId;
+    if (!tid) return c.json({ message: "No tenant" }, 400);
+    const rows = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, tid));
+    let elite = rows.find((cl) => isOptInOnlyCode(cl.code) || isOptInOnlyCode(cl.branch));
+    if (!elite) {
+      const year = new Date().getFullYear();
+      [elite] = await db
+        .insert(schema.classes)
+        .values({ id: id("cls"), tenantId: tid, branch: "ELITE", batchStartYear: year, section: "", code: "ELITE" })
+        .returning();
+      invalidateOptInOnlyCache();
+    }
+    return c.json({ class: elite }, 200);
+  })
+
+  // Move students INTO the ELITE cohort (bulk, by studentId or rollNo).
+  // Their current section is saved to originalClassId (only if not already saved, so
+  // repeated moves never lose the true home section).
+  .post("/cohorts/elite/add", requireAuth, requirePermission("users"), async (c) => {
+    const p = c.get("profile")!;
+    const tid = p.tenantId;
+    if (!tid) return c.json({ message: "No tenant" }, 400);
+    const b = await c.req.json();
+    const ids: string[] = Array.isArray(b.studentIds) ? b.studentIds.map(String) : [];
+    const rolls: string[] = Array.isArray(b.rollNos) ? b.rollNos.map((r: unknown) => String(r).trim().toUpperCase()) : [];
+
+    const cls = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, tid));
+    let elite = cls.find((cl) => isOptInOnlyCode(cl.code) || isOptInOnlyCode(cl.branch));
+    if (!elite) {
+      const year = new Date().getFullYear();
+      [elite] = await db
+        .insert(schema.classes)
+        .values({ id: id("cls"), tenantId: tid, branch: "ELITE", batchStartYear: year, section: "", code: "ELITE" })
+        .returning();
+      invalidateOptInOnlyCache();
+    }
+
+    const all = await db.select().from(schema.students).where(eq(schema.students.tenantId, tid));
+    const byId = new Map(all.map((s) => [s.id, s]));
+    const byRoll = new Map(all.map((s) => [s.rollNo.trim().toUpperCase(), s]));
+
+    const moved: { id: string; rollNo: string; name: string; from: string }[] = [];
+    const alreadyElite: string[] = [];
+    const notFound: string[] = [];
+
+    const targets = new Map<string, typeof all[number]>();
+    for (const sidRaw of ids) {
+      const s = byId.get(sidRaw);
+      if (s) targets.set(s.id, s); else notFound.push(sidRaw);
+    }
+    for (const roll of rolls) {
+      const s = byRoll.get(roll);
+      if (s) targets.set(s.id, s); else notFound.push(roll);
+    }
+
+    const codeById = new Map(cls.map((cl) => [cl.id, cl.code]));
+    for (const s of targets.values()) {
+      if (s.classId === elite.id) { alreadyElite.push(s.rollNo); continue; }
+      // Preserve the FIRST known home section; don't overwrite on re-moves.
+      const keepOriginal = s.originalClassId ?? s.classId ?? null;
+      await db.update(schema.students).set({ classId: elite.id, originalClassId: keepOriginal }).where(eq(schema.students.id, s.id));
+      moved.push({ id: s.id, rollNo: s.rollNo, name: s.name, from: codeById.get(s.classId ?? "") ?? "(none)" });
+    }
+    return c.json({ ok: true, eliteClassId: elite.id, movedCount: moved.length, moved, alreadyElite, notFound }, 200);
+  })
+
+  // Remove students FROM the ELITE cohort, restoring their original section.
+  .post("/cohorts/elite/remove", requireAuth, requirePermission("users"), async (c) => {
+    const p = c.get("profile")!;
+    const tid = p.tenantId;
+    if (!tid) return c.json({ message: "No tenant" }, 400);
+    const b = await c.req.json();
+    const ids: string[] = Array.isArray(b.studentIds) ? b.studentIds.map(String) : [];
+    // Optional explicit destination; otherwise fall back to originalClassId.
+    const toClassId: string | null = b.classId ? String(b.classId) : null;
+
+    const all = await db.select().from(schema.students).where(eq(schema.students.tenantId, tid));
+    const byId = new Map(all.map((s) => [s.id, s]));
+    const restored: { id: string; rollNo: string; to: string }[] = [];
+    const noOriginal: string[] = [];
+
+    const cls = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, tid));
+    const codeById = new Map(cls.map((cl) => [cl.id, cl.code]));
+
+    for (const sidRaw of ids) {
+      const s = byId.get(sidRaw);
+      if (!s) continue;
+      const dest = toClassId ?? s.originalClassId;
+      if (!dest) { noOriginal.push(s.rollNo); continue; }
+      await db.update(schema.students).set({ classId: dest, originalClassId: null }).where(eq(schema.students.id, s.id));
+      restored.push({ id: s.id, rollNo: s.rollNo, to: codeById.get(dest) ?? dest });
+    }
+    return c.json({ ok: true, restoredCount: restored.length, restored, noOriginal }, 200);
+  })
+
+  // Current ELITE roster + each student's original section.
+  .get("/cohorts/elite", requireAuth, async (c) => {
+    const p = c.get("profile")!;
+    const tid = p.tenantId;
+    if (!tid) return c.json({ eliteClassId: null, students: [] }, 200);
+    const cls = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, tid));
+    const elite = cls.find((cl) => isOptInOnlyCode(cl.code) || isOptInOnlyCode(cl.branch));
+    if (!elite) return c.json({ eliteClassId: null, students: [] }, 200);
+    const codeById = new Map(cls.map((cl) => [cl.id, cl.code]));
+    const rows = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, tid), eq(schema.students.classId, elite.id)));
+    const out = rows
+      .map((s) => ({ id: s.id, rollNo: s.rollNo, name: s.name, enabled: s.enabled, originalSection: s.originalClassId ? codeById.get(s.originalClassId) ?? "" : "" }))
+      .sort((a, b) => a.rollNo.localeCompare(b.rollNo));
+    return c.json({ eliteClassId: elite.id, students: out }, 200);
+  })
+
   .post("/students/:id/reset-password", requireAuth, requirePermission("users"), async (c) => {
     const sid = c.req.param("id");
     const b = await c.req.json();
@@ -801,7 +937,14 @@ const app = new Hono<{ Variables: Vars }>()
     const now = Date.now();
     if (!attempt) {
       const startedAt = new Date(now);
-      [attempt] = await db.insert(schema.attempts).values({ id: id("att"), examId: eid, studentId: sid, status: "in_progress", startedAt }).returning();
+      // Freeze the student's section onto the attempt. Reports read this snapshot, so
+      // a later section change (e.g. promotion into ELITE) never rewrites history.
+      let sectionSnapshot: string | null = null;
+      if (startStu.classId) {
+        const [snapCls] = await db.select({ code: schema.classes.code }).from(schema.classes).where(eq(schema.classes.id, startStu.classId)).limit(1);
+        sectionSnapshot = snapCls?.code ?? null;
+      }
+      [attempt] = await db.insert(schema.attempts).values({ id: id("att"), examId: eid, studentId: sid, status: "in_progress", startedAt, sectionSnapshot }).returning();
     } else if (attempt.status === "not_started") {
       [attempt] = await db.update(schema.attempts).set({ status: "in_progress", startedAt: new Date(now) }).where(eq(schema.attempts.id, attempt.id)).returning();
     }
@@ -1522,6 +1665,7 @@ const app = new Hono<{ Variables: Vars }>()
     const [stu] = await db.select().from(schema.students).where(eq(schema.students.id, studentId)).limit(1);
     if (!stu || stu.tenantId !== p.tenantId) return c.json({ message: "Student not found" }, 404);
     await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
+    await ensureOptInOnlyLoaded();
     if (!matchesCohort(ex, stu)) {
       await db.insert(schema.examRoster).values({ id: id("rst"), examId: eid, studentId, mode: "add", createdBy: p.userId ?? null });
     }
@@ -1547,6 +1691,7 @@ const app = new Hono<{ Variables: Vars }>()
     await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
     // Only need a "remove" override if the student would otherwise be a cohort match.
     const [stu] = await db.select().from(schema.students).where(eq(schema.students.id, studentId)).limit(1);
+    await ensureOptInOnlyLoaded();
     if (stu && matchesCohort(ex, stu)) {
       await db.insert(schema.examRoster).values({ id: id("rst"), examId: eid, studentId, mode: "remove", createdBy: p.userId ?? null });
     }
@@ -1990,12 +2135,16 @@ const app = new Hono<{ Variables: Vars }>()
     const smap = new Map(students.map((s) => [s.id, s]));
     const classes = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, p.tenantId!));
     const clmap = new Map(classes.map((cl) => [cl.id, cl]));
+    // Prefer the section frozen on the attempt (historical truth). Fall back to the
+    // student's current section for older rows that predate the snapshot.
     const sectionOf = (sid: string) => {
       const cid = smap.get(sid)?.classId;
       return cid ? clmap.get(cid)?.code ?? "" : "";
     };
+    const sectionOfAttempt = (a: { studentId: string; sectionSnapshot?: string | null }) =>
+      a.sectionSnapshot && a.sectionSnapshot.trim() ? a.sectionSnapshot : sectionOf(a.studentId);
     const attemptRows = atts
-      .map((a) => ({ attemptId: a.id, studentId: a.studentId, name: smap.get(a.studentId)?.name ?? "—", rollNo: smap.get(a.studentId)?.rollNo ?? "", email: smap.get(a.studentId)?.email ?? null, section: sectionOf(a.studentId), score: a.score, status: a.status, submittedAt: a.submittedAt, absent: false, disconnected: !!a.disconnected, answeredCount: a.answeredCount ?? 0 }))
+      .map((a) => ({ attemptId: a.id, studentId: a.studentId, name: smap.get(a.studentId)?.name ?? "—", rollNo: smap.get(a.studentId)?.rollNo ?? "", email: smap.get(a.studentId)?.email ?? null, section: sectionOfAttempt(a), score: a.score, status: a.status, submittedAt: a.submittedAt, absent: false, disconnected: !!a.disconnected, answeredCount: a.answeredCount ?? 0 }))
       .sort((x, y) => (y.score ?? -1) - (x.score ?? -1));
     // Assigned-but-absent students: enrolled in the exam's cohort yet no attempt row.
     // Only surface them once the exam window has closed (before that they may still
@@ -2101,6 +2250,7 @@ const app = new Hono<{ Variables: Vars }>()
     // Drop any existing override for this student, then add.
     await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
     // Only need an explicit "add" row when the student isn't already a cohort match.
+    await ensureOptInOnlyLoaded();
     if (!matchesCohort(ex, stu)) {
       await db.insert(schema.examRoster).values({ id: id("rst"), examId: eid, studentId, mode: "add", createdBy: p.userId ?? null });
     }
@@ -2178,6 +2328,7 @@ const app = new Hono<{ Variables: Vars }>()
     // Guarantee roster eligibility: clear a stray "remove"; add an "add" override
     // only if the student isn't already a cohort match.
     await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId), eq(schema.examRoster.mode, "remove")));
+    await ensureOptInOnlyLoaded();
     if (!matchesCohort(ex, stu)) {
       const existing = await db.select().from(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId), eq(schema.examRoster.mode, "add")));
       if (!existing.length) await db.insert(schema.examRoster).values({ id: id("rst"), examId: eid, studentId, mode: "add", createdBy: p.userId ?? null });
