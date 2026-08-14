@@ -62,7 +62,18 @@ const FRAME_EVENT_TYPES = ["periodic_snapshot", "preflight_snapshot"] as const;
 const isFrameEvent = (t: string) => (FRAME_EVENT_TYPES as readonly string[]).includes(t);
 // Informational rows that belong on the integrity timeline (a reviewer wants to
 // see when a blocked camera view cleared) but are not themselves violations.
-const NON_VIOLATION_TYPES = new Set<string>([...FRAME_EVENT_TYPES, "camera_restored"]);
+// `camera_block_dismissed` is the student's own claim that the room is merely dim,
+// recorded so a reviewer can weigh it. It is context for the `camera_obstructed`
+// row that always precedes it, not a second offence, so counting it too would
+// double-count a single episode.
+// `focus_loss` is window.blur, which fires for things the student does not control:
+// an OS/antivirus/notification toast stealing focus. Measured live, 36 attempts logged
+// it on a near-perfect 60s cadence (median gap 60.0s, each machine with its own fixed
+// second-offset) while `tab_switch` fired only twice overall — i.e. the tab never left
+// the foreground. Counting it produced ~15 phantom violations an hour for students who
+// did nothing wrong, so it stays on the timeline as context but no longer scores.
+// Real tab/app switching is still caught by `tab_switch` (visibilitychange).
+const NON_VIOLATION_TYPES = new Set<string>([...FRAME_EVENT_TYPES, "camera_restored", "camera_block_dismissed", "focus_loss"]);
 
 type RawIntegrityEvent = { type?: unknown; detail?: unknown; at?: unknown; photoKey?: unknown; photoUrl?: unknown };
 
@@ -1017,7 +1028,12 @@ const app = new Hono<{ Variables: Vars }>()
       return c.json({ message: "Not eligible for this exam" }, 403);
     }
 
-    let [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid))).limit(1);
+    // Always resolve to the OLDEST attempt for this (exam, student) pair. A stable
+    // deterministic pick means /start /status /heartbeat /resume all agree on the
+    // same row even if a legacy duplicate still exists.
+    let [attempt] = await db.select().from(schema.attempts)
+      .where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid)))
+      .orderBy(schema.attempts.createdAt, schema.attempts.id).limit(1);
     if (attempt && (attempt.status === "submitted" || attempt.status === "graded")) {
       return c.json({ message: "Already submitted" }, 409);
     }
@@ -1031,7 +1047,27 @@ const app = new Hono<{ Variables: Vars }>()
         const [snapCls] = await db.select({ code: schema.classes.code }).from(schema.classes).where(eq(schema.classes.id, startStu.classId)).limit(1);
         sectionSnapshot = snapCls?.code ?? null;
       }
-      [attempt] = await db.insert(schema.attempts).values({ id: id("att"), examId: eid, studentId: sid, status: "in_progress", startedAt, sectionSnapshot }).returning();
+      // RACE-SAFE CREATE. A student clicking Start twice, a flaky network retry, or
+      // SEB reloading the page fires several /start calls at once. Select-then-insert
+      // lets every one of them insert a row (they all see an empty SELECT), which is
+      // what produced up to 44 duplicate rows for one student. The unique index on
+      // (exam_id, student_id) now makes only the first insert win; the losers catch
+      // the conflict and re-read the winning row, so all callers converge on one attempt.
+      try {
+        [attempt] = await db.insert(schema.attempts)
+          .values({ id: id("att"), examId: eid, studentId: sid, status: "in_progress", startedAt, sectionSnapshot })
+          .returning();
+      } catch {
+        [attempt] = await db.select().from(schema.attempts)
+          .where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid)))
+          .orderBy(schema.attempts.createdAt, schema.attempts.id).limit(1);
+      }
+      // Lost the race AND could not read the winner (should not happen) — fail loudly
+      // rather than continue with an undefined attempt.
+      if (!attempt) return c.json({ message: "Could not start attempt, please retry" }, 503);
+      if (attempt.status === "submitted" || attempt.status === "graded") {
+        return c.json({ message: "Already submitted" }, 409);
+      }
     } else if (attempt.status === "not_started") {
       [attempt] = await db.update(schema.attempts).set({ status: "in_progress", startedAt: new Date(now) }).where(eq(schema.attempts.id, attempt.id)).returning();
     }
@@ -1059,7 +1095,7 @@ const app = new Hono<{ Variables: Vars }>()
     const eid = c.req.param("examId");
     const [exam] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
     if (!exam) return c.json({ message: "Not found" }, 404);
-    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid))).limit(1);
+    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid))).orderBy(schema.attempts.createdAt, schema.attempts.id).limit(1);
     const now = Date.now();
     if (!attempt) {
       return c.json({ status: "not_started", attemptId: null, startedAt: null, endAt: null, serverNow: new Date(now), held: false }, 200);
@@ -1089,7 +1125,7 @@ const app = new Hono<{ Variables: Vars }>()
     const eid = c.req.param("examId");
     const [exam] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
     if (!exam) return c.json({ message: "Not found" }, 404);
-    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid))).limit(1);
+    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid))).orderBy(schema.attempts.createdAt, schema.attempts.id).limit(1);
     if (!attempt) return c.json({ message: "No attempt to resume" }, 404);
     if (attempt.status === "submitted" || attempt.status === "graded") return c.json({ message: "Already submitted" }, 409);
     const b = await c.req.json().catch(() => ({}));
@@ -1120,7 +1156,7 @@ const app = new Hono<{ Variables: Vars }>()
     const sid = await verifyStudentToken(c.req.header("x-student-token"));
     if (!sid) return c.json({ message: "Unauthorized" }, 401);
     const eid = c.req.param("examId");
-    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid))).limit(1);
+    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid))).orderBy(schema.attempts.createdAt, schema.attempts.id).limit(1);
     if (!attempt) return c.json({ message: "No attempt" }, 404);
     if (attempt.status === "submitted" || attempt.status === "graded") return c.json({ ok: true }, 200);
     if (!attempt.lastPausedAt) {
@@ -1139,7 +1175,7 @@ const app = new Hono<{ Variables: Vars }>()
     const eid = c.req.param("examId");
     const [exam] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
     if (!exam) return c.json({ message: "Not found" }, 404);
-    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid))).limit(1);
+    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid))).orderBy(schema.attempts.createdAt, schema.attempts.id).limit(1);
     if (!attempt) return c.json({ message: "No attempt" }, 404);
     const now = Date.now();
     await db.update(schema.attempts).set({ lastSeenAt: new Date(now) }).where(eq(schema.attempts.id, attempt.id));
@@ -1977,6 +2013,13 @@ const app = new Hono<{ Variables: Vars }>()
     // All enabled students in the tenant — used to compute the assigned cohort
     // per exam so we can surface who hasn't started yet.
     const allStudents = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, tid), eq(schema.students.enabled, true)));
+    // Every student in the tenant (including disabled ones) indexed by id. An
+    // attempt can belong to a student who was disabled mid-term, so this map is
+    // built WITHOUT the enabled filter. Resolving names from this map instead of
+    // querying per attempt turns ~1200 round trips into one — the Live Monitor
+    // was timing out on large exams because of that N+1.
+    const tenantStudents = await db.select().from(schema.students).where(eq(schema.students.tenantId, tid));
+    const studentById = new Map(tenantStudents.map((s) => [s.id, s]));
     // Resolve a student's classId to a readable section code (e.g. "CSE-C").
     const allClasses = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, tid));
     const classCodeById = new Map(allClasses.map((cl) => [cl.id, cl.code]));
@@ -2014,7 +2057,7 @@ const app = new Hono<{ Variables: Vars }>()
         }
         const enriched = await Promise.all(
           engaged.map(async (a) => {
-            const [stu] = await db.select().from(schema.students).where(eq(schema.students.id, a.studentId));
+            const stu = studentById.get(a.studentId);
             const status = a.status === "in_progress" ? "in_progress" : "finished";
             // Online = a heartbeat within the last 40s (heartbeat interval is ~15s).
             const online = a.status === "in_progress" && !!a.lastSeenAt && now - new Date(a.lastSeenAt).getTime() < 40_000;

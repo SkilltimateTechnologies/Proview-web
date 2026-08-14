@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, real, index } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, real, index, uniqueIndex } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 
 export * from "./auth-schema";
@@ -210,7 +210,15 @@ export const attempts = sqliteTable(
     submittedAt: integer("submitted_at", { mode: "timestamp_ms" }),
     createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
   },
-  (t) => [index("attempts_exam_idx").on(t.examId), index("attempts_student_idx").on(t.studentId)],
+  (t) => [
+    index("attempts_exam_idx").on(t.examId),
+    index("attempts_student_idx").on(t.studentId),
+    // One attempt per student per exam, enforced by the DB. Without this, two
+    // concurrent /start calls both SELECT nothing and both INSERT, which is how a
+    // single student ended up with dozens of rows in the Live Monitor. /start now
+    // relies on this constraint (insert -> catch conflict -> re-select).
+    uniqueIndex("attempts_exam_student_uq").on(t.examId, t.studentId),
+  ],
 );
 
 export const answers = sqliteTable(

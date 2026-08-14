@@ -221,6 +221,19 @@ const DARK_STDDEV = 0.04;    // ...with no structure in it
 const FROZEN_DELTA = 0.0001;
 const FROZEN_RUNS = 5;
 
+/** Instantaneous per-frame judgement: is this ONE frame a usable picture?
+ *
+ *  Separate from the detector below on purpose. The detector deliberately reports
+ *  "ok" until it has seen N consecutive bad frames, so its verdict must never be
+ *  read as "the lens is clear" — for the recovery path (clearing the blocked-lens
+ *  overlay) we need the raw per-frame answer, counted the other way round. */
+export function isFrameClear(m: FrameMetrics | null): boolean {
+  if (!m) return false;
+  const flat = m.stddev < FLAT_STDDEV;
+  const dark = m.mean < DARK_MEAN && m.stddev < DARK_STDDEV;
+  return !flat && !dark;
+}
+
 /** Stateful obstruction detector. One instance per attempt.
  *
  *  Requires several consecutive bad frames before declaring anything, so a

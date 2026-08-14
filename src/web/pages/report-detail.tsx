@@ -633,6 +633,7 @@ const EVENT_META: Record<string, { label: string; icon: typeof ShieldAlert; colo
   camera_lost: { label: "Camera turned off", icon: VideoOff, color: "#c0453b" },
   camera_obstructed: { label: "Camera view blocked", icon: EyeOff, color: "#c0453b" },
   camera_restored: { label: "Camera view restored", icon: Check, color: "#2e7d5b" },
+  camera_block_dismissed: { label: "Continued with blocked camera (reported a dim room)", icon: EyeOff, color: "#b7791f" },
   tab_switch: { label: "Switched away from exam", icon: EyeOff, color: "#c0453b" },
   focus_loss: { label: "Exam window lost focus", icon: EyeOff, color: "#b7791f" },
   fullscreen_exit: { label: "Left fullscreen", icon: Maximize, color: "#c0453b" },

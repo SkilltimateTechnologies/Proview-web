@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useParams } from "wouter";
 import { api, type Bundle, type BundleQuestion, type ProctorConfig, DEFAULT_PROCTORING } from "../lib/api";
 import { useSession } from "../lib/session";
-import { requestFullscreen, exitFullscreen, startWebcam, getDisplayCount, startProctoring, captureFrame, isCameraActive, createObstructionDetector, type FrameMetrics, type ProctorEvent, type WebcamHandle } from "../lib/proctor";
+import { requestFullscreen, exitFullscreen, startWebcam, getDisplayCount, startProctoring, captureFrame, isCameraActive, createObstructionDetector, isFrameClear, type FrameMetrics, type ProctorEvent, type WebcamHandle } from "../lib/proctor";
 import { Icon, NetBadge, useOnline } from "../components/ui";
 
 type Phase = "brief" | "preflight" | "resume" | "running" | "validating" | "done";
@@ -30,6 +30,10 @@ function fmtClock(ms: number): string {
 // localStorage bridge so an in-progress exam survives a forced logout/relogin
 // (used when the internet drops mid-exam and we bounce the student to login).
 const ACTIVE_EXAM_KEY = "examly:activeExam";
+// How long the blocked-lens overlay stays un-dismissable. Long enough that
+// uncovering a taped lens is the path of least resistance, short enough that a
+// candidate in a genuinely dark room is not stuck missing exam time.
+const ESCAPE_AFTER_MS = 60_000;
 // We persist attemptId + the server-anchored absolute endAt alongside answers so
 // that a REFRESH WHILE OFFLINE can rebuild the running session without hitting the
 // network. endAt is an absolute wall-clock deadline (not a countdown), so it stays
@@ -145,6 +149,15 @@ export function ExamRunner() {
   // an unlit room is a legitimate false positive.
   const obstructionRef = useRef(createObstructionDetector());
   const [camBlocked, setCamBlocked] = useState<string | null>(null);
+  // While blocked we show a modal, so the passive 27s cadence is far too slow to
+  // clear it — a candidate who uncovers the lens would stare at the overlay for
+  // another ~80s. `blockedSince` drives a fast local re-check loop (see below) and
+  // the "just dim" escape hatch, which only appears after ESCAPE_AFTER_MS so it
+  // can't be used to click straight past the check.
+  const [blockedSince, setBlockedSince] = useState<number | null>(null);
+  const [blockAck, setBlockAck] = useState(false);
+  const blockAckRef = useRef(false);
+  blockAckRef.current = blockAck;
   // Preflight frames are captured before the attempt exists (no attemptId yet, so
   // nothing can be signed or uploaded). Buffer the JPEGs here and flush them the
   // moment /start returns an attemptId.
@@ -298,11 +311,14 @@ export function ExamRunner() {
       // Recovery is logged so a reviewer can see how long the view was blocked,
       // but it is NOT misconduct and never counts as a violation.
       setCamBlocked(null);
+      setBlockedSince(null);
+      setBlockAck(false);
       pendingEventsRef.current.push({ type: "camera_restored", detail: "Camera view is clear again", at });
       flushEventsRef.current();
       return;
     }
     setCamBlocked(verdict.reason);
+    setBlockedSince((prev) => prev ?? at);
     const ev: ProctorEvent = { type: "camera_obstructed", detail: verdict.reason, at };
     pendingEventsRef.current.push({ ...ev, photoKey });
     setSession((prev) => (prev ? { ...prev, integrityEvents: [...prev.integrityEvents, ev] } : prev));
@@ -311,6 +327,67 @@ export function ExamRunner() {
   }, [grabFrame, pushAlert]);
   const capturePeriodicRef = useRef(capturePeriodic);
   capturePeriodicRef.current = capturePeriodic;
+
+  // ---- Fast re-check while the lens is blocked ----
+  // Runs only while the overlay is up. Captures locally and does NOT upload: the
+  // timed 27s cadence still owns the evidence trail, this loop exists purely so the
+  // overlay disappears within a few seconds of the candidate uncovering the lens.
+  // Two consecutive clear frames are required so a single bright flicker (a hand
+  // passing, a headlight) can't clear a genuinely taped camera.
+  useEffect(() => {
+    if (!camBlocked || phase !== "running") return;
+    if (!proctoringRef.current.detectCameraBlock) return;
+    // A lens already covered at the camera check carries straight into the exam, so
+    // the periodic detector hasn't stamped blockedSince yet. Stamp it here or the
+    // escape hatch would never unlock for a candidate who started in a dim room.
+    setBlockedSince((prev) => prev ?? Date.now());
+    let stop = false;
+    // Count consecutive CLEAR frames with isFrameClear — NOT createObstructionDetector,
+    // whose verdict stays "ok" until it has N consecutive BAD frames, so a single
+    // covered frame would read as "clear" here and wrongly drop the overlay.
+    let clearRun = 0;
+    const tick = async () => {
+      if (stop || submittedRef.current) return;
+      let metrics: FrameMetrics | null = null;
+      try { metrics = (await captureFrame(webcamRef.current)).metrics; } catch { /* keep the overlay up */ }
+      if (stop || !metrics) return;
+      clearRun = isFrameClear(metrics) ? clearRun + 1 : 0;
+      // Two in a row, so one bright flicker (a hand passing, a headlight) can't
+      // clear a genuinely taped lens.
+      if (clearRun < 2) return;
+      // Cleared. Reset the slow detector too, otherwise it would still be holding
+      // "covered" and would not fire a fresh event on the next real obstruction.
+      obstructionRef.current.reset();
+      setCamBlocked(null);
+      setBlockedSince(null);
+      setBlockAck(false);
+      pendingEventsRef.current.push({ type: "camera_restored", detail: "Camera view is clear again", at: Date.now() });
+      flushEventsRef.current();
+    };
+    const iv = setInterval(tick, 3000);
+    void tick();
+    return () => { stop = true; clearInterval(iv); };
+  }, [camBlocked, phase]);
+
+  // Ticks the overlay's elapsed counter so the escape hatch can appear on time.
+  const [blockTick, setBlockTick] = useState(0);
+  useEffect(() => {
+    if (!camBlocked || blockAck) return;
+    const iv = setInterval(() => setBlockTick((n) => n + 1), 1000);
+    return () => clearInterval(iv);
+  }, [camBlocked, blockAck]);
+
+  // How long the current obstruction has lasted.
+  void blockTick; // read so this recomputes every second while the overlay is up
+  const blockedFor = blockedSince ? Math.max(0, Date.now() - blockedSince) : 0;
+
+  // Dismissing is a claim ("my room is just dim"), not a fix, so it is recorded and
+  // shown to the reviewer next to the frames. The warning strip stays visible and
+  // the timed detector keeps running, so a later real obstruction still fires.
+  const dismissCamBlock = useCallback(() => {
+    setBlockAck(true);
+    recordEventRef.current("camera_block_dismissed", "Student continued, reporting a dim room", { snapshot: true });
+  }, []);
 
   // ---- Load bundle for the brief (title/meta + question data) ----
   // Offline-first: hydrate immediately from the local cache (so a refresh works
@@ -753,7 +830,11 @@ export function ExamRunner() {
           pushAlert("You switched away from the exam window. This has been recorded.", "danger");
           break;
         case "focus_loss":
-          rec("focus_loss", ev.detail, { snapshot: true, minGapMs: 8000 });
+          // An external focus stealer (OS notification, antivirus popup) fires blur on a
+          // ~60s cadence on some machines, so an 8s gap logged one row a minute for the
+          // whole exam. 5 minutes collapses that into a handful of context rows. Genuine
+          // app switching is recorded by `tab_switch` above, which is the scored signal.
+          rec("focus_loss", ev.detail, { snapshot: true, minGapMs: 300_000 });
           break;
         case "copy":
         case "paste":
@@ -1284,6 +1365,37 @@ export function ExamRunner() {
         </div>
       )}
 
+      {/* Blocked-lens overlay. Interrupts the exam because a passive strip is easy
+          to ignore, but it is NOT a hard block: it clears itself within ~3s of the
+          lens being uncovered, and after ESCAPE_AFTER_MS a candidate in a genuinely
+          dim room can dismiss it (recorded, so a reviewer sees the claim). Ranks
+          below camera-loss / fullscreen / hold, which are stronger conditions. */}
+      {phase === "running" && camBlocked && !blockAck && !locked && !held && !fsExited && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 78, background: "rgba(8,12,20,.94)", display: "flex", alignItems: "center", justifyContent: "center", backdropFilter: "blur(4px)" }}>
+          <div className="card" style={{ padding: 34, maxWidth: 460, textAlign: "center" }}>
+            <div style={{ width: 58, height: 58, borderRadius: 999, background: "var(--color-warn-bg, #3a2c0a)", color: "var(--color-warn, #f0b429)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}><Icon name="eye-off" size={28} /></div>
+            <h2 style={{ fontFamily: "var(--font-serif)", fontSize: 22, marginBottom: 6 }}>We can't see you</h2>
+            <p style={{ color: "var(--color-ink2)", fontSize: 14, marginBottom: 8 }}>
+              Your camera is on, but the picture is blank. If something is covering the lens, please remove it. If your room is dark, switch on a light.
+            </p>
+            <p style={{ color: "var(--color-ink2)", fontSize: 13.5, marginBottom: 18 }}>
+              This clears on its own a few seconds after your face is visible again. <strong>Your exam timer keeps running.</strong>
+            </p>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 12.5, color: "var(--color-ink2)", marginBottom: blockedFor >= ESCAPE_AFTER_MS ? 16 : 0 }}>
+              <Icon name="loader" size={14} /> Checking your camera every few seconds — blocked for {fmtClock(blockedFor)}
+            </div>
+            {blockedFor >= ESCAPE_AFTER_MS && (
+              <button className="btn btn-ghost" style={{ width: "100%", padding: 10, fontSize: 13 }} onClick={dismissCamBlock}>
+                My room is just dim — continue the exam
+              </button>
+            )}
+            {blockedFor >= ESCAPE_AFTER_MS && (
+              <p style={{ marginTop: 10, fontSize: 11.5, color: "var(--color-ink2)" }}>Continuing is recorded and reviewed with your paper.</p>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Admin global-hold overlay — freezes the exam for everyone during a
           venue-wide outage until the administrator resumes it. Held time is
           added back to the deadline automatically. */}
@@ -1328,7 +1440,7 @@ export function ExamRunner() {
 
       {/* Live webcam preview */}
       {proctoring.requireWebcam && (
-        <video ref={videoRef} autoPlay playsInline muted style={{ position: "fixed", bottom: 16, right: 16, width: 150, height: 112, borderRadius: 10, objectFit: "cover", background: "#0b1220", border: camBlocked ? "2px solid var(--color-warn)" : "2px solid rgba(255,255,255,.15)", transform: "scaleX(-1)", zIndex: 40, boxShadow: "0 6px 18px rgba(0,0,0,.3)" }} />
+        <video ref={videoRef} autoPlay playsInline muted style={{ position: "fixed", bottom: 16, right: 16, width: 150, height: 112, borderRadius: 10, objectFit: "cover", background: "#0b1220", border: camBlocked ? "2px solid var(--color-warn)" : "2px solid rgba(255,255,255,.15)", transform: "scaleX(-1)", zIndex: camBlocked ? 79 : 40, boxShadow: "0 6px 18px rgba(0,0,0,.3)" }} />
       )}
 
       <div className="runner-body">

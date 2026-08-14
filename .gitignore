@@ -30,3 +30,18 @@ npm-debug.log*
 
 # github push token
 .git-push.env
+
+password-backup-*.json
+_pw*.ts
+deleted-test-exams-*.json
+_rmtests.ts
+_inspect.ts
+attempts-backup-*.json
+_backup.ts
+
+# attempt-dedupe recovery backups (14 Aug 2026) — kept out of git, copies in ~/proview-backups
+dupe-*.json
+orphan-answers-backup-*.json
+# one-off DB maintenance scratch scripts
+_*.ts
+_*.json
