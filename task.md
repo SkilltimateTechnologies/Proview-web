@@ -110,3 +110,65 @@ Not gated yet — `typecheck:web` runs it.
   - 3 concurrent `/submit` -> 3x `200`, 1 row per question and **content intact**
     (this is the exact case that used to blank real answers), attempt `graded`.
   No `UNIQUE constraint failed` 500s anywhere.
+
+## 15 Aug — making the duplicate-row corruption structurally impossible
+
+The dedupe + unique index fixed the incident. This pass is about the bug not
+being able to come back, because two things still made recurrence possible:
+
+1. **The index was not guaranteed to exist.** It was created by hand on the live
+   database. `start` is `bun src/server.ts` — there is no migrate step — and
+   `drizzle/` is a stale 6 Jul snapshot that predates both unique indexes
+   (regenerating emits table DROPs, so it cannot be run). A fresh environment, a
+   restored backup, or a rebuilt database would have come up WITHOUT the
+   constraint, and the upserts would have had nothing to conflict on. Silent.
+2. **Nothing tested any of it.** The repo had zero test files. The same gap let
+   `retryCounts is not defined` reach production.
+
+### Layers now in place
+- **`src/api/database/invariants.ts`** — `ensureDatabaseInvariants()` asserts
+  every required unique index at boot via `CREATE UNIQUE INDEX IF NOT EXISTS`.
+  Self-healing on a database that lacks one; a no-op when present. If duplicates
+  already exist it cannot create the index, so it logs the exact duplicate-group
+  count and the keeper rule instead of a bare SQLite error. Never throws — an
+  exam server must boot even if this check fails.
+- **`/api/health`** now returns **503 `degraded`** with the failure detail when an
+  invariant could not be put in place, so uptime monitoring catches it rather than
+  it hiding in a boot log.
+- **`GET /api/admin/invariants`** (super-admin) — full live audit: index presence,
+  duplicate groups, attempts with impossible scores, attempts whose denominator
+  != paper total.
+- **`scoreFromAnswers()` / `dedupeAnswerRows()`** in grade-queue — the single
+  scoring path. Collapses to one row per question (same keeper rule as the
+  production dedupe, `max_score` tiebreak included) and clamps to 0..100, so the
+  arithmetic cannot emit an impossible score even if a duplicate reaches it. Logs
+  `INVARIANT VIOLATION` when it has to dedupe. Replaced both raw
+  `reduce`-over-answer-rows sites (`gradeAttempt`, `sweepPendingGrading`).
+- **`src/api/lib/scoring.test.ts`** — 11 tests, no DB or network needed, wired
+  into `bun run build`. Covers the 103/100 shape, the blank-twin data loss, the
+  asymmetric `max_score` twin that once yielded 102.1 instead of 96, and both
+  clamps.
+- **`scripts/verify-invariants.ts`** (`bun run verify:db`) — ops check against a
+  real database; `--race <url>` additionally fires 12 concurrent autosaves, 12
+  concurrent batch autosaves and 3 concurrent submits at a live server, then
+  asserts one row per question with content intact. Exits non-zero, so it can
+  gate a deploy. Run it after any change to answer persistence, grading, or the
+  schema, and after provisioning or restoring any database.
+
+### Verified (not assumed)
+- Guard vs a deliberately broken database: **7 FAILs, exit 1** — caught the
+  missing indexes, duplicate rows, the 103 score, the denominator mismatch and
+  the lost-answers case.
+- Boot check vs that database: refused both indexes and printed the duplicate
+  counts. After removing the duplicates it **created both**; the next boot
+  reported them present with `created: []` (idempotent).
+- `/api/health` returned **503** with the failure payload on the broken database
+  and the server still came up; **200 `ok`** on the real database.
+- `/api/admin/invariants` on the live database: `ok: true`, both indexes present,
+  0 duplicate groups, 0 impossible scores, 0 denominator mismatches.
+- **Mutation-tested the tests**: removing the dedupe fails 1, removing the clamp
+  fails 2. They are not decoration.
+- `--race` mode vs a local server on the real database: **16/16 PASS**, fixture
+  cleaned up (`{"e":0,"a":0,"ans":0}`).
+- `bun run build` (typecheck + tests + vite) passes **with `DATABASE_URL` unset**,
+  so adding tests to the build cannot break the Railway deploy.

@@ -5,6 +5,7 @@ import { auth } from "./auth";
 import { hashPassword, verifyPassword } from "better-auth/crypto";
 import { db } from "./database";
 import * as schema from "./database/schema";
+import { INDEX_STATE, REQUIRED_UNIQUE_INDEXES } from "./database/invariants";
 import { authMiddleware, requireAuth, requireSuperAdmin, requirePermission } from "./middleware/auth";
 import type { SessionUser, ProfileCtx } from "./middleware/auth";
 import { id, displayId, computeYear, effectiveEndMs } from "./lib/util";
@@ -115,7 +116,48 @@ const app = new Hono<{ Variables: Vars }>()
   .on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw))
   .basePath("api")
   .use("*", authMiddleware)
-  .get("/health", (c) => c.json({ status: "ok" }, 200))
+  // Health doubles as the visibility surface for the database uniqueness
+  // guarantees asserted at boot. If a required unique index could not be put in
+  // place, duplicate rows can silently corrupt scores again — so that must be
+  // observable from outside the process, not buried in a startup log. Returns
+  // 503 in that state so uptime monitoring actually catches it.
+  .get("/health", (c) => {
+    const inv = INDEX_STATE;
+    if (inv.checkedAt && !inv.ok) {
+      return c.json({ status: "degraded", invariants: inv }, 503);
+    }
+    return c.json({ status: "ok", invariants: { ok: inv.ok, checkedAt: inv.checkedAt } }, 200);
+  })
+
+  // Full uniqueness/consistency audit of the live database. Admin-only, run on
+  // demand or from a scheduled check: confirms the unique indexes exist AND that
+  // no duplicate rows or impossible scores have appeared. Cheap enough to poll.
+  .get("/admin/invariants", requireAuth, requireSuperAdmin, async (c) => {
+    const indexes = await Promise.all(
+      REQUIRED_UNIQUE_INDEXES.map(async (spec) => {
+        const [a, b] = spec.columns;
+        const present = (await db.all<{ name: string }>(
+          dsql`SELECT name FROM sqlite_master WHERE type='index' AND name=${spec.name}`,
+        )).length > 0;
+        const dupes = Number((await db.all<{ c: number }>(
+          dsql`SELECT COUNT(*) AS c FROM (SELECT 1 FROM ${dsql.raw(spec.table)} GROUP BY ${dsql.raw(a)}, ${dsql.raw(b)} HAVING COUNT(*) > 1)`,
+        ))[0]?.c ?? 0);
+        return { index: spec.name, table: spec.table, columns: spec.columns, present, duplicateGroups: dupes, guards: spec.guards };
+      }),
+    );
+    const impossible = Number((await db.all<{ c: number }>(
+      dsql`SELECT COUNT(*) AS c FROM attempts WHERE score > 100 OR score < 0`,
+    ))[0]?.c ?? 0);
+    // A graded attempt whose answer max_score total differs from its paper total
+    // is the signature of the duplicate bug (inflated) or of lost rows (deflated).
+    const denomMismatch = Number((await db.all<{ c: number }>(
+      dsql`SELECT COUNT(*) AS c FROM attempts a JOIN exams e ON e.id = a.exam_id
+           WHERE a.status IN ('graded','submitted')
+             AND (SELECT COALESCE(SUM(COALESCE(x.max_score,0)),0) FROM answers x WHERE x.attempt_id = a.id) <> e.total_points`,
+    ))[0]?.c ?? 0);
+    const ok = indexes.every((i) => i.present && i.duplicateGroups === 0) && impossible === 0 && denomMismatch === 0;
+    return c.json({ ok, bootCheck: INDEX_STATE, indexes, attemptsWithImpossibleScore: impossible, attemptsWithDenominatorMismatch: denomMismatch }, ok ? 200 : 500);
+  })
 
   // ---- TEMP diagnostic: verify DB connectivity + env presence ----
   .get("/__diag", async (c) => {

@@ -240,6 +240,13 @@ export const answers = sqliteTable(
     // student scored 103/100, and in the worst case a blank duplicate landed
     // beside the real answer and swallowed the marks. Both write paths now
     // upsert against this constraint.
+    //
+    // Declaring it here is NOT enough to guarantee it exists: `start` is just
+    // `bun src/server.ts` with no migrate step, so a database that never had
+    // `db:push` run against it would come up without the constraint and the bug
+    // would silently return. It is therefore also asserted on every boot by
+    // database/invariants.ts — keep REQUIRED_UNIQUE_INDEXES there in sync with
+    // the uniqueIndex declarations here.
     uniqueIndex("answers_attempt_question_uq").on(t.attemptId, t.questionId),
   ],
 );

@@ -6,9 +6,12 @@
     ".": "./src/api/index.ts"
   },
   "scripts": {
-    "build": "bun run typecheck:api && vite build",
+    "build": "bun run typecheck:api && bun test && vite build",
     "dev": "vite",
     "start": "bun src/server.ts",
+    "test": "bun test",
+    "//verify:db": "Ops check, needs DATABASE_URL. Asserts the unique indexes exist and no duplicate/impossible-score rows are present. Add --race <url> to fire concurrent writes at a live server and prove the upserts hold. Run after any change to answer persistence, grading, or schema — and after provisioning or restoring a database.",
+    "verify:db": "bun scripts/verify-invariants.ts",
     "//typecheck": "Root tsconfig.json is `files: []` + project references, so a bare `tsc --noEmit` type-checks NOTHING. It exited 0 while two undefined identifiers (retryCounts, gradeSubjective) were live in production. Always point tsc at a real project.",
     "typecheck": "bun run typecheck:api",
     "typecheck:api": "tsc --noEmit -p tsconfig.node.json",

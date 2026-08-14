@@ -1,5 +1,6 @@
 import app from "./api";
 import { sweepPendingGrading, startAutoSubmitSweep } from "./api/lib/grade-queue";
+import { ensureDatabaseInvariants } from "./api/database/invariants";
 
 // Never let a transient background failure (e.g. a brief Turso/libsql socket
 // ECONNRESET during a background grading/auto-submit sweep) take down the whole
@@ -53,6 +54,15 @@ const server = Bun.serve({
 });
 
 console.log(`Web server listening on http://localhost:${server.port}`);
+
+// Assert the database's uniqueness guarantees before doing any background work.
+// These indexes are what actually make duplicate attempts/answers impossible —
+// the app-level upserts need them to exist to have anything to conflict on. There
+// is no migrate step in the deploy path, so this is the only thing standing
+// between a freshly provisioned / restored database and the return of the
+// duplicate-row score corruption. Awaited so the grading sweeps below run against
+// a database we have already verified; never throws.
+await ensureDatabaseInvariants();
 
 // Recover any subjective answers left ungraded (e.g. restart mid-grading or a
 // prior AI rate-limit burst). Runs off the boot path, globally throttled.

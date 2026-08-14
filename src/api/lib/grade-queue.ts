@@ -71,6 +71,76 @@ export function hasContent(response: unknown): boolean {
   return response != null && String(typeof response === "string" ? response : JSON.stringify(response)).trim() !== "";
 }
 
+type AnswerRow = typeof schema.answers.$inferSelect;
+
+/**
+ * Collapse answer rows to at most ONE row per question.
+ *
+ * `answers_attempt_question_uq` makes duplicates impossible at the database
+ * level, and that index is asserted on every boot (see database/invariants.ts).
+ * This is the second line of defence: scoring must not be able to produce an
+ * impossible number even if a duplicate somehow exists — an index dropped by
+ * hand, a restored pre-fix backup, a future writer that bypasses the upsert.
+ *
+ * A student seeing 103/100 is the failure everyone notices, so the arithmetic
+ * itself is made incapable of it. Keeper rule matches the one used for the
+ * production dedupe: real content > has a score > has a max_score > higher
+ * score > lowest id. `max_score` matters because duplicate twins were
+ * asymmetric — one row carried the points, the twin was null — and ignoring it
+ * shrinks the denominator instead of restoring it.
+ */
+export function dedupeAnswerRows<T extends Pick<AnswerRow, "id" | "questionId" | "response" | "score" | "maxScore">>(
+  rows: T[],
+): T[] {
+  const best = new Map<string, T>();
+  for (const r of rows) {
+    const cur = best.get(r.questionId);
+    if (!cur) {
+      best.set(r.questionId, r);
+      continue;
+    }
+    if (rank(r) > rank(cur)) best.set(r.questionId, r);
+  }
+  return [...best.values()];
+
+  function rank(r: T): number {
+    // Ordered lexicographically by weight, highest wins. Negated id keeps the
+    // lowest id as the final tiebreak (ids are unique so this never ties).
+    return (
+      (hasContent(r.response) ? 1e12 : 0) +
+      (r.score != null ? 1e9 : 0) +
+      (r.maxScore != null ? 1e6 : 0) +
+      (r.score ?? 0) * 1e3 +
+      -hashId(r.id)
+    );
+  }
+  function hashId(s: string): number {
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 1000;
+    return h / 1000;
+  }
+}
+
+/**
+ * The single place an attempt's percentage score is derived from answer rows.
+ * Deduped (see above) and clamped to 0..100 so no arithmetic path can emit an
+ * out-of-range score. `expectedMax` (the paper's total_points) is preferred as
+ * the denominator when supplied, since it cannot be distorted by row-level data
+ * at all.
+ */
+export function scoreFromAnswers(
+  rows: Pick<AnswerRow, "id" | "questionId" | "response" | "score" | "maxScore">[],
+  expectedMax?: number | null,
+): { scorePct: number; earned: number; max: number; deduped: number } {
+  const unique = dedupeAnswerRows(rows);
+  const earned = unique.reduce((s, a) => s + (a.score ?? 0), 0);
+  const rowMax = unique.reduce((s, a) => s + (a.maxScore ?? 0), 0);
+  const max = expectedMax && expectedMax > 0 ? expectedMax : rowMax;
+  const raw = max > 0 ? (earned / max) * 100 : 0;
+  const scorePct = Math.max(0, Math.min(100, Math.round(raw * 10) / 10));
+  return { scorePct, earned, max, deduped: rows.length - unique.length };
+}
+
 const inFlight = new Set<string>();
 
 /**
@@ -126,9 +196,13 @@ export async function gradeAttempt(attemptId: string, providerArg?: string | nul
   // when nothing subjective is left ungraded.
   const finalAnswers = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, attemptId));
   const stillUngraded = finalAnswers.some((a) => a.score == null && hasContent(a.response));
-  const earned = finalAnswers.reduce((s, a) => s + (a.score ?? 0), 0);
-  const max = finalAnswers.reduce((s, a) => s + (a.maxScore ?? 0), 0);
-  const scorePct = max > 0 ? Math.round((earned / max) * 1000) / 10 : 0;
+  const { scorePct, deduped } = scoreFromAnswers(finalAnswers);
+  if (deduped > 0) {
+    console.error(
+      `[grade-queue] INVARIANT VIOLATION: attempt ${attemptId} has ${deduped} duplicate answer row(s); ` +
+        `scored on the deduped set. answers_attempt_question_uq is missing or was bypassed.`,
+    );
+  }
 
   const [att] = await db.select().from(schema.attempts).where(eq(schema.attempts.id, attemptId)).limit(1);
   // Never regress a re-opened / in-progress attempt.
@@ -270,7 +344,10 @@ export async function finalizeAttempt(
     await db.delete(schema.answers).where(and(eq(schema.answers.attemptId, aid), notInArray(schema.answers.questionId, qids)));
   }
 
-  const scorePct = max > 0 ? Math.round((earned / max) * 1000) / 10 : 0;
+  // `earned`/`max` are accumulated over the PAPER (eqs), not over answer rows, so
+  // a duplicate row cannot distort them. Clamped anyway — no code path should be
+  // able to emit a score outside 0..100.
+  const scorePct = max > 0 ? Math.max(0, Math.min(100, Math.round((earned / max) * 1000) / 10)) : 0;
   const status: "submitted" | "graded" = hasPending ? "submitted" : "graded";
   const answeredCount = rows.filter((r) => hasContent(r.response)).length;
   await db.update(schema.attempts).set({
@@ -380,9 +457,12 @@ export async function sweepPendingGrading() {
       } else {
         // Nothing left to grade but the attempt is still "submitted" — the final
         // flip was lost. Recompute the score and flip to "graded" directly.
-        const earned = ans.reduce((s, x) => s + (x.score ?? 0), 0);
-        const max = ans.reduce((s, x) => s + (x.maxScore ?? 0), 0);
-        const scorePct = max > 0 ? Math.round((earned / max) * 1000) / 10 : 0;
+        const { scorePct, deduped } = scoreFromAnswers(ans);
+        if (deduped > 0) {
+          console.error(
+            `[grade-queue] INVARIANT VIOLATION: attempt ${a.id} has ${deduped} duplicate answer row(s) during reconcile; scored on the deduped set.`,
+          );
+        }
         await db.update(schema.attempts).set({ status: "graded", score: scorePct }).where(eq(schema.attempts.id, a.id));
         reconciled++;
       }
