@@ -9,7 +9,7 @@
  * rate limits. When every subjective answer of an attempt is graded, the score
  * is recomputed and the attempt flips to "graded".
  */
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, notInArray } from "drizzle-orm";
 import { db } from "../database";
 import * as schema from "../database/schema";
 import { gradeSubjective } from "./ai";
@@ -192,8 +192,13 @@ export async function finalizeAttempt(
   const prior = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, aid));
   const priorRespByQ = new Map(prior.map((p) => [p.questionId, p.response]));
 
-  // Wipe any prior answers for idempotency, then insert the merged set fresh.
-  await db.delete(schema.answers).where(eq(schema.answers.attemptId, aid));
+  // NOTE: this used to DELETE every answer row here and re-insert the merged set.
+  // That was a data-loss window, not just an idempotency trick: if two finalize
+  // calls overlapped (student submit racing the auto-submit sweep, or a double
+  // submit), the second one read `prior` AFTER the first had deleted it, saw an
+  // empty map, and wrote blank rows over real work. One student ended up with 23
+  // real answers sitting beside blank twins and scored 0. We now upsert every row
+  // instead, so the student's work is never unreachable for even an instant.
 
   let earned = 0;
   let max = 0;
@@ -239,7 +244,21 @@ export async function finalizeAttempt(
       autoGraded,
     });
   }
-  if (rows.length) await db.insert(schema.answers).values(rows);
+  // Upsert on (attempt_id, question_id) so a concurrent finalize converges on the
+  // same row instead of creating a second one. autoGrade is deterministic and the
+  // merged `response` prefers content, so whichever call lands last writes the
+  // same values.
+  for (const r of rows) {
+    await db.insert(schema.answers).values(r).onConflictDoUpdate({
+      target: [schema.answers.attemptId, schema.answers.questionId],
+      set: { response: r.response, score: r.score, maxScore: r.maxScore, aiNotes: r.aiNotes, autoGraded: r.autoGraded },
+    });
+  }
+  // Drop stray rows for questions that are no longer part of the paper (the old
+  // blanket delete used to cover this). Targeted, so live answers are untouched.
+  if (qids.length) {
+    await db.delete(schema.answers).where(and(eq(schema.answers.attemptId, aid), notInArray(schema.answers.questionId, qids)));
+  }
 
   const scorePct = max > 0 ? Math.round((earned / max) * 1000) / 10 : 0;
   const status: "submitted" | "graded" = hasPending ? "submitted" : "graded";

@@ -233,7 +233,16 @@ export const answers = sqliteTable(
     aiNotes: text("ai_notes"),
     autoGraded: integer("auto_graded", { mode: "boolean" }).notNull().default(false),
   },
-  (t) => [index("answers_attempt_idx").on(t.attemptId)],
+  (t) => [
+    index("answers_attempt_idx").on(t.attemptId),
+    // One answer row per question per attempt. Without this, two concurrent
+    // writers (autosave + submit, or submit + the auto-submit sweep) could each
+    // insert a row for the same question: the grader sums every row, so a
+    // student scored 103/100, and in the worst case a blank duplicate landed
+    // beside the real answer and swallowed the marks. Both write paths now
+    // upsert against this constraint.
+    uniqueIndex("answers_attempt_question_uq").on(t.attemptId, t.questionId),
+  ],
 );
 
 export const integrityEvents = sqliteTable(

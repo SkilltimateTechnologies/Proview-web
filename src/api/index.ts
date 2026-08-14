@@ -1209,15 +1209,18 @@ const app = new Hono<{ Variables: Vars }>()
     const eqs = await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, attempt.examId));
     const validQ = new Set(eqs.map((e) => e.questionId));
 
+    // Upsert against answers_attempt_question_uq. The old select-then-insert had
+    // the same race as /start: two autosaves in flight for one question both saw
+    // no existing row and both inserted, and the grader then counted both rows.
+    // Only `response` is touched here — never clobber a score the grader wrote.
     for (const a of incoming) {
       if (!a || !validQ.has(a.questionId)) continue;
-      const [existing] = await db.select().from(schema.answers)
-        .where(and(eq(schema.answers.attemptId, aid), eq(schema.answers.questionId, a.questionId))).limit(1);
-      if (existing) {
-        await db.update(schema.answers).set({ response: a.response ?? null }).where(eq(schema.answers.id, existing.id));
-      } else {
-        await db.insert(schema.answers).values({ id: id("ans"), attemptId: aid, questionId: a.questionId, response: a.response ?? null, score: null, maxScore: null, autoGraded: false });
-      }
+      await db.insert(schema.answers)
+        .values({ id: id("ans"), attemptId: aid, questionId: a.questionId, response: a.response ?? null, score: null, maxScore: null, autoGraded: false })
+        .onConflictDoUpdate({
+          target: [schema.answers.attemptId, schema.answers.questionId],
+          set: { response: a.response ?? null },
+        });
     }
 
     // Recompute answeredCount from rows that carry real content.
