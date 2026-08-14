@@ -153,12 +153,7 @@ export default function Settings() {
           </Field>
         )}
         {pc.requireWebcam && (
-          <Toggle label="Periodic webcam snapshots" sub="Capture a webcam photo at intervals during the exam." checked={pc.webcamSnapshots} onChange={(v) => setPc({ webcamSnapshots: v })} />
-        )}
-        {pc.requireWebcam && pc.webcamSnapshots && (
-          <Field label="Snapshot interval (seconds)">
-            <input className="input" type="number" min={5} value={pc.snapshotIntervalSec} onChange={(e) => setPc({ snapshotIntervalSec: Number(e.target.value) })} />
-          </Field>
+          <Toggle label="Webcam snapshot on every violation" sub="Capture a webcam photo the moment a violation happens (camera turned off, switching away, leaving fullscreen, extra display) and attach it to the student's report. Snapshots are taken only on violations — never on a timer." checked={pc.webcamSnapshots} onChange={(v) => setPc({ webcamSnapshots: v })} />
         )}
 
         {/* --- Connection & auto-actions --- */}

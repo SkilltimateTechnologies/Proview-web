@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, type CSSProperties } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, Link } from "wouter";
-import { ArrowLeft, Download, ChevronRight, Check, X, Sparkles, Lightbulb, MoreVertical, UserX, Trash2, FileText, FileSpreadsheet, Files, ChevronDown, Loader2 } from "lucide-react";
+import { ArrowLeft, Download, ChevronRight, Check, X, Sparkles, Lightbulb, MoreVertical, UserX, Trash2, FileText, FileSpreadsheet, Files, ChevronDown, Loader2, ShieldAlert, VideoOff, MonitorX, Maximize, Copy, EyeOff } from "lucide-react";
 import JSZip from "jszip";
 import { api } from "../lib/api";
 import { useSession } from "../lib/session";
@@ -625,6 +625,73 @@ type AnswerRow = {
 
 const LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H"];
 
+// ---- Proctoring evidence ----
+type IntegrityRow = { id: string; type: string; detail: string | null; at: string | number | null; photo: string | null };
+
+const EVENT_META: Record<string, { label: string; icon: typeof ShieldAlert; color: string }> = {
+  camera_lost: { label: "Camera turned off", icon: VideoOff, color: "#c0453b" },
+  camera_restored: { label: "Camera restored", icon: Check, color: "#2e7d5b" },
+  tab_switch: { label: "Switched away from exam", icon: EyeOff, color: "#c0453b" },
+  focus_loss: { label: "Exam window lost focus", icon: EyeOff, color: "#b7791f" },
+  fullscreen_exit: { label: "Left fullscreen", icon: Maximize, color: "#c0453b" },
+  multi_monitor: { label: "Extra display connected", icon: MonitorX, color: "#b7791f" },
+  copy: { label: "Copy blocked", icon: Copy, color: "#b7791f" },
+  paste: { label: "Paste blocked", icon: Copy, color: "#b7791f" },
+  cut: { label: "Cut blocked", icon: Copy, color: "#b7791f" },
+  copy_in_answer: { label: "Copied inside answer field", icon: Copy, color: "#8a8f98" },
+  paste_in_answer: { label: "Pasted into answer field", icon: Copy, color: "#b7791f" },
+  cut_in_answer: { label: "Cut inside answer field", icon: Copy, color: "#8a8f98" },
+  context_menu: { label: "Right-click blocked", icon: ShieldAlert, color: "#8a8f98" },
+  shortcut: { label: "Blocked shortcut", icon: ShieldAlert, color: "#8a8f98" },
+  screenshot: { label: "Screenshot attempt", icon: ShieldAlert, color: "#c0453b" },
+};
+
+function fmtEventTime(t: string | number | null | undefined) {
+  if (!t) return "—";
+  return new Date(t).toLocaleString("en-IN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: "Asia/Kolkata" });
+}
+
+/** Timeline of recorded proctoring violations for one attempt, with the webcam
+ *  snapshot captured at the moment of each event (when one was captured). */
+function IntegrityPanel({ events }: { events: IntegrityRow[] }) {
+  const serious = events.filter((e) => e.type === "camera_lost" || e.type === "tab_switch" || e.type === "fullscreen_exit" || e.type === "screenshot" || e.type === "multi_monitor").length;
+  return (
+    <div className="mb-6">
+      <div className="flex items-center justify-between mb-2">
+        <div className="mono-label">Proctoring evidence ({events.length})</div>
+        {serious > 0 && <Pill label={`${serious} SERIOUS`} color="#c0453b" />}
+      </div>
+      {events.length === 0 ? (
+        <div className="card p-4 text-sm text-[var(--color-ink2)]">No violations recorded for this attempt.</div>
+      ) : (
+        <div className="space-y-2">
+          {events.map((e) => {
+            const meta = EVENT_META[e.type] ?? { label: e.type.replace(/_/g, " "), icon: ShieldAlert, color: "#8a8f98" };
+            const EvIcon = meta.icon;
+            return (
+              <div key={e.id} className="card p-3 flex items-start gap-3">
+                <div className="h-8 w-8 rounded-lg flex items-center justify-center shrink-0" style={{ background: `${meta.color}1a`, color: meta.color }}>
+                  <EvIcon size={15} />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm font-semibold text-[var(--color-ink)]">{meta.label}</div>
+                  {e.detail && <div className="text-xs text-[var(--color-ink2)] mt-0.5 break-words">{e.detail}</div>}
+                  <div className="mono-label mt-1">{fmtEventTime(e.at)}</div>
+                </div>
+                {e.photo && (
+                  <a href={e.photo} target="_blank" rel="noreferrer" className="shrink-0" title="Open full snapshot">
+                    <img src={e.photo} alt="Webcam snapshot" className="h-16 w-[85px] rounded-lg object-cover border border-[var(--color-line)]" style={{ transform: "scaleX(-1)" }} />
+                  </a>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AttemptDrawer({ examId, row, brand, examTitle, totalQuestions, onClose }: { examId: string; row: Row; brand: Brand; examTitle: string; totalQuestions?: number; onClose: () => void }) {
   const [dl, setDl] = useState(false);
   const q = useQuery({
@@ -681,6 +748,7 @@ function AttemptDrawer({ examId, row, brand, examTitle, totalQuestions, onClose 
         <div className="card p-6 text-center text-sm text-[var(--color-ink2)]">Detailed breakdown not available for this attempt.</div>
       ) : (
         <>
+          <IntegrityPanel events={(d.integrity ?? []) as IntegrityRow[]} />
           <div className="mono-label mb-2">Answer breakdown ({answers.length})</div>
           {answers.length === 0 ? (
             <div className="card p-4 text-sm text-[var(--color-ink2)] mb-6">No stored answers for this attempt.</div>

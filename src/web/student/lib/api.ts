@@ -146,7 +146,20 @@ export const api = {
       headers: { "Content-Type": "application/json", ...tokenHeader() },
       body: JSON.stringify({ answers }),
     }).then((r) => (r.ok ? (r.json() as Promise<{ ok: boolean; answeredCount?: number; frozen?: boolean }>) : Promise.reject(new Error(`sync failed (${r.status})`)))),
-  submit: (attemptId: string, payload: { answers: { questionId: string; response: unknown }[]; integrityEvents: { type: string; detail?: string; at?: number }[] }) =>
+  // Proctoring: flush violation events the moment they happen so the evidence
+  // survives a crash / force-quit. keepalive lets a flush fired during page
+  // unload still reach the server. Never throws — the caller retries.
+  flushEvents: (attemptId: string, events: { type: string; detail?: string; at?: number; photoKey?: string | null }[]) =>
+    fetch(`${API_URL}/api/student/attempts/${attemptId}/events`, {
+      method: "POST",
+      keepalive: true,
+      headers: { "Content-Type": "application/json", ...tokenHeader() },
+      body: JSON.stringify({ events }),
+    }).then((r) => (r.ok ? (r.json() as Promise<{ ok: boolean; saved: number }>) : Promise.reject(new Error(`events failed (${r.status})`)))),
+  // Proctoring: presigned PUT for a violation snapshot (uploaded direct to storage).
+  snapshotUrl: (attemptId: string) =>
+    req<{ ok: boolean; url: string | null; key: string | null }>(`/student/attempts/${attemptId}/snapshot-url`, { method: "POST", body: JSON.stringify({}) }),
+  submit: (attemptId: string, payload: { answers: { questionId: string; response: unknown }[]; integrityEvents: { type: string; detail?: string; at?: number; photoKey?: string | null }[] }) =>
     req<{ ok: boolean; score: number; integrityScore: number }>(`/student/attempts/${attemptId}/submit`, {
       method: "POST",
       body: JSON.stringify(payload),

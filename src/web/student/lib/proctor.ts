@@ -5,7 +5,13 @@
 import type { ProctorConfig } from "./api";
 import { DEFAULT_PROCTORING } from "./api";
 
-export type ProctorEvent = { type: string; detail?: string; at: number };
+export type ProctorEvent = {
+  type: string;
+  detail?: string;
+  at: number;
+  /** Object-storage key of the webcam snapshot captured at this moment (if any). */
+  photoKey?: string | null;
+};
 
 type Handler = (ev: ProctorEvent) => void;
 
@@ -26,9 +32,24 @@ export function startProctoring(onEvent: Handler, config?: Partial<ProctorConfig
   const cleanups: Array<() => void> = [];
 
   // Block copy / paste / cut.
+  // IMPORTANT: clipboard actions INSIDE the student's own answer field (the code
+  // editor, a short-answer textarea) are allowed — a candidate legitimately moves
+  // code around while solving, and hard-blocking that mid-exam breaks the coding
+  // questions. Those are still RECORDED as evidence (`*_in_answer`) so an admin can
+  // review them; clipboard use anywhere else (e.g. copying the question paper out)
+  // is blocked outright.
+  const inAnswerField = (target: EventTarget | null): boolean => {
+    const el = target as HTMLElement | null;
+    if (!el || typeof el.closest !== "function") return false;
+    return !!el.closest("textarea, input, [contenteditable='true']");
+  };
   if (cfg.blockCopyPaste) {
     for (const evt of ["copy", "paste", "cut"] as const) {
       const h = (e: Event) => {
+        if (inAnswerField(e.target)) {
+          emit(`${evt}_in_answer`, `${evt} inside the answer field`);
+          return;
+        }
         e.preventDefault();
         emit(evt, `Blocked ${evt}`);
       };
@@ -147,6 +168,45 @@ export async function startWebcam(onLost: (reason: string) => void): Promise<Web
       stream.getTracks().forEach((t) => t.stop());
     },
   };
+}
+
+// Grab a single JPEG frame from the live webcam stream. Used to attach visual
+// evidence to a violation (camera loss, tab switch, extra monitor…). Draws the
+// stream into an offscreen canvas so it works even when the preview <video> is
+// hidden behind a lock overlay. Returns null if the stream can't produce a frame
+// — a missing snapshot must never break the exam.
+export async function captureSnapshot(handle: WebcamHandle | null, timeoutMs = 2500): Promise<Blob | null> {
+  if (!handle) return null;
+  const track = handle.stream.getVideoTracks()[0];
+  if (!track || track.readyState !== "live") return null;
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.srcObject = handle.stream;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("timeout")), timeoutMs);
+      const done = () => { clearTimeout(t); resolve(); };
+      if (video.readyState >= 2) { done(); return; }
+      video.onloadeddata = done;
+      video.onerror = () => { clearTimeout(t); reject(new Error("video error")); };
+      void video.play().catch(() => { /* autoplay of a muted stream is allowed */ });
+    });
+    const w = video.videoWidth || 320;
+    const h = video.videoHeight || 240;
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(video, 0, 0, w, h);
+    return await new Promise<Blob | null>((resolve) => canvas.toBlob((b) => resolve(b), "image/jpeg", 0.7));
+  } catch {
+    return null;
+  } finally {
+    try { video.pause(); } catch { /* ignore */ }
+    video.srcObject = null;
+  }
 }
 
 export function isCameraActive(handle: WebcamHandle | null): boolean {

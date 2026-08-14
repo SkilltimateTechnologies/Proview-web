@@ -10,7 +10,7 @@ import type { SessionUser, ProfileCtx } from "./middleware/auth";
 import { id, displayId, autoGrade, computeYear, effectiveEndMs } from "./lib/util";
 import { generateQuestions } from "./lib/ai";
 import { queueAttemptGrading, finalizeAttempt, hasContent } from "./lib/grade-queue";
-import { presignPut, getObject } from "./lib/s3";
+import { presignPut, presignGet, getObject } from "./lib/s3";
 import { signStudentToken, verifyStudentToken } from "./lib/student-token";
 import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
 import { isEligible, matchesCohort, loadRoster, loadRosters, ensureOptInOnlyLoaded, invalidateOptInOnlyCache, isOptInOnlyCode } from "./lib/roster";
@@ -45,6 +45,49 @@ async function resolveRegisterTenant(codeRaw: string) {
       ),
     );
   return byCode ?? null;
+}
+
+// ---- Proctoring evidence ----
+// Persist integrity/violation events reported by the running student client
+// (camera loss, tab switch, fullscreen exit, blocked copy/paste, extra monitor…).
+// The client flushes events the moment they happen AND resends the full list at
+// submit as a backstop, so we dedupe on (type, at) against what's already stored.
+// `photoKey` is the object-storage key of the webcam snapshot captured at that
+// moment; it is only accepted inside this attempt's own prefix.
+const INTEGRITY_PREFIX = (attemptId: string) => `integrity/${attemptId}/`;
+type RawIntegrityEvent = { type?: unknown; detail?: unknown; at?: unknown; photoKey?: unknown; photoUrl?: unknown };
+
+async function persistIntegrityEvents(attemptId: string, raw: unknown): Promise<number> {
+  if (!Array.isArray(raw) || raw.length === 0) return 0;
+  const incoming = (raw as RawIntegrityEvent[]).slice(0, 300);
+
+  // Existing (type|at) keys for this attempt so a resend can't double-insert.
+  const existing = await db
+    .select({ type: schema.integrityEvents.type, at: schema.integrityEvents.at })
+    .from(schema.integrityEvents)
+    .where(eq(schema.integrityEvents.attemptId, attemptId));
+  const seen = new Set(existing.map((e) => `${e.type}|${new Date(e.at).getTime()}`));
+
+  const rows: { id: string; attemptId: string; type: string; detail: string | null; photoUrl: string | null; at: Date }[] = [];
+  for (const ev of incoming) {
+    const type = String(ev?.type ?? "").trim().slice(0, 40);
+    if (!type) continue;
+    const atMs = Number(ev?.at);
+    const at = Number.isFinite(atMs) && atMs > 0 ? atMs : Date.now();
+    const key = `${type}|${at}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const detailRaw = ev?.detail == null ? "" : String(ev.detail).trim().slice(0, 300);
+    const photoRaw = String(ev?.photoKey ?? ev?.photoUrl ?? "").trim();
+    const photoUrl = photoRaw.startsWith(INTEGRITY_PREFIX(attemptId)) ? photoRaw.slice(0, 300) : null;
+    rows.push({ id: id("iev"), attemptId, type, detail: detailRaw || null, photoUrl, at: new Date(at) });
+  }
+  if (rows.length === 0) return 0;
+  // Chunked insert — SQLite/libSQL caps bound variables per statement.
+  for (let i = 0; i < rows.length; i += 50) {
+    await db.insert(schema.integrityEvents).values(rows.slice(i, i + 50));
+  }
+  return rows.length;
 }
 
 const app = new Hono<{ Variables: Vars }>()
@@ -1105,6 +1148,43 @@ const app = new Hono<{ Variables: Vars }>()
     return c.json({ ok: true, answeredCount }, 200);
   })
 
+  // ---- Proctoring: flush integrity events as they happen ----
+  // The running client posts every violation here immediately (camera loss, tab
+  // switch, fullscreen exit, extra monitor, blocked copy/paste…) so the evidence
+  // survives a crash, a kill-the-app cheat attempt, or a never-submitted attempt.
+  // Events are still resent at submit as a backstop; persistIntegrityEvents
+  // dedupes on (type, at).
+  .post("/student/attempts/:attemptId/events", async (c) => {
+    const sid = await verifyStudentToken(c.req.header("x-student-token"));
+    if (!sid) return c.json({ message: "Unauthorized" }, 401);
+    const aid = c.req.param("attemptId");
+    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.id, aid), eq(schema.attempts.studentId, sid))).limit(1);
+    if (!attempt) return c.json({ message: "Not found" }, 404);
+    const body = await c.req.json().catch(() => ({}));
+    const saved = await persistIntegrityEvents(aid, body.events ?? body.integrityEvents);
+    return c.json({ ok: true, saved }, 200);
+  })
+
+  // ---- Proctoring: presigned upload URL for a violation snapshot ----
+  // The client grabs a JPEG frame from the live webcam at the moment of a
+  // violation, PUTs it straight to object storage with this URL, then attaches
+  // the returned key to the event. Keys are scoped to the attempt's own prefix.
+  .post("/student/attempts/:attemptId/snapshot-url", async (c) => {
+    const sid = await verifyStudentToken(c.req.header("x-student-token"));
+    if (!sid) return c.json({ message: "Unauthorized" }, 401);
+    const aid = c.req.param("attemptId");
+    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.id, aid), eq(schema.attempts.studentId, sid))).limit(1);
+    if (!attempt) return c.json({ message: "Not found" }, 404);
+    const key = `${INTEGRITY_PREFIX(aid)}${Date.now()}-${id()}.jpg`;
+    try {
+      const url = await presignPut(key, "image/jpeg");
+      return c.json({ ok: true, url, key }, 200);
+    } catch {
+      // Storage misconfigured — never block the exam over a snapshot.
+      return c.json({ ok: false, url: null, key: null }, 200);
+    }
+  })
+
   // Submit an attempt: persist answers, auto-grade objective questions
   // immediately, and AI-grade subjective/coding on submit.
   .post("/student/attempts/:attemptId/submit", async (c) => {
@@ -1117,6 +1197,11 @@ const app = new Hono<{ Variables: Vars }>()
 
     const body = await c.req.json().catch(() => ({}));
     const respArr: { questionId: string; response: unknown }[] = Array.isArray(body.answers) ? body.answers : [];
+
+    // Backstop for proctoring evidence: the client flushes violations live to
+    // /events, but resends the whole list here in case a flush failed offline.
+    // Deduped on (type, at) so nothing is stored twice. Never blocks the submit.
+    try { await persistIntegrityEvents(aid, body.integrityEvents); } catch { /* evidence is best-effort */ }
 
     // Global AI provider for grading (single global settings row).
     let provider: string | null = null;
@@ -1861,12 +1946,37 @@ const app = new Hono<{ Variables: Vars }>()
         const atts = await db.select().from(schema.attempts).where(eq(schema.attempts.examId, ex.id));
         // Everyone who has engaged with the exam (in progress or already submitted/graded).
         const engaged = atts.filter((a) => a.status !== "not_started");
+        // Proctoring evidence per attempt: violation count + newest snapshot key.
+        const engagedIds = engaged.map((a) => a.id);
+        const evRows: { attemptId: string; photoUrl: string | null; at: Date }[] = [];
+        for (let i = 0; i < engagedIds.length; i += 100) {
+          const chunk = engagedIds.slice(i, i + 100);
+          const part = await db
+            .select({ attemptId: schema.integrityEvents.attemptId, photoUrl: schema.integrityEvents.photoUrl, at: schema.integrityEvents.at })
+            .from(schema.integrityEvents)
+            .where(inArray(schema.integrityEvents.attemptId, chunk));
+          evRows.push(...part);
+        }
+        const evAgg = new Map<string, { count: number; lastKey: string | null; lastAt: number }>();
+        for (const ev of evRows) {
+          const cur = evAgg.get(ev.attemptId) ?? { count: 0, lastKey: null, lastAt: 0 };
+          cur.count += 1;
+          const ms = new Date(ev.at).getTime();
+          if (ev.photoUrl && ms >= cur.lastAt) { cur.lastKey = ev.photoUrl; cur.lastAt = ms; }
+          evAgg.set(ev.attemptId, cur);
+        }
         const enriched = await Promise.all(
           engaged.map(async (a) => {
             const [stu] = await db.select().from(schema.students).where(eq(schema.students.id, a.studentId));
             const status = a.status === "in_progress" ? "in_progress" : "finished";
             // Online = a heartbeat within the last 40s (heartbeat interval is ~15s).
             const online = a.status === "in_progress" && !!a.lastSeenAt && now - new Date(a.lastSeenAt).getTime() < 40_000;
+            // Latest violation snapshot, as a short-lived presigned URL.
+            const agg = evAgg.get(a.id);
+            let snapshot: string | null = null;
+            if (agg?.lastKey) {
+              try { snapshot = await presignGet(agg.lastKey); } catch { snapshot = null; }
+            }
             return {
               attemptId: a.id,
               examId: ex.id,
@@ -1880,7 +1990,8 @@ const app = new Hono<{ Variables: Vars }>()
               submittedAt: a.submittedAt,
               score: a.status === "graded" ? a.score : null,
               graded: a.status === "graded",
-              snapshot: null as string | null,
+              snapshot,
+              violations: agg?.count ?? 0,
             };
           }),
         );
@@ -1889,9 +2000,9 @@ const app = new Hono<{ Variables: Vars }>()
         // begin → "not_started".
         const endMs = ex.endAt ? new Date(ex.endAt).getTime() : null;
         const windowClosed = endMs !== null && !Number.isNaN(endMs) && now > endMs;
-        const engagedIds = new Set(engaged.map((a) => a.studentId));
+        const engagedStudentIds = new Set(engaged.map((a) => a.studentId));
         const notStarted = assignedStudents(ex)
-          .filter((stu) => !engagedIds.has(stu.id))
+          .filter((stu) => !engagedStudentIds.has(stu.id))
           .map((stu) => ({
             attemptId: `ns-${stu.id}`,
             examId: ex.id,
@@ -1904,6 +2015,7 @@ const app = new Hono<{ Variables: Vars }>()
             startedAt: null as string | null,
             submittedAt: null as string | null,
             snapshot: null as string | null,
+            violations: 0,
           }));
         const absentCount = windowClosed ? notStarted.length : 0;
         return {
@@ -2202,11 +2314,25 @@ const app = new Hono<{ Variables: Vars }>()
         autoGraded: a?.autoGraded ?? null,
       };
     });
+    // Proctoring evidence: every recorded violation for this attempt, newest
+    // first, with a short-lived signed URL for the webcam snapshot captured at
+    // that moment (null when no snapshot was captured / storage was unavailable).
+    const evRows = await db.select().from(schema.integrityEvents)
+      .where(eq(schema.integrityEvents.attemptId, aid))
+      .orderBy(desc(schema.integrityEvents.at));
+    const integrity = await Promise.all(
+      evRows.slice(0, 300).map(async (ev) => {
+        let photo: string | null = null;
+        if (ev.photoUrl) { try { photo = await presignGet(ev.photoUrl); } catch { photo = null; } }
+        return { id: ev.id, type: ev.type, detail: ev.detail, at: ev.at, photo };
+      }),
+    );
     return c.json({
       exam: { id: ex.id, title: ex.title },
       student: { name: stu?.name ?? "—", rollNo: stu?.rollNo ?? "", email: stu?.email ?? null },
       attempt: { score: att.score, status: att.status, submittedAt: att.submittedAt, startedAt: att.startedAt },
       answers,
+      integrity,
     }, 200);
   })
 

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, UserX, Pause, Play, Plus, Wifi, WifiOff, RotateCcw } from "lucide-react";
+import { Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, UserX, Pause, Play, Plus, Wifi, WifiOff, RotateCcw, ShieldAlert, ShieldCheck } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Drawer } from "../components/ui";
@@ -19,8 +19,31 @@ type LiveStudent = {
   score?: number | null;
   graded?: boolean;
   snapshot: string | null;
+  /** Recorded proctoring violations for this attempt (camera loss, tab switch…). */
+  violations?: number;
   examTitle?: string;
 };
+
+type IntegrityRow = { id: string; type: string; detail: string | null; at: string | number | null; photo: string | null };
+
+const EVENT_LABEL: Record<string, string> = {
+  camera_lost: "Camera turned off",
+  camera_restored: "Camera restored",
+  tab_switch: "Switched away from exam",
+  focus_loss: "Window lost focus",
+  fullscreen_exit: "Left fullscreen",
+  multi_monitor: "Extra display connected",
+  copy: "Copy blocked",
+  paste: "Paste blocked",
+  cut: "Cut blocked",
+  copy_in_answer: "Copied inside answer field",
+  paste_in_answer: "Pasted into answer field",
+  cut_in_answer: "Cut inside answer field",
+  context_menu: "Right-click blocked",
+  shortcut: "Blocked shortcut",
+  screenshot: "Screenshot attempt",
+};
+const SERIOUS = new Set(["camera_lost", "tab_switch", "fullscreen_exit", "screenshot", "multi_monitor"]);
 
 type FilterKey = "all" | "in_progress" | "finished" | "not_started" | "absent";
 const FILTERS: { k: FilterKey; label: string }[] = [
@@ -198,6 +221,7 @@ export default function Monitor() {
                             <th>Roll No</th>
                             <th>Section</th>
                             <th>Status</th>
+                            <th className="text-right">Flags</th>
                             <th className="text-right">Score</th>
                             <th className="text-right">Started</th>
                             <th className="text-right">Submitted</th>
@@ -234,6 +258,15 @@ export default function Monitor() {
                                   <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[#c0453b]"><UserX size={14} /> Absent</span>
                                 ) : (
                                   <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--color-muted)]"><CircleDashed size={14} /> Not started</span>
+                                )}
+                              </td>
+                              <td className="text-right">
+                                {s.status === "not_started" || s.status === "absent" ? (
+                                  <span className="mono-label text-[var(--color-muted)]">—</span>
+                                ) : (s.violations ?? 0) > 0 ? (
+                                  <span className="inline-flex items-center gap-1 text-xs font-semibold" style={{ color: "#c0453b" }}><ShieldAlert size={13} /> {s.violations}</span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-1 text-xs font-medium text-[var(--color-success)]"><ShieldCheck size={13} /> Clean</span>
                                 )}
                               </td>
                               <td className="text-right">
@@ -284,7 +317,8 @@ type SheetAnswer = {
 
 function StudentDrawer({ s, onClose }: { s: LiveStudent; onClose: () => void }) {
   const q = useQuery({
-    enabled: !!s.examId && s.status === "finished",
+    enabled: !!s.examId && (s.status === "finished" || s.status === "in_progress"),
+    refetchInterval: s.status === "in_progress" ? 10_000 : false,
     queryKey: ["monitor-attempt", s.examId, s.attemptId],
     queryFn: async () => {
       const res = await api.reports[":examId"].attempt[":attemptId"].$get({ param: { examId: s.examId!, attemptId: s.attemptId } });
@@ -294,6 +328,7 @@ function StudentDrawer({ s, onClose }: { s: LiveStudent; onClose: () => void }) 
   });
   const d = q.data && !("message" in q.data) ? q.data : null;
   const answers = (d?.answers ?? []) as SheetAnswer[];
+  const events = ((d as { integrity?: IntegrityRow[] } | null)?.integrity ?? []) as IntegrityRow[];
 
   return (
     <Drawer
@@ -326,6 +361,37 @@ function StudentDrawer({ s, onClose }: { s: LiveStudent; onClose: () => void }) 
 
       {s.status === "finished" && s.examId && (
         <ReopenControl examId={s.examId} attemptId={s.attemptId} student={s.student} onDone={onClose} />
+      )}
+
+      {(s.status === "in_progress" || s.status === "finished") && (
+        <div className="mb-5">
+          <div className="mono-label mb-2">Proctoring evidence ({events.length})</div>
+          {q.isLoading ? (
+            <Loader />
+          ) : events.length === 0 ? (
+            <div className="card p-4 text-sm text-[var(--color-ink2)]">No violations recorded{s.status === "in_progress" ? " so far" : ""}.</div>
+          ) : (
+            <div className="space-y-2 max-h-72 overflow-auto pr-1">
+              {events.map((e) => (
+                <div key={e.id} className="card p-3 flex items-start gap-3">
+                  <div className="h-8 w-8 rounded-lg flex items-center justify-center shrink-0" style={{ background: SERIOUS.has(e.type) ? "#c0453b1a" : "#b7791f1a", color: SERIOUS.has(e.type) ? "#c0453b" : "#b7791f" }}>
+                    <ShieldAlert size={15} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-semibold text-[var(--color-ink)]">{EVENT_LABEL[e.type] ?? e.type.replace(/_/g, " ")}</div>
+                    {e.detail && <div className="text-xs text-[var(--color-ink2)] mt-0.5 break-words">{e.detail}</div>}
+                    <div className="mono-label mt-1">{fmtTime(e.at)}</div>
+                  </div>
+                  {e.photo && (
+                    <a href={e.photo} target="_blank" rel="noreferrer" className="shrink-0" title="Open full snapshot">
+                      <img src={e.photo} alt="Webcam snapshot" className="h-16 w-[85px] rounded-lg object-cover border border-[var(--color-line)]" style={{ transform: "scaleX(-1)" }} />
+                    </a>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       )}
 
       {s.status === "absent" ? (

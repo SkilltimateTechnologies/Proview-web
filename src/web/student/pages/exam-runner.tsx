@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useParams } from "wouter";
 import { api, type Bundle, type BundleQuestion, type ProctorConfig, DEFAULT_PROCTORING } from "../lib/api";
 import { useSession } from "../lib/session";
-import { requestFullscreen, exitFullscreen, startWebcam, getDisplayCount, type ProctorEvent, type WebcamHandle } from "../lib/proctor";
+import { requestFullscreen, exitFullscreen, startWebcam, getDisplayCount, startProctoring, captureSnapshot, isCameraActive, type ProctorEvent, type WebcamHandle } from "../lib/proctor";
 import { Icon, NetBadge, useOnline } from "../components/ui";
 
 type Phase = "brief" | "preflight" | "resume" | "running" | "validating" | "done";
@@ -137,11 +137,27 @@ export function ExamRunner() {
   const [lockLeft, setLockLeft] = useState(0);
   const lockTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Multi-monitor state (single-screen enforcement).
+  // Multi-monitor state. Extra displays are RECORDED as a violation, never a
+  // hard block — home candidates legitimately use a laptop + external monitor,
+  // and locking them out of a live exam is worse than flagging it for review.
   const [displayCount, setDisplayCount] = useState(1);
-  const [screenLocked, setScreenLocked] = useState(false);
   const displayCountRef = useRef(1);
   displayCountRef.current = displayCount;
+
+  // Fullscreen escape: students must not be able to leave the exam window, so an
+  // exit is re-enforced immediately. If the browser refuses to re-enter without a
+  // fresh user gesture we show a blocking overlay with a single button.
+  const [fsExited, setFsExited] = useState(false);
+
+  // ---- Proctoring evidence pipeline ----
+  // Every violation is (a) kept on the session for the submit backstop and
+  // (b) pushed to the server immediately, so evidence survives a crash, a
+  // force-quit, or an attempt that is never submitted.
+  const pendingEventsRef = useRef<ProctorEvent[]>([]);
+  const eventSyncingRef = useRef(false);
+  const lastEventAtRef = useRef<Record<string, number>>({});
+  const lockLeftRef = useRef(0);
+  lockLeftRef.current = lockLeft;
 
   const attachVideo = useCallback((handle: WebcamHandle) => {
     if (videoRef.current) {
@@ -149,6 +165,81 @@ export function ExamRunner() {
       void videoRef.current.play().catch(() => {});
     }
   }, []);
+
+  // Push queued violations to the server. Called the moment an event is recorded,
+  // on every heartbeat, on reconnect, and before submit. A failed flush re-queues
+  // the batch so nothing is silently dropped; events also ride along in the submit
+  // payload as a backstop (the server dedupes on type + timestamp).
+  const flushEvents = useCallback(() => {
+    const s = sessionRef.current;
+    if (!s?.attemptId || eventSyncingRef.current || !navigator.onLine) return;
+    if (pendingEventsRef.current.length === 0) return;
+    const batch = pendingEventsRef.current.slice(0, 100);
+    pendingEventsRef.current = pendingEventsRef.current.slice(batch.length);
+    eventSyncingRef.current = true;
+    void api.flushEvents(s.attemptId, batch)
+      .catch(() => { pendingEventsRef.current = [...batch, ...pendingEventsRef.current]; })
+      .finally(() => { eventSyncingRef.current = false; });
+  }, []);
+  const flushEventsRef = useRef(flushEvents);
+  flushEventsRef.current = flushEvents;
+
+  // Capture a webcam frame for the violation that just happened and upload it
+  // straight to object storage. Returns the storage key, or null when snapshots
+  // are off / the camera can't produce a frame / the upload fails. Snapshots are
+  // taken ONLY on violations (never on a timer), so an exam stores a handful of
+  // images instead of thousands.
+  const grabSnapshotKey = useCallback(async (): Promise<string | null> => {
+    const s = sessionRef.current;
+    if (!s?.attemptId || !navigator.onLine) return null;
+    if (!proctoringRef.current.webcamSnapshots) return null;
+    try {
+      const blob = await captureSnapshot(webcamRef.current);
+      if (!blob) return null;
+      const pre = await api.snapshotUrl(s.attemptId);
+      if (!pre.ok || !pre.url || !pre.key) return null;
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 8000);
+      try {
+        const res = await fetch(pre.url, { method: "PUT", body: blob, headers: { "Content-Type": "image/jpeg" }, signal: ctrl.signal });
+        return res.ok ? pre.key : null;
+      } finally { clearTimeout(t); }
+    } catch {
+      return null;
+    }
+  }, []);
+
+  // Record one violation: keep it on the session (submit backstop + live count),
+  // queue it for the server, and optionally attach a webcam snapshot. `minGapMs`
+  // throttles chatty event types (blocked keystrokes, focus flapping) so a student
+  // hammering Ctrl+C can't generate thousands of rows.
+  const recordEvent = useCallback((type: string, detail?: string, opts?: { snapshot?: boolean; minGapMs?: number }) => {
+    if (submittedRef.current) return;
+    const at = Date.now();
+    const gap = opts?.minGapMs ?? 0;
+    if (gap > 0 && at - (lastEventAtRef.current[type] ?? 0) < gap) return;
+    lastEventAtRef.current[type] = at;
+    const ev: ProctorEvent = { type, detail, at };
+    setSession((prev) => (prev ? { ...prev, integrityEvents: [...prev.integrityEvents, ev] } : prev));
+    if (!opts?.snapshot) {
+      pendingEventsRef.current.push(ev);
+      flushEventsRef.current();
+      return;
+    }
+    // Snapshot first so the image travels with the event (one server round trip).
+    void (async () => {
+      const photoKey = await grabSnapshotKey();
+      pendingEventsRef.current.push({ ...ev, photoKey });
+      if (photoKey) {
+        setSession((prev) => (prev
+          ? { ...prev, integrityEvents: prev.integrityEvents.map((e) => (e.at === at && e.type === type ? { ...e, photoKey } : e)) }
+          : prev));
+      }
+      flushEventsRef.current();
+    })();
+  }, [grabSnapshotKey]);
+  const recordEventRef = useRef(recordEvent);
+  recordEventRef.current = recordEvent;
 
   // ---- Load bundle for the brief (title/meta + question data) ----
   // Offline-first: hydrate immediately from the local cache (so a refresh works
@@ -172,11 +263,9 @@ export function ExamRunner() {
     const cfg = proctoringRef.current;
     if (!cfg.blockOnCameraLoss || submittedRef.current) return;
     setCamReady(false);
-    const s = sessionRef.current;
-    if (s) {
-      const ev: ProctorEvent = { type: "camera_lost", detail: reason, at: Date.now() };
-      setSession({ ...s, integrityEvents: [...s.integrityEvents, ev] });
-    }
+    // Persist the violation immediately (with a snapshot attempt) — the overlay
+    // tells the student "this has been recorded", so it must actually be recorded.
+    recordEventRef.current("camera_lost", reason, { snapshot: true, minGapMs: 3000 });
     pushAlert(`Camera turned off — exam locked. ${reason}`, "danger");
     setLocked(true);
     setLockLeft(cfg.cameraLossLockSeconds);
@@ -224,15 +313,17 @@ export function ExamRunner() {
     if (!examId || !student || !bundle) return;
     if (proctoringRef.current.requireWebcam && !camReady) { setCamError("Enable your camera to start."); return; }
     if (!online) { setErr("An internet connection is required to start this exam."); return; }
+    let startDisplays = 1;
     if (proctoringRef.current.requireSingleScreen) {
       // Never let the display check block the start flow — cap it so a hung
       // permission prompt (seen inside SEB kiosk) can't freeze "Start secure exam".
-      const count = await Promise.race([
+      // An extra monitor is FLAGGED, not blocked (home candidates commonly use a
+      // laptop plus an external display).
+      startDisplays = await Promise.race([
         getDisplayCount().catch(() => 1),
         new Promise<number>((r) => setTimeout(() => r(1), 1500)),
       ]);
-      setDisplayCount(count);
-      if (count > 1) { setErr("Disconnect all extra monitors — only one display is allowed during the exam."); return; }
+      setDisplayCount(startDisplays);
     }
     try {
       const start = await api.start(examId);
@@ -257,11 +348,16 @@ export function ExamRunner() {
       saveProgress(examId, { attemptId: start.attemptId, endAt, answers: mergedAnswers, flags: saved?.flags ?? {}, cur: curRef.current });
       setHeld(!!start.held);
       enterRunning();
+      // Record the setup we started with, so the report shows the conditions.
+      if (startDisplays > 1) {
+        recordEventRef.current("multi_monitor", `${startDisplays} displays connected at start`, { snapshot: true });
+        pushAlert(`${startDisplays} displays detected — this has been recorded for review.`, "warn");
+      }
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Could not start exam");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [examId, student, bundle, camReady, online]);
+  }, [examId, student, bundle, camReady, online, pushAlert]);
 
   function enterRunning() {
     runningSinceRef.current = Date.now();
@@ -369,18 +465,30 @@ export function ExamRunner() {
     }
   }, [engageLock, attachVideo]);
 
+  // Unlock as soon as BOTH conditions hold: the penalty countdown has elapsed and
+  // the camera is live again. This runs on a repeating poll (not once when the
+  // countdown hits zero) so a student whose camera comes back later — or who
+  // reconnects it with the "Re-enable camera now" button — is never left stranded
+  // behind the overlay with a working camera.
   useEffect(() => {
-    if (locked && lockLeft === 0) {
-      void (async () => {
-        const ok = await tryRestoreCamera();
-        if (ok) {
-          setLocked(false);
-          pushAlert("Camera restored — exam resumed. This was recorded.", "warn");
-          if (proctoringRef.current.fullscreenRequired) void requestFullscreen();
-        }
-      })();
-    }
-  }, [locked, lockLeft, tryRestoreCamera, pushAlert]);
+    if (!locked) return;
+    let stopped = false;
+    const tick = async () => {
+      if (stopped || submittedRef.current) return;
+      if (lockLeftRef.current > 0) return;
+      const ok = isCameraActive(webcamRef.current) || (await tryRestoreCamera());
+      if (stopped || !ok) return;
+      setLocked(false);
+      setCamReady(true);
+      setCamError("");
+      recordEventRef.current("camera_restored", "Camera restored — exam resumed");
+      pushAlert("Camera restored — exam resumed. This was recorded.", "warn");
+      if (proctoringRef.current.fullscreenRequired) void requestFullscreen();
+    };
+    void tick();
+    const t = setInterval(() => void tick(), 2500);
+    return () => { stopped = true; clearInterval(t); };
+  }, [locked, tryRestoreCamera, pushAlert]);
 
   // ---- Offline-first network handling (no freeze, no logout) ----
   // On the FIRST drop we save progress locally + show ONE toast, then stay quiet.
@@ -400,8 +508,10 @@ export function ExamRunner() {
       notifiedOfflineRef.current = false;
       const s = sessionRef.current;
       if (s) saveProgress(examId, { answers: s.answers, flags: s.flags, cur: curRef.current });
-      // Flush every answer edited during the offline window (all still dirty).
+      // Flush every answer edited during the offline window (all still dirty),
+      // plus any violations recorded while the connection was down.
       flushSyncRef.current();
+      flushEventsRef.current();
     }
   }, [online, phase, examId, pushAlert]);
 
@@ -416,8 +526,10 @@ export function ExamRunner() {
     const beat = () => {
       if (stopped || submittedRef.current || !navigator.onLine) return;
       // Piggyback a sync on every heartbeat so any answer left dirty (e.g. the
-      // student is idle on one question) reaches the server within ~15s.
+      // student is idle on one question) reaches the server within ~15s, plus a
+      // flush of any proctoring evidence still queued.
       flushSyncRef.current();
+      flushEventsRef.current();
       void api.heartbeat(examId)
         .then((info) => {
           if (stopped) return;
@@ -495,10 +607,68 @@ export function ExamRunner() {
   }, [phase, result, examId, gradeDone]);
 
   // ---- Proctoring while running ----
-  // DISABLED on web: real proctored exams run inside Safe Exam Browser (SEB),
-  // which enforces lockdown at the OS level. The browser build is preview-only,
-  // so tab-switch / focus-loss detection and auto-submit are intentionally off
-  // here — switching tabs must NOT flag violations or submit the exam.
+  // Real exams run inside Safe Exam Browser (SEB), which enforces lockdown at the
+  // OS level; this layer records the EVIDENCE (and re-enforces fullscreen) so an
+  // admin can review what happened. Tab/focus loss is recorded but NEVER
+  // auto-submits — SEB already blocks tab switching, and a home candidate must not
+  // lose their exam to a stray notification.
+  useEffect(() => {
+    if (phase !== "running") return;
+    const cfg = proctoringRef.current;
+    const stop = startProctoring((ev) => {
+      const rec = recordEventRef.current;
+      switch (ev.type) {
+        case "fullscreen_exit":
+          rec("fullscreen_exit", ev.detail, { snapshot: true, minGapMs: 3000 });
+          pushAlert("You left fullscreen — the exam must stay in fullscreen. This has been recorded.", "danger");
+          // Re-enforce immediately. If the browser refuses without a fresh user
+          // gesture, the overlay below forces the student to click to come back.
+          void requestFullscreen().then(() => {
+            setTimeout(() => { if (!document.fullscreenElement) setFsExited(true); }, 400);
+          });
+          break;
+        case "tab_switch":
+          rec("tab_switch", ev.detail, { snapshot: true, minGapMs: 3000 });
+          pushAlert("You switched away from the exam window. This has been recorded.", "danger");
+          break;
+        case "focus_loss":
+          rec("focus_loss", ev.detail, { snapshot: true, minGapMs: 8000 });
+          break;
+        case "copy":
+        case "paste":
+        case "cut":
+          rec(ev.type, ev.detail, { minGapMs: 2000 });
+          pushAlert("Copying from the exam is disabled. This has been recorded.", "warn");
+          break;
+        case "copy_in_answer":
+        case "paste_in_answer":
+        case "cut_in_answer":
+          // Allowed inside the student's own answer field — recorded silently.
+          rec(ev.type, ev.detail, { minGapMs: 5000 });
+          break;
+        default:
+          // context_menu / shortcut / screenshot / Electron kiosk events.
+          rec(ev.type, ev.detail, { minGapMs: 2000 });
+          break;
+      }
+    }, cfg);
+    return stop;
+  }, [phase, pushAlert]);
+
+  // Clear the "return to fullscreen" overlay the moment fullscreen is back.
+  useEffect(() => {
+    const onFs = () => { if (document.fullscreenElement) setFsExited(false); };
+    document.addEventListener("fullscreenchange", onFs);
+    return () => document.removeEventListener("fullscreenchange", onFs);
+  }, []);
+
+  // Drain queued violations on a timer too, so evidence recorded while offline
+  // (or before the attempt id existed) still reaches the server.
+  useEffect(() => {
+    if (phase !== "running") return;
+    const t = setInterval(() => flushEventsRef.current(), 10_000);
+    return () => clearInterval(t);
+  }, [phase]);
 
   // ---- Webcam lifecycle while running ----
   useEffect(() => {
@@ -523,16 +693,22 @@ export function ExamRunner() {
   }, [phase]);
 
   // ---- Single-screen watchdog while running ----
+  // Records an extra display as a violation (with a snapshot) and warns the
+  // student — it does NOT lock them out. Home candidates often have a second
+  // monitor attached; the admin decides what to do with the evidence afterwards.
   useEffect(() => {
     if (phase !== "running" || !proctoringRef.current.requireSingleScreen) return;
     const check = () => void getDisplayCount().then((n) => {
       setDisplayCount(n);
-      setScreenLocked(n > 1);
+      if (n > 1) {
+        recordEventRef.current("multi_monitor", `${n} displays connected`, { snapshot: true, minGapMs: 60_000 });
+        pushAlert(`${n} displays detected — only one is allowed. This has been recorded.`, "warn");
+      }
     }).catch(() => {});
-    const t = setInterval(check, 2500);
+    const t = setInterval(check, 5000);
     check();
     return () => clearInterval(t);
-  }, [phase]);
+  }, [phase, pushAlert]);
 
   // Live server-anchored countdown.
   const remaining = session ? session.endAt - now : 0;
@@ -562,6 +738,9 @@ export function ExamRunner() {
   const doSubmit = useCallback(async () => {
     const s = sessionRef.current;
     if (!s || submittedRef.current || !bundle) return;
+    // Push any queued violations before we flip the submitted flag (after which
+    // recording stops). They also ride along in the payload as a backstop.
+    flushEventsRef.current();
     submittedRef.current = true;
     setSubmitting(true);
 
@@ -726,7 +905,8 @@ export function ExamRunner() {
     const needSingle = proctoring.requireSingleScreen;
     const camOk = !needCam || camReady;
     const screenOk = !needSingle || displayCount <= 1;
-    const canResume = camOk && screenOk;
+    // Extra displays are flagged, not blocking — only the camera gates a resume.
+    const canResume = camOk;
     return (
       <div className="runner" style={{ alignItems: "center", justifyContent: "center" }}>
         <div className="card" style={{ padding: 32, maxWidth: 520, width: "100%" }}>
@@ -746,7 +926,7 @@ export function ExamRunner() {
 
           <div style={{ display: "grid", gap: 10, marginBottom: 20 }}>
             {needCam && <CheckRow ok={camOk} label="Webcam" detail={camOk ? "Camera active" : camError || "Camera not detected — click Enable camera"} />}
-            {needSingle && <CheckRow ok={screenOk} label="Single display" detail={screenOk ? "One monitor detected" : `${displayCount} monitors detected — disconnect extra displays`} />}
+            {needSingle && <CheckRow ok={screenOk} label="Single display" detail={screenOk ? "One monitor detected" : `${displayCount} displays detected — this will be recorded for review`} />}
           </div>
 
           {camError && needCam && (
@@ -759,7 +939,7 @@ export function ExamRunner() {
             </button>
           )}
           <button className="btn btn-primary" style={{ width: "100%", padding: 13 }} disabled={!canResume} onClick={() => { if (proctoringRef.current.fullscreenRequired) void requestFullscreen(); enterRunning(); }}>
-            <Icon name="play" /> {canResume ? "Resume exam" : needCam && !camOk ? "Enable your camera to resume" : "Disconnect extra monitors to resume"}
+            <Icon name="play" /> {canResume ? "Resume exam" : "Enable your camera to resume"}
           </button>
         </div>
       </div>
@@ -773,7 +953,9 @@ export function ExamRunner() {
     const netOk = online;
     const camOk = !needCam || camReady;
     const screenOk = !needSingle || displayCount <= 1;
-    const canStart = netOk && camOk && screenOk;
+    // Extra displays are recorded as a violation, not a hard block — a candidate
+    // sitting at home must still be able to begin the exam.
+    const canStart = netOk && camOk;
     return (
       <div className="runner" style={{ alignItems: "center", justifyContent: "center" }}>
         <div className="card" style={{ padding: 32, maxWidth: 520, width: "100%" }}>
@@ -792,7 +974,7 @@ export function ExamRunner() {
           <div style={{ display: "grid", gap: 10, marginBottom: 20 }}>
             {needCam && <CheckRow ok={camOk} label="Webcam" detail={camOk ? "Camera active" : camError || "Camera not detected — click Enable camera"} />}
             <CheckRow ok={netOk} label="Internet connection" detail={netOk ? "Connected" : "Waiting for a connection to start the exam"} />
-            {needSingle && <CheckRow ok={screenOk} label="Single display" detail={screenOk ? "One monitor detected" : `${displayCount} monitors detected — disconnect extra displays`} />}
+            {needSingle && <CheckRow ok={screenOk} label="Single display" detail={screenOk ? "One monitor detected" : `${displayCount} displays detected — disconnect extras if you can; this is recorded for review`} />}
           </div>
 
           {camError && needCam && (
@@ -808,7 +990,7 @@ export function ExamRunner() {
             </button>
           )}
           <button className="btn btn-primary" style={{ width: "100%", padding: 13 }} disabled={!canStart} onClick={() => void startExam()}>
-            <Icon name="play" /> {canStart ? "Start secure exam" : needCam && !camOk ? "Enable your camera to start" : needSingle && !screenOk ? "Disconnect extra monitors to start" : "Waiting for connection…"}
+            <Icon name="play" /> {canStart ? "Start secure exam" : needCam && !camOk ? "Enable your camera to start" : "Waiting for connection…"}
           </button>
           <button className="btn btn-ghost btn-sm" style={{ width: "100%", marginTop: 10 }} onClick={() => { webcamRef.current?.stop(); webcamRef.current = null; setCamReady(false); navigate("/"); }}>Cancel</button>
         </div>
@@ -887,15 +1069,27 @@ export function ExamRunner() {
         </div>
       )}
 
-      {/* Second-monitor lock overlay */}
-      {screenLocked && !locked && (
-        <div style={{ position: "fixed", inset: 0, zIndex: 80, background: "rgba(8,12,20,.92)", display: "flex", alignItems: "center", justifyContent: "center", backdropFilter: "blur(4px)" }}>
+      {/* Fullscreen-escape overlay — the student must return to fullscreen to
+          continue. Shown only when the browser refused to re-enter fullscreen
+          automatically (it needs a fresh user gesture). The exit itself is already
+          recorded as a violation with a snapshot. */}
+      {fsExited && !locked && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 85, background: "rgba(8,12,20,.94)", display: "flex", alignItems: "center", justifyContent: "center", backdropFilter: "blur(4px)" }}>
           <div className="card" style={{ padding: 34, maxWidth: 440, textAlign: "center" }}>
             <div style={{ width: 58, height: 58, borderRadius: 999, background: "var(--color-danger-bg)", color: "var(--color-danger)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}><Icon name="monitor-x" size={28} /></div>
-            <h2 style={{ fontFamily: "var(--font-serif)", fontSize: 22, marginBottom: 6 }}>Extra monitor detected</h2>
-            <p style={{ color: "var(--color-ink2)", fontSize: 14, marginBottom: 18 }}>Only one display is allowed during this exam. {displayCount} monitors are currently connected. Disconnect the extra display to continue — this has been recorded and the timer keeps running.</p>
-            <div className="mono-label" style={{ color: "#8ba0bd" }}>Waiting for a single display…</div>
+            <h2 style={{ fontFamily: "var(--font-serif)", fontSize: 22, marginBottom: 6 }}>Return to fullscreen</h2>
+            <p style={{ color: "var(--color-ink2)", fontSize: 14, marginBottom: 18 }}>This exam must stay in fullscreen. Leaving it has been recorded. Click below to go back — the timer keeps running.</p>
+            <button className="btn btn-primary" style={{ width: "100%", padding: 11 }} onClick={() => { void requestFullscreen(); setFsExited(false); }}>
+              <Icon name="monitor" /> Back to fullscreen
+            </button>
           </div>
+        </div>
+      )}
+
+      {/* Extra-display warning strip — recorded, never blocking. */}
+      {proctoring.requireSingleScreen && displayCount > 1 && (
+        <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, zIndex: 45, background: "var(--color-warn)", color: "#fff", padding: "8px 14px", fontSize: 12.5, fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+          <Icon name="monitor-x" size={14} /> {displayCount} displays detected — only one is allowed. This has been recorded for review.
         </div>
       )}
 
