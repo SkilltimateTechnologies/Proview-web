@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useParams } from "wouter";
 import { api, type Bundle, type BundleQuestion, type ProctorConfig, DEFAULT_PROCTORING } from "../lib/api";
 import { useSession } from "../lib/session";
-import { requestFullscreen, exitFullscreen, startWebcam, getDisplayCount, startProctoring, captureSnapshot, isCameraActive, type ProctorEvent, type WebcamHandle } from "../lib/proctor";
+import { requestFullscreen, exitFullscreen, startWebcam, getDisplayCount, startProctoring, captureFrame, isCameraActive, createObstructionDetector, type FrameMetrics, type ProctorEvent, type WebcamHandle } from "../lib/proctor";
 import { Icon, NetBadge, useOnline } from "../components/ui";
 
 type Phase = "brief" | "preflight" | "resume" | "running" | "validating" | "done";
@@ -137,6 +137,19 @@ export function ExamRunner() {
   const [lockLeft, setLockLeft] = useState(0);
   const lockTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // ---- Blocked-lens detection ----
+  // A camera with tape/paper/a hand over it reports a perfectly healthy track:
+  // `live`, unmuted, delivering frames. No track-level signal can catch it, so we
+  // measure the pixels of the frame we already captured (see analyzeFrame). Like
+  // the multi-monitor check this FLAGS and warns — it never locks the exam, because
+  // an unlit room is a legitimate false positive.
+  const obstructionRef = useRef(createObstructionDetector());
+  const [camBlocked, setCamBlocked] = useState<string | null>(null);
+  // Preflight frames are captured before the attempt exists (no attemptId yet, so
+  // nothing can be signed or uploaded). Buffer the JPEGs here and flush them the
+  // moment /start returns an attemptId.
+  const preflightFramesRef = useRef<{ blob: Blob; at: number }[]>([]);
+
   // Multi-monitor state. Extra displays are RECORDED as a violation, never a
   // hard block — home candidates legitimately use a laptop + external monitor,
   // and locking them out of a live exam is worse than flagging it for review.
@@ -190,14 +203,11 @@ export function ExamRunner() {
   // straight to object storage. Returns the storage key, or null when snapshots
   // are off / the camera can't produce a frame / the upload fails. Used both for
   // violation evidence and for the timed frames below.
-  const grabSnapshotKey = useCallback(async (): Promise<string | null> => {
-    const s = sessionRef.current;
-    if (!s?.attemptId || !navigator.onLine) return null;
-    if (!proctoringRef.current.webcamSnapshots) return null;
+  // Sign + PUT one JPEG straight to object storage. Returns the storage key, or
+  // null on any failure — the API only signs URLs, images never pass through it.
+  const uploadFrame = useCallback(async (attemptId: string, blob: Blob): Promise<string | null> => {
     try {
-      const blob = await captureSnapshot(webcamRef.current);
-      if (!blob) return null;
-      const pre = await api.snapshotUrl(s.attemptId);
+      const pre = await api.snapshotUrl(attemptId);
       if (!pre.ok || !pre.url || !pre.key) return null;
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), 8000);
@@ -209,6 +219,26 @@ export function ExamRunner() {
       return null;
     }
   }, []);
+
+  // Capture a frame AND its luminance metrics in one pass (same canvas, decoded
+  // once), then upload it. Metrics come back even when the upload fails, so
+  // blocked-lens detection keeps working on a flaky uplink.
+  const grabFrame = useCallback(async (): Promise<{ key: string | null; metrics: FrameMetrics | null }> => {
+    const s = sessionRef.current;
+    if (!s?.attemptId) return { key: null, metrics: null };
+    if (!proctoringRef.current.webcamSnapshots) return { key: null, metrics: null };
+    try {
+      const { blob, metrics } = await captureFrame(webcamRef.current);
+      if (!blob || !navigator.onLine) return { key: null, metrics };
+      return { key: await uploadFrame(s.attemptId, blob), metrics };
+    } catch {
+      return { key: null, metrics: null };
+    }
+  }, [uploadFrame]);
+
+  const grabSnapshotKey = useCallback(async (): Promise<string | null> => {
+    return (await grabFrame()).key;
+  }, [grabFrame]);
 
   // Record one violation: keep it on the session (submit backstop + live count),
   // queue it for the server, and optionally attach a webcam snapshot. `minGapMs`
@@ -252,11 +282,33 @@ export function ExamRunner() {
     if (submittedRef.current) return;
     const s = sessionRef.current;
     if (!s?.attemptId) return;
-    const photoKey = await grabSnapshotKey();
-    if (!photoKey) return;
-    pendingEventsRef.current.push({ type: "periodic_snapshot", detail: "Timed webcam frame", at: Date.now(), photoKey });
+    const { key: photoKey, metrics } = await grabFrame();
+    if (photoKey) {
+      pendingEventsRef.current.push({ type: "periodic_snapshot", detail: "Timed webcam frame", at: Date.now(), photoKey });
+      flushEventsRef.current();
+    }
+    // Blocked-lens check on the frame we just took. Only the TRANSITION is
+    // recorded (covered -> ok -> covered), so a lens taped for an hour produces
+    // one event, not one per capture.
+    if (!proctoringRef.current.detectCameraBlock) return;
+    const { verdict, changed } = obstructionRef.current.push(metrics);
+    if (!changed) return;
+    const at = Date.now();
+    if (verdict.state === "ok") {
+      // Recovery is logged so a reviewer can see how long the view was blocked,
+      // but it is NOT misconduct and never counts as a violation.
+      setCamBlocked(null);
+      pendingEventsRef.current.push({ type: "camera_restored", detail: "Camera view is clear again", at });
+      flushEventsRef.current();
+      return;
+    }
+    setCamBlocked(verdict.reason);
+    const ev: ProctorEvent = { type: "camera_obstructed", detail: verdict.reason, at };
+    pendingEventsRef.current.push({ ...ev, photoKey });
+    setSession((prev) => (prev ? { ...prev, integrityEvents: [...prev.integrityEvents, ev] } : prev));
     flushEventsRef.current();
-  }, [grabSnapshotKey]);
+    pushAlert("Your camera view is blocked. Uncover the lens or improve the lighting — this has been recorded for review.", "warn");
+  }, [grabFrame, pushAlert]);
   const capturePeriodicRef = useRef(capturePeriodic);
   capturePeriodicRef.current = capturePeriodic;
 
@@ -328,6 +380,41 @@ export function ExamRunner() {
     return () => clearInterval(t);
   }, [phase]);
 
+  // ---- Camera-check capture (preflight) ----
+  // The camera check is exactly when a candidate would swap in a photo, cover the
+  // lens, or seat a stand-in — but until /start runs there is no attemptId, so
+  // nothing can be signed or uploaded yet. Capture into memory here and flush the
+  // buffer as soon as the attempt exists (see startExam). Capped at MAX_FRAMES so
+  // a student who parks on the gate for 20 minutes can't grow the heap.
+  useEffect(() => {
+    if (phase !== "preflight" || !camReady) return;
+    const cfg = proctoringRef.current;
+    if (!cfg.webcamSnapshots || !cfg.requireWebcam) return;
+    const MAX_FRAMES = 4;
+    // Faster confirmation than the in-exam detector: the student is sitting at the
+    // gate and can fix a covered lens before the timer ever starts.
+    const gate = createObstructionDetector(2, { detectFrozen: false });
+    let stopped = false;
+
+    const tick = async () => {
+      if (stopped || !isCameraActive(webcamRef.current)) return;
+      try {
+        const { blob, metrics } = await captureFrame(webcamRef.current);
+        if (stopped) return;
+        if (blob && preflightFramesRef.current.length < MAX_FRAMES) {
+          preflightFramesRef.current.push({ blob, at: Date.now() });
+        }
+        if (!cfg.detectCameraBlock) return;
+        const { verdict, changed } = gate.push(metrics);
+        if (changed) setCamBlocked(verdict.state === "ok" ? null : verdict.reason);
+      } catch { /* a failed camera-check frame must never block starting */ }
+    };
+
+    void tick();
+    const t = setInterval(() => { void tick(); }, 6000);
+    return () => { stopped = true; clearInterval(t); };
+  }, [phase, camReady]);
+
   const startExam = useCallback(async () => {
     if (!examId || !student || !bundle) return;
     if (proctoringRef.current.requireWebcam && !camReady) { setCamError("Enable your camera to start."); return; }
@@ -367,6 +454,21 @@ export function ExamRunner() {
       saveProgress(examId, { attemptId: start.attemptId, endAt, answers: mergedAnswers, flags: saved?.flags ?? {}, cur: curRef.current });
       setHeld(!!start.held);
       enterRunning();
+      // Flush the camera-check frames now that an attempt exists to hang them on.
+      // Fire-and-forget: the exam must start instantly, never wait on uploads.
+      const gateFrames = preflightFramesRef.current.splice(0);
+      if (gateFrames.length) {
+        void (async () => {
+          for (const f of gateFrames) {
+            const key = await uploadFrame(start.attemptId, f.blob);
+            if (key) pendingEventsRef.current.push({ type: "preflight_snapshot", detail: "Camera check frame", at: f.at, photoKey: key });
+          }
+          flushEventsRef.current();
+        })();
+      }
+      // Fresh detector state for the exam itself — gate readings must not carry over.
+      obstructionRef.current.reset();
+      setCamBlocked(null);
       // Record the setup we started with, so the report shows the conditions.
       if (startDisplays > 1) {
         recordEventRef.current("multi_monitor", `${startDisplays} displays connected at start`, { snapshot: true });
@@ -376,7 +478,7 @@ export function ExamRunner() {
       setErr(e instanceof Error ? e.message : "Could not start exam");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [examId, student, bundle, camReady, online, pushAlert]);
+  }, [examId, student, bundle, camReady, online, pushAlert, uploadFrame]);
 
   function enterRunning() {
     runningSinceRef.current = Date.now();
@@ -708,8 +810,12 @@ export function ExamRunner() {
     const cfg = proctoringRef.current;
     if (!cfg.webcamSnapshots || !cfg.requireWebcam) return;
     // Floor the interval so a mistyped setting can't turn into an upload storm.
-    const baseMs = Math.max(45, cfg.snapshotIntervalSec || 100) * 1000;
-    const nextDelay = () => baseMs * (0.75 + Math.random() * 0.5);
+    const baseMs = Math.max(20, cfg.snapshotIntervalSec || 27) * 1000;
+    // Per-tick jitter is only ±10%: at a 27s cadence a wider band would push
+    // frames outside the intended 25-30s window. The heavy de-synchronising is
+    // done by the random first-capture offset below (0..one full interval), which
+    // is what actually stops 150 machines uploading on the same wall-clock tick.
+    const nextDelay = () => baseMs * (0.9 + Math.random() * 0.2);
     let timer: ReturnType<typeof setTimeout> | null = null;
     let stopped = false;
 
@@ -1037,7 +1143,15 @@ export function ExamRunner() {
             {needCam && <CheckRow ok={camOk} label="Webcam" detail={camOk ? "Camera active" : camError || "Camera not detected — click Enable camera"} />}
             <CheckRow ok={netOk} label="Internet connection" detail={netOk ? "Connected" : "Waiting for a connection to start the exam"} />
             {needSingle && <CheckRow ok={screenOk} label="Single display" detail={screenOk ? "One monitor detected" : `${displayCount} displays detected — disconnect extras if you can; this is recorded for review`} />}
+            {needCam && camOk && <CheckRow ok={!camBlocked} label="Camera view" detail={camBlocked ? camBlocked : "Your face is clearly visible"} />}
           </div>
+
+          {camBlocked && needCam && camOk && (
+            <div style={{ display: "flex", gap: 8, color: "var(--color-warn)", background: "#fdf3e2", padding: "10px 12px", borderRadius: 10, fontSize: 13, marginBottom: 14 }}>
+              <Icon name="triangle-alert" size={15} />
+              <span>Uncover your camera and make sure the room is well lit. You can still start, but a blocked camera view is recorded for review.</span>
+            </div>
+          )}
 
           {camError && needCam && (
             <div style={{ display: "flex", gap: 8, color: "var(--color-danger)", background: "var(--color-danger-bg)", padding: "10px 12px", borderRadius: 10, fontSize: 13, marginBottom: 14 }}><Icon name="triangle-alert" size={15} /> {camError}</div>
@@ -1194,17 +1308,27 @@ export function ExamRunner() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           {proctoring.requireWebcam && (
-            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600, color: camReady ? "var(--color-success)" : "var(--color-danger)" }}>
-              <Icon name={camReady ? "video" : "video-off"} size={15} /> {camReady ? "Camera on" : "Camera off"}
+            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600, color: !camReady ? "var(--color-danger)" : camBlocked ? "var(--color-warn)" : "var(--color-success)" }}>
+              <Icon name={camReady ? (camBlocked ? "triangle-alert" : "video") : "video-off"} size={15} /> {!camReady ? "Camera off" : camBlocked ? "Camera blocked" : "Camera on"}
             </div>
           )}
           <NetBadge online={online} />
         </div>
       </div>
 
+      {/* Blocked-lens notice. Persistent (not a 5s toast) because it is actionable:
+          the candidate can uncover the lens or turn on a light and clear it. It never
+          blocks the exam — an unlit room is a legitimate false positive. */}
+      {proctoring.requireWebcam && camReady && camBlocked && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, background: "#fdf3e2", color: "var(--color-warn)", padding: "9px 16px", fontSize: 13, fontWeight: 600, borderBottom: "1px solid #eccf9a" }}>
+          <Icon name="triangle-alert" size={15} />
+          <span>Your camera view is blocked. Uncover the lens and make sure the room is lit — this has been recorded for review.</span>
+        </div>
+      )}
+
       {/* Live webcam preview */}
       {proctoring.requireWebcam && (
-        <video ref={videoRef} autoPlay playsInline muted style={{ position: "fixed", bottom: 16, right: 16, width: 150, height: 112, borderRadius: 10, objectFit: "cover", background: "#0b1220", border: "2px solid rgba(255,255,255,.15)", transform: "scaleX(-1)", zIndex: 40, boxShadow: "0 6px 18px rgba(0,0,0,.3)" }} />
+        <video ref={videoRef} autoPlay playsInline muted style={{ position: "fixed", bottom: 16, right: 16, width: 150, height: 112, borderRadius: 10, objectFit: "cover", background: "#0b1220", border: camBlocked ? "2px solid var(--color-warn)" : "2px solid rgba(255,255,255,.15)", transform: "scaleX(-1)", zIndex: 40, boxShadow: "0 6px 18px rgba(0,0,0,.3)" }} />
       )}
 
       <div className="runner-body">

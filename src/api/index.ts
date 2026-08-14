@@ -55,6 +55,15 @@ async function resolveRegisterTenant(codeRaw: string) {
 // `photoKey` is the object-storage key of the webcam snapshot captured at that
 // moment; it is only accepted inside this attempt's own prefix.
 const INTEGRITY_PREFIX = (attemptId: string) => `integrity/${attemptId}/`;
+
+// Timed camera frames: evidence, not misconduct. They belong in the Snapshots
+// trail and must never inflate a violation count.
+const FRAME_EVENT_TYPES = ["periodic_snapshot", "preflight_snapshot"] as const;
+const isFrameEvent = (t: string) => (FRAME_EVENT_TYPES as readonly string[]).includes(t);
+// Informational rows that belong on the integrity timeline (a reviewer wants to
+// see when a blocked camera view cleared) but are not themselves violations.
+const NON_VIOLATION_TYPES = new Set<string>([...FRAME_EVENT_TYPES, "camera_restored"]);
+
 type RawIntegrityEvent = { type?: unknown; detail?: unknown; at?: unknown; photoKey?: unknown; photoUrl?: unknown };
 
 async function persistIntegrityEvents(attemptId: string, raw: unknown): Promise<number> {
@@ -1992,13 +2001,13 @@ const app = new Hono<{ Variables: Vars }>()
             .where(inArray(schema.integrityEvents.attemptId, chunk));
           evRows.push(...part);
         }
-        // Timed frames (`periodic_snapshot`) are evidence, NOT misconduct: they must
-        // never inflate the violation count, but they DO make the best live
-        // thumbnail — so they still feed `lastKey`.
+        // Timed frames are evidence, NOT misconduct: they must never inflate the
+        // violation count, but they DO make the best live thumbnail — so they still
+        // feed `lastKey`.
         const evAgg = new Map<string, { count: number; lastKey: string | null; lastAt: number }>();
         for (const ev of evRows) {
           const cur = evAgg.get(ev.attemptId) ?? { count: 0, lastKey: null, lastAt: 0 };
-          if (ev.type !== "periodic_snapshot") cur.count += 1;
+          if (!NON_VIOLATION_TYPES.has(ev.type)) cur.count += 1;
           const ms = new Date(ev.at).getTime();
           if (ev.photoUrl && ms >= cur.lastAt) { cur.lastKey = ev.photoUrl; cur.lastAt = ms; }
           evAgg.set(ev.attemptId, cur);
@@ -2372,11 +2381,12 @@ const app = new Hono<{ Variables: Vars }>()
       return { id: ev.id, type: ev.type, detail: ev.detail, at: ev.at, photo, proxy };
     };
     const integrity = await Promise.all(
-      evRows.filter((ev) => ev.type !== "periodic_snapshot").slice(0, 300).map(sign),
+      evRows.filter((ev) => !isFrameEvent(ev.type)).slice(0, 300).map(sign),
     );
-    // Newest first, capped — a 3h attempt at one frame per 100s is ~110 frames.
+    // Capped — at the ~27s cadence a 3h attempt is ~400 frames, so the cap has to
+    // clear that or the tail of a long attempt silently disappears from review.
     const snapshots = (await Promise.all(
-      evRows.filter((ev) => ev.type === "periodic_snapshot" && ev.photoUrl).slice(0, 300).map(sign),
+      evRows.filter((ev) => isFrameEvent(ev.type) && ev.photoUrl).slice(0, 600).map(sign),
     )).filter((s) => s.photo);
     return c.json({
       exam: { id: ex.id, title: ex.title },

@@ -631,7 +631,8 @@ type IntegrityRow = { id: string; type: string; detail: string | null; at: strin
 
 const EVENT_META: Record<string, { label: string; icon: typeof ShieldAlert; color: string }> = {
   camera_lost: { label: "Camera turned off", icon: VideoOff, color: "#c0453b" },
-  camera_restored: { label: "Camera restored", icon: Check, color: "#2e7d5b" },
+  camera_obstructed: { label: "Camera view blocked", icon: EyeOff, color: "#c0453b" },
+  camera_restored: { label: "Camera view restored", icon: Check, color: "#2e7d5b" },
   tab_switch: { label: "Switched away from exam", icon: EyeOff, color: "#c0453b" },
   focus_loss: { label: "Exam window lost focus", icon: EyeOff, color: "#b7791f" },
   fullscreen_exit: { label: "Left fullscreen", icon: Maximize, color: "#c0453b" },
@@ -655,7 +656,7 @@ function fmtEventTime(t: string | number | null | undefined) {
 /** Timeline of recorded proctoring violations for one attempt, with the webcam
  *  snapshot captured at the moment of each event (when one was captured). */
 function IntegrityPanel({ events }: { events: IntegrityRow[] }) {
-  const serious = events.filter((e) => e.type === "camera_lost" || e.type === "tab_switch" || e.type === "fullscreen_exit" || e.type === "screenshot" || e.type === "multi_monitor").length;
+  const serious = events.filter((e) => e.type === "camera_lost" || e.type === "tab_switch" || e.type === "fullscreen_exit" || e.type === "screenshot" || e.type === "multi_monitor" || e.type === "camera_obstructed").length;
   return (
     <div className="mb-6">
       <div className="flex items-center justify-between mb-2">
@@ -765,10 +766,11 @@ function SnapshotsPanel({ shots, label }: { shots: IntegrityRow[]; label: string
         if (s.proxy && scope) headers["X-Tenant-Id"] = scope;
         const res = await fetch(url, { headers });
         if (!res.ok) throw new Error(`frame ${i + 1} returned ${res.status}`);
-        const name = `${String(i + 1).padStart(3, "0")}_${fmtStamp(s.at)}.jpg`;
+        const pre = s.type === "preflight_snapshot";
+        const name = `${String(i + 1).padStart(3, "0")}_${fmtStamp(s.at)}${pre ? "_camera-check" : ""}.jpg`;
         zip.file(name, await res.arrayBuffer());
         const g = gaps[i];
-        lines.push(`${name}   ${fmtEventTime(s.at)}   ${g == null ? "first frame" : `+${fmtGap(g)}`}`);
+        lines.push(`${name}   ${fmtEventTime(s.at)}   ${pre ? "camera check (before start)" : g == null ? "first frame" : `+${fmtGap(g)}`}`);
         setDone(i + 1);
       }
       zip.file("index.txt", lines.join("\n"));
@@ -790,7 +792,7 @@ function SnapshotsPanel({ shots, label }: { shots: IntegrityRow[]; label: string
           <Camera size={22} className="mx-auto mb-2 text-[var(--color-muted)]" />
           <div className="text-sm text-[var(--color-ink)] font-medium">No webcam frames for this attempt</div>
           <div className="text-xs text-[var(--color-ink2)] mt-1 max-w-sm mx-auto leading-relaxed">
-            Timed capture records a frame every interval once the student grants camera access. Nothing here means the attempt ran before snapshots were enabled, or the camera was never started.
+            Capture starts at the pre-exam camera check and then records a frame every interval. Nothing here means the attempt ran before snapshots were enabled, or the camera was never started.
           </div>
         </div>
       </div>
@@ -831,8 +833,8 @@ function SnapshotsPanel({ shots, label }: { shots: IntegrityRow[]; label: string
               />
               <div className="flex items-center justify-between gap-1 mt-1.5">
                 <span className="mono-label" style={{ fontSize: "0.62rem" }}>#{(seq.get(s.id) ?? 0) + 1} · {fmtClock(s.at)}</span>
-                <span className="mono-label" style={{ fontSize: "0.62rem", color: hole ? "#b7791f" : undefined }}>
-                  {g == null ? "start" : `+${fmtGap(g)}`}
+                <span className="mono-label" style={{ fontSize: "0.62rem", color: s.type === "preflight_snapshot" ? "var(--brand)" : hole ? "#b7791f" : undefined }}>
+                  {s.type === "preflight_snapshot" ? "camera check" : g == null ? "start" : `+${fmtGap(g)}`}
                 </span>
               </div>
             </a>

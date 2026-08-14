@@ -133,6 +133,150 @@ export function startProctoring(onEvent: Handler, config?: Partial<ProctorConfig
 // stops (device unplugged, permission revoked, track ended). Used to gate
 // exam start and to lock the exam if the camera is closed mid-exam.
 
+export type FrameMetrics = {
+  /** Mean luminance across the frame, 0 (black) .. 1 (white). */
+  mean: number;
+  /** Spatial standard deviation of luminance. A real scene has structure and
+   *  sits well above ~0.05; a lens under tape/paper is a near-uniform field. */
+  stddev: number;
+  /** Coarse 8x8 luminance grid, used to detect a frozen / looping feed. */
+  grid: number[];
+};
+
+/** Measure luminance statistics from an already-drawn canvas.
+ *
+ *  This is the core of obstruction detection. A covered camera still reports a
+ *  perfectly healthy MediaStreamTrack — `live`, unmuted, producing frames — so
+ *  no track-level signal can catch tape over the lens. The pixels can: an
+ *  obstructed frame loses spatial variance, because whatever is pressed against
+ *  the lens fills the whole field with one flat tone.
+ *
+ *  Samples every 2nd pixel on both axes (1 in 4 pixels, ~19k of 76k at 320x240)
+ *  — statistically identical for this purpose and cheap enough to run on a
+ *  low-end exam machine. */
+export function analyzeFrame(ctx: CanvasRenderingContext2D, w: number, h: number): FrameMetrics | null {
+  let data: Uint8ClampedArray;
+  try {
+    data = ctx.getImageData(0, 0, w, h).data;
+  } catch {
+    return null; // tainted canvas — never break capture over metrics
+  }
+  const GRID = 8;
+  const sums = new Array(GRID * GRID).fill(0);
+  const counts = new Array(GRID * GRID).fill(0);
+  let total = 0;
+  let totalSq = 0;
+  let n = 0;
+  for (let y = 0; y < h; y += 2) {
+    for (let x = 0; x < w; x += 2) {
+      const i = (y * w + x) * 4;
+      const lum = (0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]) / 255;
+      total += lum;
+      totalSq += lum * lum;
+      n++;
+      const gx = Math.min(GRID - 1, Math.floor((x / w) * GRID));
+      const gy = Math.min(GRID - 1, Math.floor((y / h) * GRID));
+      const gi = gy * GRID + gx;
+      sums[gi] += lum;
+      counts[gi]++;
+    }
+  }
+  if (n === 0) return null;
+  const mean = total / n;
+  const variance = Math.max(0, totalSq / n - mean * mean);
+  return {
+    mean,
+    stddev: Math.sqrt(variance),
+    grid: sums.map((s, i) => (counts[i] ? s / counts[i] : 0)),
+  };
+}
+
+export type ObstructionVerdict =
+  | { state: "ok" }
+  | { state: "covered"; reason: string }
+  | { state: "frozen"; reason: string };
+
+/** Thresholds are deliberately conservative — a false "you covered your camera"
+ *  accusation against an honest candidate mid-exam is far more damaging than a
+ *  missed one, and a reviewer still has the full frame trail either way.
+ *
+ *  Reference: real verified exam frames measured mean 0.49-0.51 with healthy
+ *  spatial variance. Tape/paper over a lens collapses stddev toward 0. */
+const FLAT_STDDEV = 0.025;   // uniform field: tape, paper, a hand, a closed shutter
+const DARK_MEAN = 0.06;      // essentially black frame
+const DARK_STDDEV = 0.04;    // ...with no structure in it
+
+/** Frozen-feed detection deliberately only catches a BIT-IDENTICAL picture.
+ *
+ *  Averaging ~1200 pixels into each of the 64 grid cells cancels sensor noise, so
+ *  the grid moves only when the SCENE moves. Measured: real exam frames moved
+ *  0.024-0.027 per cell, a synthetic scene with zero motion still moved ~0.0006,
+ *  and a re-fed identical image moved exactly 0. Any live sensor produces noise,
+ *  so 1e-4 separates "a still image is being injected" from "this candidate is
+ *  sitting very still" — which a looser threshold would confuse, and accusing a
+ *  motionless honest candidate of feeding a fake camera is the worse error.
+ *
+ *  Consequence, accepted: a cheater looping a VIDEO is not caught here. That is
+ *  what the reviewable frame trail is for. */
+const FROZEN_DELTA = 0.0001;
+const FROZEN_RUNS = 5;
+
+/** Stateful obstruction detector. One instance per attempt.
+ *
+ *  Requires several consecutive bad frames before declaring anything, so a
+ *  student briefly leaning into frame, a light flicker, or one dropped frame
+ *  can't raise a flag. */
+export function createObstructionDetector(consecutive = 3, opts?: { detectFrozen?: boolean }) {
+  // Frozen detection is opt-out because the pre-exam camera check samples every
+  // 6s: a student reading the instructions without moving would trip it there.
+  const detectFrozen = opts?.detectFrozen ?? true;
+  let badRun = 0;
+  let frozenRun = 0;
+  let lastGrid: number[] | null = null;
+  let lastFlagged = false;
+
+  return {
+    /** Feed one frame's metrics; returns a verdict plus whether it just changed. */
+    push(m: FrameMetrics | null): { verdict: ObstructionVerdict; changed: boolean } {
+      if (!m) return { verdict: { state: "ok" }, changed: false };
+
+      const flat = m.stddev < FLAT_STDDEV;
+      const dark = m.mean < DARK_MEAN && m.stddev < DARK_STDDEV;
+
+      let delta = Infinity;
+      if (lastGrid) {
+        let d = 0;
+        for (let i = 0; i < m.grid.length; i++) d += Math.abs(m.grid[i] - lastGrid[i]);
+        delta = d / m.grid.length;
+      }
+      lastGrid = m.grid;
+
+      if (flat || dark) badRun++; else badRun = 0;
+      // A frozen feed only counts while the image is otherwise plausible —
+      // a flat frame is already covered by badRun above.
+      if (detectFrozen && delta < FROZEN_DELTA && !flat && !dark) frozenRun++; else frozenRun = 0;
+
+      let verdict: ObstructionVerdict = { state: "ok" };
+      if (badRun >= consecutive) {
+        verdict = {
+          state: "covered",
+          reason: dark
+            ? `Camera view is black (brightness ${m.mean.toFixed(3)}) — lens may be covered or the room is unlit`
+            : `Camera view is a flat, featureless image (variation ${m.stddev.toFixed(3)}) — lens may be taped or blocked`,
+        };
+      } else if (frozenRun >= FROZEN_RUNS) {
+        verdict = { state: "frozen", reason: `Camera image has not changed across ${frozenRun} captures — feed may be a still image or a virtual camera` };
+      }
+
+      const isFlagged = verdict.state !== "ok";
+      const changed = isFlagged !== lastFlagged;
+      lastFlagged = isFlagged;
+      return { verdict, changed };
+    },
+    reset() { badRun = 0; frozenRun = 0; lastGrid = null; lastFlagged = false; },
+  };
+}
+
 export type WebcamHandle = {
   stream: MediaStream;
   stop: () => void;
@@ -170,15 +314,25 @@ export async function startWebcam(onLost: (reason: string) => void): Promise<Web
   };
 }
 
+export type CapturedFrame = {
+  blob: Blob | null;
+  /** Luminance stats for the same pixels that were encoded, or null when the
+   *  canvas could not be read. Never a reason to drop the blob. */
+  metrics: FrameMetrics | null;
+};
+
 // Grab a single JPEG frame from the live webcam stream. Used to attach visual
-// evidence to a violation (camera loss, tab switch, extra monitor…). Draws the
-// stream into an offscreen canvas so it works even when the preview <video> is
-// hidden behind a lock overlay. Returns null if the stream can't produce a frame
-// — a missing snapshot must never break the exam.
-export async function captureSnapshot(handle: WebcamHandle | null, timeoutMs = 2500): Promise<Blob | null> {
-  if (!handle) return null;
+// evidence to a violation (camera loss, tab switch, extra monitor…) and for the
+// periodic snapshot trail. Draws the stream into an offscreen canvas so it works
+// even when the preview <video> is hidden behind a lock overlay, and measures
+// that same canvas for obstruction detection so nothing is decoded twice.
+// Returns nulls if the stream can't produce a frame — a missing snapshot must
+// never break the exam.
+export async function captureFrame(handle: WebcamHandle | null, timeoutMs = 2500): Promise<CapturedFrame> {
+  const empty: CapturedFrame = { blob: null, metrics: null };
+  if (!handle) return empty;
   const track = handle.stream.getVideoTracks()[0];
-  if (!track || track.readyState !== "live") return null;
+  if (!track || track.readyState !== "live") return empty;
   const video = document.createElement("video");
   video.muted = true;
   video.playsInline = true;
@@ -197,16 +351,24 @@ export async function captureSnapshot(handle: WebcamHandle | null, timeoutMs = 2
     const canvas = document.createElement("canvas");
     canvas.width = w;
     canvas.height = h;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return null;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return empty;
     ctx.drawImage(video, 0, 0, w, h);
-    return await new Promise<Blob | null>((resolve) => canvas.toBlob((b) => resolve(b), "image/jpeg", 0.7));
+    let metrics: FrameMetrics | null = null;
+    try { metrics = analyzeFrame(ctx, w, h); } catch { /* metrics are best-effort */ }
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob((b) => resolve(b), "image/jpeg", 0.7));
+    return { blob, metrics };
   } catch {
-    return null;
+    return empty;
   } finally {
     try { video.pause(); } catch { /* ignore */ }
     video.srcObject = null;
   }
+}
+
+/** Back-compat wrapper for callers that only want the image. */
+export async function captureSnapshot(handle: WebcamHandle | null, timeoutMs = 2500): Promise<Blob | null> {
+  return (await captureFrame(handle, timeoutMs)).blob;
 }
 
 export function isCameraActive(handle: WebcamHandle | null): boolean {

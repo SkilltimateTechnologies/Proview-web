@@ -55,6 +55,7 @@ export type ProctorConfig = {
   maxTabSwitches: number;
   webcamSnapshots: boolean;
   snapshotIntervalSec: number;
+  detectCameraBlock: boolean;
   requireSingleScreen: boolean;
   blockScreenshots: boolean;
   autoSubmitOnTimeout: boolean;
@@ -63,7 +64,7 @@ export type ProctorConfig = {
 export const DEFAULT_PROCTORING: ProctorConfig = {
   requireWebcam: true, requireInternet: true, blockOnCameraLoss: true, cameraLossLockSeconds: 120,
   fullscreenRequired: true, blockCopyPaste: true, flagTabSwitch: true, maxTabSwitches: 0,
-  webcamSnapshots: false, snapshotIntervalSec: 30,
+  webcamSnapshots: false, snapshotIntervalSec: 27, detectCameraBlock: true,
   requireSingleScreen: true, blockScreenshots: true, autoSubmitOnTimeout: true,
 };
 

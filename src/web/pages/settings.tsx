@@ -15,6 +15,7 @@ type ProctorConfig = {
   maxTabSwitches: number;
   webcamSnapshots: boolean;
   snapshotIntervalSec: number;
+  detectCameraBlock: boolean;
   requireSingleScreen: boolean;
   blockScreenshots: boolean;
   autoSubmitOnTimeout: boolean;
@@ -119,7 +120,7 @@ export default function Settings() {
   const DEFAULT_PROCTORING: ProctorConfig = {
     requireWebcam: true, requireInternet: true, blockOnCameraLoss: true, cameraLossLockSeconds: 120,
     fullscreenRequired: true, blockCopyPaste: true, flagTabSwitch: true, maxTabSwitches: 0,
-    webcamSnapshots: false, snapshotIntervalSec: 30,
+    webcamSnapshots: false, snapshotIntervalSec: 27, detectCameraBlock: true,
     requireSingleScreen: true, blockScreenshots: true, autoSubmitOnTimeout: true,
   };
   const pc: ProctorConfig = { ...DEFAULT_PROCTORING, ...(form.proctoring ?? {}) };
@@ -153,7 +154,18 @@ export default function Settings() {
           </Field>
         )}
         {pc.requireWebcam && (
-          <Toggle label="Webcam snapshot on every violation" sub="Capture a webcam photo the moment a violation happens (camera turned off, switching away, leaving fullscreen, extra display) and attach it to the student's report. Snapshots are taken only on violations — never on a timer." checked={pc.webcamSnapshots} onChange={(v) => setPc({ webcamSnapshots: v })} />
+          <Toggle label="Webcam snapshots" sub="Capture a webcam photo on every violation (camera turned off, switching away, leaving fullscreen, extra display) AND on a timer through the whole attempt, starting at the pre-exam camera check. All frames appear in the student's report." checked={pc.webcamSnapshots} onChange={(v) => setPc({ webcamSnapshots: v })} />
+        )}
+        {pc.requireWebcam && pc.webcamSnapshots && (
+          <Field label="Timed snapshot interval (seconds)">
+            <input className="input" type="number" min={20} max={600} value={pc.snapshotIntervalSec} onChange={(e) => setPc({ snapshotIntervalSec: Number(e.target.value) })} />
+            <span className="block text-xs text-[var(--color-ink2)] mt-1">
+              Each student&apos;s timer is jittered ±10% so 150 machines don&apos;t upload on the same tick. 20s is the minimum. At 27s a 3-hour exam stores roughly 400 frames per student.
+            </span>
+          </Field>
+        )}
+        {pc.requireWebcam && pc.webcamSnapshots && (
+          <Toggle label="Detect a blocked camera" sub="A camera covered with tape or paper still reports as working, so Proview checks the picture itself and flags a frame that is flat or black. Recorded for review with a warning to the student — it never locks the exam, because a dark room looks the same. Turn off for poorly lit exam halls." checked={pc.detectCameraBlock} onChange={(v) => setPc({ detectCameraBlock: v })} />
         )}
 
         {/* --- Connection & auto-actions --- */}

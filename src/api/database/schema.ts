@@ -270,6 +270,7 @@ export type ProctorConfig = {
   maxTabSwitches: number;          // auto-submit after this many switches (0 = never)
   webcamSnapshots: boolean;        // periodically capture webcam snapshots
   snapshotIntervalSec: number;     // snapshot cadence
+  detectCameraBlock: boolean;      // flag a camera that is on but physically covered/blacked out
   requireSingleScreen: boolean;    // block exam if more than one display is connected
   blockScreenshots: boolean;       // trap PrintScreen / Win+Shift+S screenshot shortcuts
   autoSubmitOnTimeout: boolean;    // force-submit the moment the exam timer reaches 0
@@ -285,7 +286,8 @@ export const DEFAULT_PROCTORING: ProctorConfig = {
   flagTabSwitch: true,
   maxTabSwitches: 0,
   webcamSnapshots: false,
-  snapshotIntervalSec: 30,
+  snapshotIntervalSec: 27,
+  detectCameraBlock: true,
   requireSingleScreen: true,
   blockScreenshots: true,
   autoSubmitOnTimeout: true,
