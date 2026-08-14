@@ -8,6 +8,9 @@ dist/
 .env
 .env.*
 !.env.template
+# storage-migration credentials (destination account keys)
+*.env
+.tigris-new.env
 
 # logs
 *.log
