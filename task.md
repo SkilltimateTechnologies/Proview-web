@@ -89,3 +89,24 @@ Findings:
 Known debt: `tsc -p tsconfig.app.json` (web) has 57 pre-existing errors, mostly
 Hono RPC response-union narrowing (`{ message: string }` variants not narrowed).
 Not gated yet — `typecheck:web` runs it.
+
+### Post-deploy verification (2f02d01 live on prod)
+- Deploy marker: `POST /api/ai/grade` returned `200` with a real Anthropic grade
+  (`{"score":2,...}`). Before this commit it 500'd on every call (unimported
+  `gradeSubjective` + nonexistent `settings.tenantId`), so a 200 proves the new
+  build is serving.
+- Grading backlog cleared on its own once the deploy landed: all 2325 attempts
+  `graded`, 0 ungraded answers carrying content, `settings.ai_used` moved 0 -> 2.
+  The earlier stall was the `retryCounts` ReferenceError, not an API-key problem.
+- Scores after dedupe + rescore: `23K91A04H1` Elite Assessment - 1 = **96/100**
+  (was 103), `23K91A66K1` Grand Test - 1 (Batch-3) = **41** (was 0).
+- DB-wide: duplicate `(attempt_id, question_id)` pairs = **0**, attempts with
+  `score > 100` = **0**, graded/submitted attempts whose answer `max_score` sum
+  != `exams.total_points` = **0**.
+- Race tests against prod on a throwaway exam (`ZZ RACE TEST`, deleted after,
+  0 leftovers):
+  - 12 concurrent single-answer autosaves, same question -> 12x `200`, **1** row.
+  - 12 concurrent 2-question batch autosaves -> 12x `200`, **1** row per question.
+  - 3 concurrent `/submit` -> 3x `200`, 1 row per question and **content intact**
+    (this is the exact case that used to blank real answers), attempt `graded`.
+  No `UNIQUE constraint failed` 500s anywhere.
