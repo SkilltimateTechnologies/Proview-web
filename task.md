@@ -491,3 +491,35 @@ shuffle already removes the exploit.
   not stamping (2 fails), token check removed (1 fail).
 - `bun test` 56 pass / 0 fail; `typecheck:api` clean; `typecheck:web` still 57
   pre-existing errors (unchanged); `bun run build` exit 0.
+
+### Deployed and verified in production
+
+Commit `a1f25fc`, pushed `205f490..a1f25fc`, live on Railway at
+`checkedAt 2026-08-15T05:59:05.859Z`.
+
+Pre-deploy safety, because this changes the student answer path: `/api/monitor`
+showed `live: []` and `nextScheduled: null`, and the database showed **0
+`in_progress` attempts** — nobody was mid-paper. All **2325** existing attempts
+had `option_order = NULL`, so every historical review still renders in the
+authored order.
+
+Post-deploy, against the live server:
+
+- `/api/health` → `status: ok`, `invariants.ok: true`.
+- `GET /api/admin/invariants` → `ok: true`, all 3 unique indexes present with 0
+  duplicate groups, and `columnsPresent: ["attempts.option_order"]` — the boot
+  DDL is confirmed working on the production database.
+- `bun run verify:option-order --base <prod>` → **21/21 PASS**, score **100**.
+  All 6 questions genuinely reordered, order stable across refetches, attempt
+  stamped `option_order=v1`, stored responses still ORIGINAL indices, and the
+  no-token client's indices stored verbatim. Throwaway exam cleaned up (verified
+  gone).
+- `bun scripts/verify-invariants.ts --race <prod>` → **ALL INVARIANTS HOLD**:
+  14 DB checks PASS, 9/9 race checks PASS (concurrent autosaves/submits still
+  collapse to exactly 1 row per question with content preserved), monitor latency
+  cold 874ms / warm 429ms against a 2500ms budget. One NOTE, the known real
+  namesakes `boda sandeep: 23K91A0539,24K95A0503`.
+
+Net effect: from the next exam onward, the answer key differs per student. Held
+constant: every stored response, every graded attempt, every report, and every
+review of a paper sat before this deploy.
