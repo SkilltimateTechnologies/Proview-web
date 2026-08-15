@@ -14,6 +14,7 @@ import { db } from "../database";
 import * as schema from "../database/schema";
 import { gradeSubjective } from "./ai";
 import { autoGrade, effectiveEndMs, id } from "./util";
+import { maybeCheckExamAfterGrading } from "./watchdog";
 
 // Global cap on in-flight AI grading calls. A whole class submitting at the
 // deadline funnels ~20 subjective answers per student through this semaphore, so
@@ -212,6 +213,11 @@ export async function gradeAttempt(attemptId: string, providerArg?: string | nul
     // Fully graded — flip to graded and clear retry bookkeeping.
     retryCounts.delete(attemptId);
     await db.update(schema.attempts).set({ status: "graded", score: scorePct }).where(eq(schema.attempts.id, attemptId));
+    // If that was the exam's last outstanding attempt, the exam is finished:
+    // self-check its data now, while the people who ran it are still around,
+    // instead of waiting for the college to report a wrong mark. Fire-and-forget
+    // and never awaited into the grading result — a check must not fail grading.
+    void maybeCheckExamAfterGrading(att.examId);
     return;
   }
 
@@ -240,6 +246,7 @@ export async function gradeAttempt(attemptId: string, providerArg?: string | nul
   }
   console.error(`[grade-queue] attempt ${attemptId}: gave up grading ${ungraded.length} answer(s) after ${tries} tries; marking graded (manual review needed).`);
   await db.update(schema.attempts).set({ status: "graded", score: scorePct }).where(eq(schema.attempts.id, attemptId));
+  void maybeCheckExamAfterGrading(att.examId);
 }
 
 /**
@@ -464,6 +471,7 @@ export async function sweepPendingGrading() {
           );
         }
         await db.update(schema.attempts).set({ status: "graded", score: scorePct }).where(eq(schema.attempts.id, a.id));
+        void maybeCheckExamAfterGrading(a.examId);
         reconciled++;
       }
     }

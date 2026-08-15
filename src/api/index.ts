@@ -14,6 +14,7 @@ import { finalizeAttempt, hasContent } from "./lib/grade-queue";
 import { presignPut, presignGet, presignGetCached, getObject } from "./lib/s3";
 import { signStudentToken, verifyStudentToken } from "./lib/student-token";
 import { normalizeRoll, rollNoProblem, isDuplicateRollError } from "./lib/students";
+import { recordMonitorBuild, monitorTiming, recentExamChecks, failingExamChecks, checkExamData, MONITOR_POLL_MS, MONITOR_BUDGET_MS } from "./lib/watchdog";
 import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
 import { isEligible, matchesCohort, loadRoster, loadRosters, ensureOptInOnlyLoaded, invalidateOptInOnlyCache, isOptInOnlyCode } from "./lib/roster";
 
@@ -340,8 +341,15 @@ async function getMonitorSnapshot(tid: string): Promise<MonitorSnapshot> {
   const running = monitorInFlight.get(tid);
   if (running) return running;
 
+  // Time every real build. This is the freeze early-warning: the incident was a
+  // build that grew past the 5s poll interval until polls stacked. The watchdog
+  // logs it and flags the payload as soon as builds cross half the interval, so
+  // it is visible on the invigilator's own screen during the exam.
+  const startedAt = Date.now();
   const task = buildMonitorSnapshot(tid)
     .then((data) => {
+      const rows = data.live.reduce((n, ex) => n + ex.students.length, 0);
+      recordMonitorBuild(Date.now() - startedAt, rows);
       monitorCache.set(tid, { at: Date.now(), data });
       return data;
     })
@@ -364,10 +372,24 @@ const app = new Hono<{ Variables: Vars }>()
   // 503 in that state so uptime monitoring actually catches it.
   .get("/health", (c) => {
     const inv = INDEX_STATE;
+    const monitor = monitorTiming();
+    const badExams = failingExamChecks();
     if (inv.checkedAt && !inv.ok) {
-      return c.json({ status: "degraded", invariants: inv }, 503);
+      return c.json({ status: "degraded", invariants: inv, monitor, examChecks: badExams }, 503);
     }
-    return c.json({ status: "ok", invariants: { ok: inv.ok, checkedAt: inv.checkedAt } }, 200);
+    // A slow Live Monitor or an exam that finished with bad data is reported but
+    // does NOT 503: the exam server is still serving students correctly and must
+    // stay in the load balancer. It shows up as "warn" for whoever is looking.
+    const warn = monitor.degraded || badExams.length > 0;
+    return c.json(
+      {
+        status: warn ? "warn" : "ok",
+        invariants: { ok: inv.ok, checkedAt: inv.checkedAt },
+        monitor,
+        examChecks: badExams,
+      },
+      200,
+    );
   })
 
   // Full uniqueness/consistency audit of the live database. Admin-only, run on
@@ -427,7 +449,23 @@ const app = new Hono<{ Variables: Vars }>()
       attemptsWithDenominatorMismatch: denomMismatch,
       duplicateStudentSuspects: suspects.map((s) => ({ ...s, n: Number(s.n) })),
       malformedRollNumbers: malformedRolls,
+      // Runtime self-monitoring, so one page answers "is it healthy right now?"
+      // as well as "is the stored data sound?".
+      liveMonitor: { ...monitorTiming(), pollMs: MONITOR_POLL_MS, budgetMs: MONITOR_BUDGET_MS },
+      examChecks: recentExamChecks(),
     }, ok ? 200 : 500);
+  })
+
+  // Re-run the per-exam data check on demand. The automatic run happens when an
+  // exam finishes grading; this is for re-checking an older exam (e.g. after a
+  // manual score edit) without waiting for anything.
+  .post("/admin/exam-check/:examId", requireAuth, requireSuperAdmin, async (c) => {
+    const examId = c.req.param("examId");
+    const [exam] = await db.select().from(schema.exams).where(eq(schema.exams.id, examId)).limit(1);
+    if (!exam) return c.json({ error: "Exam not found" }, 404);
+    const result = await checkExamData(examId);
+    if (!result) return c.json({ error: "Check failed; see server logs" }, 500);
+    return c.json(result, 200);
   })
 
   // ---- TEMP diagnostic: verify DB connectivity + env presence ----
@@ -2358,7 +2396,7 @@ const app = new Hono<{ Variables: Vars }>()
   .get("/monitor", requireAuth, requirePermission("liveMonitor"), async (c) => {
     const p = c.get("profile")!;
     const tid = p.tenantId;
-    if (!tid) return c.json({ live: [], nextScheduled: null }, 200);
+    if (!tid) return c.json({ live: [], nextScheduled: null, health: null }, 200);
 
     // Every open Live Monitor tab polls this endpoint every 5s, and during an exam
     // several invigilators watch at once. The payload is identical for everyone in
@@ -2366,7 +2404,24 @@ const app = new Hono<{ Variables: Vars }>()
     // in-flight promise, and callers within the cache window get the last result.
     // This is what stops N invigilators turning into N x the database load — the
     // single biggest reason the monitor seized up during a live exam.
-    return c.json(await getMonitorSnapshot(tid), 200);
+    const snapshot = await getMonitorSnapshot(tid);
+    // Ship the watchdog verdict with the payload so a slow monitor is visible to
+    // the invigilator looking at the screen, not only in the server logs. This is
+    // outside the cached snapshot because the timing changes per build.
+    const t = monitorTiming();
+    return c.json(
+      {
+        ...snapshot,
+        health: {
+          degraded: t.degraded,
+          lastBuildMs: t.lastBuildMs,
+          worstBuildMs: t.worstBuildMs,
+          budgetMs: MONITOR_BUDGET_MS,
+          pollMs: MONITOR_POLL_MS,
+        },
+      },
+      200,
+    );
   })
 
 

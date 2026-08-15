@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, UserX, Pause, Play, Plus, Wifi, WifiOff, RotateCcw, ShieldAlert, ShieldCheck } from "lucide-react";
+import { Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, UserX, Pause, Play, Plus, Wifi, WifiOff, RotateCcw, ShieldAlert, ShieldCheck, AlertTriangle } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Drawer } from "../components/ui";
@@ -135,6 +135,27 @@ export default function Monitor() {
 
   const nextScheduled = (q.data as any)?.nextScheduled as { examId: string; title: string; startAt: number | null } | null | undefined;
 
+  // Freeze early-warning. Two independent signals, because they fail differently:
+  //   * `health.degraded` — the SERVER says its own snapshot builds are crossing
+  //     the budget. This is the condition that escalated into the freeze.
+  //   * staleness — the CLIENT has had no successful refresh in 3 poll intervals,
+  //     which also covers the cases the server cannot report (request stacking,
+  //     network stall, server gone).
+  // Either way the invigilator is told the screen may be out of date, instead of
+  // silently trusting stale numbers while an exam runs.
+  const health = (q.data as any)?.health as
+    | { degraded: boolean; lastBuildMs: number | null; worstBuildMs: number | null; budgetMs: number; pollMs: number }
+    | null
+    | undefined;
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 2000);
+    return () => clearInterval(t);
+  }, []);
+  const staleMs = q.dataUpdatedAt ? now - q.dataUpdatedAt : 0;
+  const stale = !!q.dataUpdatedAt && staleMs > 15_000;
+  const showLagWarning = !!health?.degraded || stale;
+
   function matchFilter(s: LiveStudent) {
     if (filter === "in_progress") return s.status === "in_progress";
     if (filter === "finished") return s.status === "finished";
@@ -146,6 +167,22 @@ export default function Monitor() {
   return (
     <div className="rise">
       <PageHeader eyebrow="Proctoring" title="Live Monitor" action={<Pill label="AUTO-REFRESH 5s" color="#2e7d5b" />} />
+
+      {showLagWarning ? (
+        <div className="card mb-4 flex items-start gap-3 border-l-4 border-l-[#c2410c] bg-[#fff7ed] p-4">
+          <AlertTriangle size={18} className="mt-0.5 shrink-0 text-[#c2410c]" />
+          <div className="text-sm text-[#7c2d12]">
+            <div className="font-semibold">
+              {stale ? "This page may be out of date" : "Live Monitor is running slow"}
+            </div>
+            <div className="mt-0.5">
+              {stale
+                ? `No successful refresh for ${Math.round(staleMs / 1000)}s. Numbers below may be stale — students are unaffected and the exam is still running normally.`
+                : `The server is taking ${health?.lastBuildMs}ms to build this view (target under ${health?.budgetMs}ms). Refreshes may start to lag. Students are unaffected.`}
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {q.isLoading ? (
         <Loader />

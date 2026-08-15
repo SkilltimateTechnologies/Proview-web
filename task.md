@@ -304,3 +304,85 @@ a name.
 - `src/api/lib/students.test.ts` — 12 tests wired into `bun run build`.
   Mutation-tested: dropping `toUpperCase()` fails 1, dropping the `cause` walk
   fails 2.
+
+## Incident 4 — why the server now self-monitors instead of running a nightly cron (15 Aug 2026)
+
+The obvious fix for "how do we know this doesn't come back" was a scheduled job
+that scans the database every night. That was **rejected on purpose**, for two
+reasons:
+
+1. **There is nothing left to scan for.** The three unique indexes added in
+   Incident 3 reject the bad row at write time. A nightly scan of a database that
+   cannot hold duplicates is a job whose only possible output is "clean".
+2. **A 2 AM report about a 11 AM freeze is useless.** The Live Monitor froze in
+   the middle of a live exam. The people who needed to know were the invigilators
+   in the hall at that moment, and nobody reads a cron email at 2 AM.
+
+So the checks run **at the two moments that actually matter**, inside the exam
+server, with no cron and no new infrastructure:
+
+- **Every uncached `/api/monitor` build is timed** (`recordMonitorBuild`). This is
+  the exact code path that froze.
+- **When an exam finishes grading, that exam's data is checked once**
+  (`maybeCheckExamAfterGrading`) — duplicate answer groups, impossible scores,
+  denominator mismatches, attempts with no answers. Scoped to one exam using
+  indexed aggregates, so it is cheap enough to run inline; a full-table audit
+  would not be.
+
+### Escalation rules (and why)
+
+- `MONITOR_BUDGET_MS = MONITOR_POLL_MS / 2` — 2500ms of the 5000ms poll. The
+  budget **must** sit strictly below the poll interval, otherwise the warning only
+  arrives after requests are already stacking, which is the freeze itself.
+- **3 consecutive** over-budget builds before flagging degraded. One spike must
+  not cry wolf.
+- **One** healthy build clears it. No latching, so a recovered server does not
+  keep showing a stale warning.
+- Cache hits and coalesced callers are deliberately **not** timed — they would
+  dilute the average and hide a genuinely slow build.
+
+### `warn`, not 503
+
+A slow monitor or a failed exam check makes `/api/health` return
+`status: "warn"` with **HTTP 200**. The exam server is still serving students
+correctly and must stay in the load balancer — pulling it out mid-exam would turn
+a lagging invigilator page into an outage for 500 students. Only a **failed
+database invariant** returns 503.
+
+The watchdog never throws into a request path: every DB call is wrapped, every
+trigger is fire-and-forget `void`.
+
+### Invigilator-facing signal
+
+`monitor.tsx` shows an amber banner from **two independent signals**:
+
+- server `health.degraded`, and
+- client-side staleness — `dataUpdatedAt` older than 15s (3 poll intervals).
+
+Staleness covers what the server cannot report: request stacking, a network
+stall, or the server being gone entirely. Both banner variants state
+"Students are unaffected", because they are.
+
+### Verified
+
+- `src/api/lib/watchdog.test.ts` — **10 pass**. Mutation-tested: threshold 3→1
+  fails 1, removing the streak-clear fails 2, `{...timing}`→`timing` fails 2.
+- **Degraded path end-to-end** (budget temporarily forced to 1ms): poll 1 false,
+  poll 2 false, **poll 3 true**; `/api/health` → `warn`, `streak: 3`; log line
+  `LIVE MONITOR DEGRADED: 3 consecutive builds over budget...`. Budget restored
+  and re-verified afterwards.
+- **No false alarms at the real budget**: 1,123-row payload, 3 polls →
+  `status: ok`, `degraded: false`, worst build **367ms** against a 2500ms budget,
+  **0 watchdog warnings** in the log.
+- **Exam self-check against the real production database, all 10 exams → clean**
+  (`dupGroups=0 badScore=0 denom=0 noAns=0`): Grand Test - 1 Batch 1-4
+  (221/239/212/198), Python DSA Screening Batch 1-4 (277/284/221/219),
+  Elite Assessment – 1 (268), Weekly Assessment – 1 (186).
+- Bug caught by that run and fixed: a nonexistent exam id passed the
+  "0 pending" test and recorded a meaningless "data clean" entry. Now returns
+  early when the exam has 0 attempts.
+- On demand: `POST /api/admin/exam-check/:examId` → 200 with the result, 404 on
+  an unknown exam.
+- `orphan-answers-delete-backup-*.json` is gitignored; the 797 orphan rows it
+  contains were deleted after a dry run confirmed none of their 23 parent
+  attempts still existed.
