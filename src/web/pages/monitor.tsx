@@ -28,6 +28,8 @@ type IntegrityRow = { id: string; type: string; detail: string | null; at: strin
 
 const EVENT_LABEL: Record<string, string> = {
   camera_lost: "Camera turned off",
+  camera_blocked: "Camera access blocked",
+  camera_obstructed: "Camera view blocked",
   camera_restored: "Camera restored",
   tab_switch: "Switched away from exam",
   focus_loss: "Window lost focus",
@@ -43,7 +45,7 @@ const EVENT_LABEL: Record<string, string> = {
   shortcut: "Blocked shortcut",
   screenshot: "Screenshot attempt",
 };
-const SERIOUS = new Set(["camera_lost", "tab_switch", "fullscreen_exit", "screenshot", "multi_monitor"]);
+const SERIOUS = new Set(["camera_lost", "camera_blocked", "camera_obstructed", "tab_switch", "fullscreen_exit", "screenshot", "multi_monitor"]);
 
 type FilterKey = "all" | "in_progress" | "finished" | "not_started" | "absent";
 const FILTERS: { k: FilterKey; label: string }[] = [

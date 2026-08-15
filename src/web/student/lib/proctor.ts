@@ -295,24 +295,90 @@ export type WebcamHandle = {
   stop: () => void;
 };
 
+/**
+ * Watch the camera PERMISSION itself, independently of whether we hold a stream.
+ *
+ * Track-level signals ("ended", muted) only tell us a stream we already own has
+ * died. They say nothing about a permission that was revoked while we were not
+ * looking, and — critically — nothing about permission being GRANTED again. A
+ * student locked out by a Block needs the exam to resume the moment access comes
+ * back, without hunting for a button.
+ *
+ * Defensive on purpose. The Permissions API is optional, `"camera"` is not a
+ * valid PermissionName in every engine (Firefox throws TypeError), and there is
+ * precedent in this file for a permission query hanging forever inside SEB's
+ * kiosk Chromium — see getDisplayCount. So the query is raced against a timeout
+ * and every path is wrapped: an unsupported or slow browser silently gets no
+ * watcher and falls back to the track-level detection, which is exactly the
+ * behaviour that shipped before.
+ *
+ * Returns a cleanup function; safe to call even if nothing was ever attached.
+ */
+export function watchCameraPermission(onChange: (state: PermissionState) => void): () => void {
+  let status: (PermissionStatus & { onchange: unknown }) | null = null;
+  let cancelled = false;
+  const handler = () => {
+    if (!cancelled && status) onChange(status.state);
+  };
+
+  void (async () => {
+    try {
+      if (!navigator.permissions?.query) return;
+      const query = navigator.permissions.query({ name: "camera" as PermissionName });
+      // Never await this unguarded: a query that never settles would leak a promise
+      // and, worse, tempt a future caller into awaiting the watcher at startup.
+      const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500));
+      const res = await Promise.race([query, timeout]);
+      if (cancelled || !res) return;
+      status = res as PermissionStatus & { onchange: unknown };
+      status.addEventListener?.("change", handler);
+      // Report the CURRENT state too: the exam may be resuming into an
+      // already-denied permission, which has no change event to wait for.
+      onChange(status.state);
+    } catch {
+      /* Permissions API unsupported or "camera" not queryable — track-level
+         detection still covers us. */
+    }
+  })();
+
+  return () => {
+    cancelled = true;
+    try { status?.removeEventListener?.("change", handler); } catch { /* ignore */ }
+  };
+}
+
 export async function startWebcam(onLost: (reason: string) => void): Promise<WebcamHandle> {
   const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240 }, audio: false });
   const track = stream.getVideoTracks()[0];
   let stopped = false;
 
-  const handleEnded = () => {
-    if (stopped) return;
-    onLost("Camera stream ended");
+  // Report a loss ONCE per handle. The poll below runs every 1.5s and a dead track
+  // stays dead, so without this latch a single incident fired onLost continuously
+  // for as long as the camera was off — the runner recorded a fresh violation every
+  // few seconds, turning one unplugged webcam into twenty entries in the student's
+  // integrity report and re-triggering the lock on every tick. Recovery does not
+  // depend on this poll: the runner's unlock loop re-reads the live track through
+  // isCameraActive (so an OS un-mute is still noticed) and builds a NEW handle,
+  // with its own latch, whenever it re-acquires the camera.
+  let lost = false;
+  let poll: ReturnType<typeof setInterval> | undefined;
+  const reportLost = (reason: string) => {
+    if (stopped || lost) return;
+    lost = true;
+    if (poll) clearInterval(poll);
+    onLost(reason);
   };
+
+  const handleEnded = () => reportLost("Camera stream ended");
   track.addEventListener("ended", handleEnded);
 
   // Poll for muted / disabled state (some OS-level camera-off toggles mute the track).
-  const poll = setInterval(() => {
-    if (stopped) return;
+  poll = setInterval(() => {
+    if (stopped || lost) return;
     if (!track.readyState || track.readyState === "ended") {
-      onLost("Camera disconnected");
+      reportLost("Camera disconnected");
     } else if (track.muted) {
-      onLost("Camera turned off");
+      reportLost("Camera turned off");
     }
   }, 1500);
 

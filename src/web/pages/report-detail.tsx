@@ -631,6 +631,7 @@ type IntegrityRow = { id: string; type: string; detail: string | null; at: strin
 
 const EVENT_META: Record<string, { label: string; icon: typeof ShieldAlert; color: string }> = {
   camera_lost: { label: "Camera turned off", icon: VideoOff, color: "#c0453b" },
+  camera_blocked: { label: "Camera access blocked by candidate", icon: VideoOff, color: "#c0453b" },
   camera_obstructed: { label: "Camera view blocked", icon: EyeOff, color: "#c0453b" },
   camera_restored: { label: "Camera view restored", icon: Check, color: "#2e7d5b" },
   camera_block_dismissed: { label: "Continued with blocked camera (reported a dim room)", icon: EyeOff, color: "#b7791f" },
@@ -657,7 +658,7 @@ function fmtEventTime(t: string | number | null | undefined) {
 /** Timeline of recorded proctoring violations for one attempt, with the webcam
  *  snapshot captured at the moment of each event (when one was captured). */
 function IntegrityPanel({ events }: { events: IntegrityRow[] }) {
-  const serious = events.filter((e) => e.type === "camera_lost" || e.type === "tab_switch" || e.type === "fullscreen_exit" || e.type === "screenshot" || e.type === "multi_monitor" || e.type === "camera_obstructed").length;
+  const serious = events.filter((e) => e.type === "camera_lost" || e.type === "camera_blocked" || e.type === "tab_switch" || e.type === "fullscreen_exit" || e.type === "screenshot" || e.type === "multi_monitor" || e.type === "camera_obstructed").length;
   return (
     <div className="mb-6">
       <div className="flex items-center justify-between mb-2">

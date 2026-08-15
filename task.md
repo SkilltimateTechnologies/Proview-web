@@ -523,3 +523,124 @@ Post-deploy, against the live server:
 Net effect: from the next exam onward, the answer key differs per student. Held
 constant: every stored response, every graded attempt, every report, and every
 review of a paper sat before this deploy.
+
+---
+
+## Incident 6 — a blocked camera left the exam running
+
+**Reported:** a student can deliberately switch off or block the camera mid-exam
+and simply keep answering. The screenshot supplied showed Chrome's *"Camera
+blocked — this page has been blocked from accessing your camera"* state.
+
+### Why the existing lock did not catch it
+
+Loss detection lived entirely at the **track** level: `startWebcam` listened for
+the track's `ended` event and polled `readyState`/`muted` every 1.5s. Revoking
+permission does not reliably end or mute a stream that is already running — in
+some Chromium builds the old track keeps delivering frames — so nothing fired,
+and the exam carried on.
+
+The recovery path was worse than useless. Once Chromium records a **Block** for
+an origin, `getUserMedia` rejects with `NotAllowedError` **instantly and without
+prompting, forever**. The overlay's "Re-enable camera now" button called exactly
+that, so it could only ever print *"Camera is still unavailable. Please reconnect
+/ allow your camera."* The student was told to allow access with no way to allow
+it.
+
+And the usual advice — *click the camera icon in the address bar* — is
+unusable here. Students sit inside **Safe Exam Browser**: kiosk Chromium with no
+address bar, no padlock and no site-settings menu. Every instruction has to be
+achievable from the seat.
+
+### What changed
+
+1. **`src/web/student/lib/camera-failure.ts` (new).** Classifies a
+   `getUserMedia` rejection into `permission_denied` / `no_device` / `in_use` /
+   `unsupported` / `unknown`, each with a title, a message and ordered remedies
+   that are true inside a kiosk: privacy shutter → camera function key → USB
+   reconnect → raise your hand (permission can only be restored by relaunching
+   the secure browser and choosing Allow). Matches on `DOMException.name` first
+   because that is what the spec pins down, with a message sniff as a fallback.
+   Deliberately DOM-free so it is unit-testable without a browser.
+2. **`watchCameraPermission` in `proctor.ts`.** Subscribes to
+   `navigator.permissions.query({name:"camera"})` and reacts to `denied` the
+   moment it happens, independent of the track. Defensive by necessity: the
+   Permissions API is optional, `"camera"` is not a valid `PermissionName`
+   everywhere (Firefox throws), and this repo already has a case of a permission
+   query hanging forever in SEB kiosk (`getDisplayCount`). The query is raced
+   against a 1500ms timeout and every path is wrapped; unsupported means no
+   watcher and we fall back to track-level detection.
+3. **`camera_blocked`, a new event type** distinct from `camera_lost`. A denied
+   permission can only happen by choice; a dead track can be a fallen-out USB
+   cable. Keeping them apart is the difference between evidence and an
+   accusation. Surfaced in Live Monitor and in the report timeline, and counted
+   as serious in both.
+4. **Hard block, no dismiss.** Unlike the obstruction overlay (which has a "my
+   room is just dim" escape hatch after a delay), this one cannot be dismissed.
+   The countdown is **hidden** while access is denied — waiting cannot clear a
+   recorded Block, so showing a clock would promise something that cannot happen.
+5. **The timer keeps running.** `endAt` is server-anchored and absolute, so this
+   needed no change: blocking the camera buys no thinking time. The overlay says
+   so explicitly.
+
+### Three defects found while verifying, all fixed
+
+- **Evidence was thrown away when the freeze was off.** `engageLock` returned
+  early on `!blockOnCameraLoss` *before recording anything*, so an exam with
+  "Lock exam if camera is closed" disabled swallowed a deliberate block
+  completely — no timeline entry, no report row. The event is now recorded
+  **before** that gate. The toggle governs whether the candidate is interrupted,
+  not whether the invigilator gets to see it.
+- **The overlay lied after the camera came back.** Restoring the camera mid-
+  penalty cleared `camFail`, so the overlay fell back to *"Your camera was turned
+  off. The exam is paused until it is back"* — while the camera was
+  demonstrably back — above a footer promising it would resume as soon as it was.
+  There is now an explicit "Camera is back" state: stale remedies and the dead
+  retry button disappear, the countdown appears, and the copy names the
+  countdown as the only thing being waited on.
+- **One incident produced a violation every few seconds.** `startWebcam`'s poll
+  called `onLost` on every 1.5s tick for as long as the track stayed dead, and
+  each call re-recorded an event and re-armed the lock. A single unplugged webcam
+  became ~20 entries in the student's integrity report and a penalty clock that
+  could never reach zero. `onLost` is now latched to fire **once per handle**
+  (the poll stops with it), and `engageLock` refuses to re-arm the countdown
+  while already locked. Recovery is unaffected: the unlock loop re-reads the live
+  track via `isCameraActive`, so an OS un-mute is still noticed, and every
+  re-acquisition builds a fresh handle with a fresh latch.
+
+### Verification
+
+`camera-failure.test.ts`, 34 tests: every `DOMException.name` maps to the right
+code; a real `DOMException` classifies the same as a plain object; non-Error
+inputs (`null`, `undefined`, `""`, numbers, `Symbol`, `[]`, a numeric `name`)
+never throw; every branch returns non-empty steps, always names a way out, and
+**never** mentions the address bar, padlock or site settings; `eventDetail` is
+capped at 200 chars on both paths.
+
+**Mutation tested, 12/12 killed** — including dropping `SecurityError` from the
+permission branch, classifying unknown errors as a deliberate block, removing the
+relaunch instruction, swapping the relaunch step for address-bar advice, dropping
+either 200-char cap, making `cameraLostFailure` accuse the candidate, and letting
+`OverconstrainedError`/`AbortError` fall through.
+
+Then driven in a real Chromium against a throwaway student and exam, from login
+through the brief and the preflight gate into a running exam, with a stubbed
+Permissions API and a `getUserMedia` that rejects `NotAllowedError` the way a
+recorded Block does. **21/21 browser checks passed** across two scenarios:
+
+- *Deliberate block:* overlay up, title "Camera access is blocked", 4 kiosk-true
+  steps, no countdown, no dismiss control, exam controls confirmed unreachable
+  via `elementFromPoint`, exam timer still counting down, exactly one
+  `camera_blocked` row, copy switching to "Camera is back" on grant, and the
+  overlay clearing itself with **no click** followed by one `camera_restored`.
+- *Track death, no permission change:* stays neutral ("Camera turned off"), shows
+  the countdown, records exactly **one** `camera_lost` (two before the latch fix).
+
+Admin surfaces confirmed in-browser: Live Monitor renders "Camera access
+blocked", the report timeline renders "Camera access blocked by candidate", both
+with the detail string. Fixture torn down and verified gone; 0 `in_progress`
+attempts left behind.
+
+Gates: `bun run typecheck:api` clean, `bun test` 90/90, `vite build` clean, and
+`typecheck:web` held at its pre-existing **57** errors (confirmed by a `git
+stash` A/B — the app code adds none).

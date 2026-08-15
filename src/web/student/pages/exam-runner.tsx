@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useParams } from "wouter";
 import { api, type Bundle, type BundleQuestion, type ProctorConfig, DEFAULT_PROCTORING } from "../lib/api";
 import { useSession } from "../lib/session";
-import { requestFullscreen, exitFullscreen, startWebcam, getDisplayCount, startProctoring, captureFrame, isCameraActive, createObstructionDetector, isFrameClear, type FrameMetrics, type ProctorEvent, type WebcamHandle } from "../lib/proctor";
+import { requestFullscreen, exitFullscreen, startWebcam, getDisplayCount, startProctoring, captureFrame, isCameraActive, createObstructionDetector, isFrameClear, watchCameraPermission, type FrameMetrics, type ProctorEvent, type WebcamHandle } from "../lib/proctor";
+import { classifyCameraError, cameraLostFailure, type CameraFailure } from "../lib/camera-failure";
 import { Icon, NetBadge, useOnline } from "../components/ui";
 
 type Phase = "brief" | "preflight" | "resume" | "running" | "validating" | "done";
@@ -149,6 +150,22 @@ export function ExamRunner() {
   const [locked, setLocked] = useState(false);
   const [lockLeft, setLockLeft] = useState(0);
   const lockTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // WHY the camera is unavailable, not just that it is. Drives the lock overlay's
+  // instructions: inside SEB a blocked permission and an unplugged webcam need
+  // completely different remedies, and the generic "allow camera access" text was
+  // actionable for neither. Null while the camera is healthy.
+  const [camFail, setCamFail] = useState<CameraFailure | null>(null);
+  // Set once the exam has been stopped specifically because access is DENIED
+  // rather than the device having gone away. `getUserMedia` rejects instantly and
+  // silently in that state, so the retry button cannot help and the UI must say so.
+  const camDeniedRef = useRef(false);
+  // The camera is working again but the lock has NOT lifted yet, because the
+  // penalty countdown is still running. Without this the overlay silently fell
+  // back to "Your camera was turned off. The exam is paused until it is back."
+  // while the camera was demonstrably back — telling a student to fix something
+  // they have already fixed, next to a footer promising the exam resumes as soon
+  // as they do. Say what is actually being waited on.
+  const [camBack, setCamBack] = useState(false);
 
   // ---- Blocked-lens detection ----
   // A camera with tape/paper/a hand over it reports a perfectly healthy track:
@@ -428,15 +445,42 @@ export function ExamRunner() {
   }, [examId]);
 
   // ---- Camera-loss lock ----
-  const engageLock = useCallback((reason: string) => {
+  const engageLock = useCallback((reason: string, failure?: CameraFailure) => {
     const cfg = proctoringRef.current;
-    if (!cfg.blockOnCameraLoss || submittedRef.current) return;
+    if (submittedRef.current) return;
     setCamReady(false);
+    const fail = failure ?? cameraLostFailure(reason);
+    setCamFail(fail);
+    // A denied permission is a separate offence from a camera that died: it can
+    // only happen by choice, and it is the one state the retry button cannot fix.
+    // Type it distinctly so the admin timeline can tell the two apart, and latch
+    // it so the overlay keeps showing the right instructions while locked.
+    const denied = fail.code === "permission_denied";
+    if (denied) camDeniedRef.current = true;
+    setCamBack(false);
     // Persist the violation immediately (with a snapshot attempt) — the overlay
     // tells the student "this has been recorded", so it must actually be recorded.
-    recordEventRef.current("camera_lost", reason, { snapshot: true, minGapMs: 3000 });
-    pushAlert(`Camera turned off — exam locked. ${reason}`, "danger");
+    //
+    // Recorded BEFORE the freeze gate on purpose. "Lock exam if camera is closed"
+    // is a decision about interrupting the candidate, not about what the
+    // invigilator gets to see: an exam with that toggle off used to swallow a
+    // deliberate camera block entirely, leaving no trace in the timeline or the
+    // report. Evidence is always kept; only the freeze is optional.
+    recordEventRef.current(denied ? "camera_blocked" : "camera_lost", fail.eventDetail, { snapshot: true, minGapMs: 3000 });
+    if (!cfg.blockOnCameraLoss) {
+      // Warn and carry on. The status pill already reads "Camera off".
+      pushAlert(denied ? "Camera access is blocked. This has been recorded for review." : `Camera turned off. ${reason}`, "danger");
+      return;
+    }
+    pushAlert(denied ? "Camera access blocked — exam paused. Unblock your camera to continue." : `Camera turned off — exam locked. ${reason}`, "danger");
     setLocked(true);
+    // Do NOT re-arm the countdown if we are already locked. Two independent
+    // detectors now notice a dead camera — the track-level poll in startWebcam and
+    // the permission watcher — and a single incident routinely trips both a few
+    // seconds apart. Restarting the clock on the second one would silently extend
+    // the penalty for a student who did nothing new, and a student whose webcam
+    // reports itself as ended repeatedly could never reach zero at all.
+    if (lockedRef.current) return;
     setLockLeft(cfg.cameraLossLockSeconds);
     if (lockTimerRef.current) clearInterval(lockTimerRef.current);
     lockTimerRef.current = setInterval(() => {
@@ -458,8 +502,15 @@ export function ExamRunner() {
       webcamRef.current = handle;
       setTimeout(() => attachVideo(handle), 50);
       setCamReady(true);
-    } catch {
-      setCamError("Could not access the camera. Allow camera access and make sure no other app is using it.");
+      setCamFail(null);
+      camDeniedRef.current = false;
+    } catch (e) {
+      // Classify instead of printing one catch-all line: at the preflight gate this
+      // text is the only thing standing between a candidate with a closed privacy
+      // shutter and a raised hand they never needed.
+      const fail = classifyCameraError(e);
+      setCamFail(fail);
+      setCamError(`${fail.title}. ${fail.steps[0]}`);
       setCamReady(false);
     }
   }, [engageLock, attachVideo]);
@@ -677,9 +728,21 @@ export function ExamRunner() {
       attachVideo(handle);
       setCamReady(true);
       setCamError("");
+      setCamFail(null);
+      camDeniedRef.current = false;
+      // The unlock poll decides when the overlay actually lifts; until it does,
+      // the overlay must show the countdown as the reason it is still up.
+      setCamBack(true);
       return true;
-    } catch {
-      setCamError("Camera is still unavailable. Please reconnect / allow your camera.");
+    } catch (e) {
+      // Keep the overlay's instructions in step with the CURRENT cause: a student
+      // who reconnects a webcam while permission is still denied moves from
+      // "no camera" to "blocked", and must be told the remedy has changed.
+      const fail = classifyCameraError(e);
+      setCamFail(fail);
+      if (fail.code === "permission_denied") camDeniedRef.current = true;
+      setCamError(fail.steps[0] ?? fail.message);
+      setCamBack(false);
       return false;
     }
   }, [engageLock, attachVideo]);
@@ -700,6 +763,7 @@ export function ExamRunner() {
       setLocked(false);
       setCamReady(true);
       setCamError("");
+      setCamBack(false);
       recordEventRef.current("camera_restored", "Camera restored — exam resumed");
       pushAlert("Camera restored — exam resumed. This was recorded.", "warn");
       if (proctoringRef.current.fullscreenRequired) void requestFullscreen();
@@ -708,6 +772,41 @@ export function ExamRunner() {
     const t = setInterval(() => void tick(), 2500);
     return () => { stopped = true; clearInterval(t); };
   }, [locked, tryRestoreCamera, pushAlert]);
+
+  // ---- Camera permission watcher ----
+  // Stops the exam the moment access is REVOKED, which the track-level signals in
+  // startWebcam cannot be relied on for. Revoking permission does not always end
+  // or mute an existing track — in some Chromium versions the old stream keeps
+  // delivering frames — so without this a student could block the camera and carry
+  // on with the proctor none the wiser until the next frame upload failed.
+  //
+  // It is also the ONLY thing that notices access being granted again while the
+  // exam is locked, so the student is not left behind an overlay after fixing the
+  // very thing it asked them to fix.
+  useEffect(() => {
+    if (phase !== "running" && phase !== "preflight" && phase !== "resume") return;
+    if (!proctoringRef.current.requireWebcam) return;
+    let stopped = false;
+    const off = watchCameraPermission((state) => {
+      if (stopped || submittedRef.current) return;
+      if (state === "denied") {
+        camDeniedRef.current = true;
+        const fail = classifyCameraError({ name: "NotAllowedError" });
+        setCamReady(false);
+        setCamFail(fail);
+        // Only the running exam gets locked. At the preflight/resume gates there is
+        // nothing to interrupt — the student simply cannot pass the camera check,
+        // and the gate already shows the failure text.
+        if (phase === "running") engageLock(fail.eventDetail, fail);
+      } else if (state === "granted" && camDeniedRef.current) {
+        camDeniedRef.current = false;
+        // Re-acquire immediately rather than waiting for the 2.5s unlock poll, so
+        // the exam comes back the instant the block is lifted.
+        void tryRestoreCamera();
+      }
+    });
+    return () => { stopped = true; off(); };
+  }, [phase, engageLock, tryRestoreCamera]);
 
   // ---- Offline-first network handling (no freeze, no logout) ----
   // On the FIRST drop we save progress locally + show ONE toast, then stay quiet.
@@ -1375,13 +1474,46 @@ export function ExamRunner() {
       {locked && (
         <div style={{ position: "fixed", inset: 0, zIndex: 80, background: "rgba(8,12,20,.92)", display: "flex", alignItems: "center", justifyContent: "center", backdropFilter: "blur(4px)" }}>
           <div className="card" style={{ padding: 34, maxWidth: 440, textAlign: "center" }}>
-            <div style={{ width: 58, height: 58, borderRadius: 999, background: "var(--color-danger-bg)", color: "var(--color-danger)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}><Icon name="video-off" size={28} /></div>
-            <h2 style={{ fontFamily: "var(--font-serif)", fontSize: 22, marginBottom: 6 }}>Exam locked</h2>
-            <p style={{ color: "var(--color-ink2)", fontSize: 14, marginBottom: 18 }}>Your camera was turned off. The exam is paused and this has been recorded. It will unlock shortly — keep your camera on for the rest of the exam.</p>
-            <div className="timer-big timer-danger" style={{ justifyContent: "center", marginBottom: 18 }}><Icon name="lock" size={20} /> {fmtClock(lockLeft * 1000)}</div>
-            <button className="btn btn-primary" style={{ width: "100%", padding: 11 }} onClick={() => void tryRestoreCamera()}><Icon name="video" /> Re-enable camera now</button>
-            {camError && <div style={{ marginTop: 12, fontSize: 12.5, color: "var(--color-danger)" }}>{camError}</div>}
-            <p style={{ marginTop: 14, fontSize: 12, color: "#8ba0bd" }}>The exam timer keeps running while locked.</p>
+            <div style={{ width: 58, height: 58, borderRadius: 999, background: camBack ? "var(--color-warn-bg, #3a2c0a)" : "var(--color-danger-bg)", color: camBack ? "var(--color-warn, #f0b429)" : "var(--color-danger)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}><Icon name={camBack ? "video" : "video-off"} size={28} /></div>
+            <h2 style={{ fontFamily: "var(--font-serif)", fontSize: 22, marginBottom: 6 }}>{camBack ? "Camera is back" : camFail?.title ?? "Exam paused"}</h2>
+            <p style={{ color: "var(--color-ink2)", fontSize: 14, marginBottom: 14 }}>
+              {camBack
+                ? "Your camera is working again. The exam unlocks when the countdown below reaches zero."
+                : camFail?.message ?? "Your camera was turned off. The exam is paused until it is back."} This has been recorded for review.
+            </p>
+
+            {/* The remedies. This is the whole point of the overlay: inside SEB
+                there is no address bar to click, so the student needs steps that
+                work from their seat. Ordered hardware-first — a privacy shutter is
+                far more common than a genuine permission block, and it is the one
+                thing they can fix without an invigilator.
+                Hidden once the camera is back: instructions for a problem that no
+                longer exists are just noise in front of a running clock. */}
+            {!camBack && camFail && camFail.steps.length > 0 && (
+              <ol style={{ textAlign: "left", margin: "0 0 16px", padding: "14px 16px 14px 32px", background: "var(--color-danger-bg)", borderRadius: 10, color: "var(--color-ink)", fontSize: 13, lineHeight: 1.65 }}>
+                {camFail.steps.map((s, i) => <li key={i} style={{ marginBottom: i === camFail.steps.length - 1 ? 0 : 6 }}>{s}</li>)}
+              </ol>
+            )}
+
+            {/* A denied permission never recovers by waiting, so showing a
+                countdown there would promise something that cannot happen. Show the
+                penalty clock only while it is genuinely the thing being waited on. */}
+            {(camBack || camFail?.code !== "permission_denied") && lockLeft > 0 && (
+              <div className="timer-big timer-danger" style={{ justifyContent: "center", marginBottom: 18 }}><Icon name="lock" size={20} /> {fmtClock(lockLeft * 1000)}</div>
+            )}
+
+            {/* Nothing left to retry once the camera is live — the only thing
+                standing between the student and the exam is the countdown. */}
+            {!camBack && (
+              <button className="btn btn-primary" style={{ width: "100%", padding: 11 }} onClick={() => void tryRestoreCamera()}><Icon name="video" /> I've turned my camera back on</button>
+            )}
+            {!camBack && camError && <div style={{ marginTop: 12, fontSize: 12.5, color: "var(--color-danger)" }}>{camError}</div>}
+            <p style={{ marginTop: 14, fontSize: 12, color: "#8ba0bd" }}>
+              {camBack
+                ? "The exam unlocks by itself — do not close this window."
+                : "The exam resumes as soon as your camera is back and the lock time has elapsed."}{" "}
+              <strong>Your exam timer keeps running.</strong>
+            </p>
           </div>
         </div>
       )}
