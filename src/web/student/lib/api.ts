@@ -72,6 +72,19 @@ export type Bundle = {
   exam: { id: string; title: string; durationMin: number; totalPoints: number; startAt: string | null; endAt: string | null };
   questions: BundleQuestion[];
   proctoring?: ProctorConfig;
+  /**
+   * Names the option-ordering scheme this paper was rendered with. Options are
+   * shuffled per student, so the indices in this bundle are DISPLAY indices — the
+   * server only knows how to map them back if it is told which scheme produced
+   * them. Echoed on every call that carries an answer index in either direction
+   * (start / status / syncAnswers / submit).
+   *
+   * Optional on purpose: bundles are cached in localStorage and served offline
+   * first, so a running client can hold a paper from an older build that has no
+   * token. Sending undefined tells the server "these are original indices, do not
+   * translate", which is exactly right for that client.
+   */
+  optionOrder?: string;
 };
 
 export type StartInfo = { attemptId: string; startedAt: string; endAt: string; serverNow: string; durationMin: number; pausedMs?: number; held?: boolean; answers?: Record<string, unknown> };
@@ -135,17 +148,22 @@ export const api = {
     req<HeartbeatInfo>(`/student/heartbeat/${examId}`, { method: "POST" }),
   exams: () => req<{ exams: ExamListItem[]; student: { id: string; name: string; rollNo: string; email: string | null } }>("/student/exams"),
   bundle: (examId: string) => req<Bundle>(`/student/exams/${examId}/bundle`),
-  start: (examId: string) => req<StartInfo>(`/student/attempts/${examId}/start`, { method: "POST" }),
-  status: (examId: string) => req<StatusInfo>(`/student/attempts/${examId}/status`),
+  // optionOrder (all four answer-carrying calls below): the scheme token from the
+  // bundle currently on screen. Passed explicitly rather than read from storage so
+  // it can never disagree with the paper the student is actually looking at.
+  start: (examId: string, optionOrder?: string) =>
+    req<StartInfo>(`/student/attempts/${examId}/start`, { method: "POST", body: JSON.stringify({ optionOrder }) }),
+  status: (examId: string, optionOrder?: string) =>
+    req<StatusInfo>(`/student/attempts/${examId}/status${optionOrder ? `?optionOrder=${encodeURIComponent(optionOrder)}` : ""}`),
   // Real-time per-answer autosave. keepalive lets the request survive a page
   // hide/unload so the last answer still reaches the server. Never throws — a
   // failed sync just leaves the answer in the client's dirty set to retry.
-  syncAnswers: (attemptId: string, answers: { questionId: string; response: unknown }[]) =>
+  syncAnswers: (attemptId: string, answers: { questionId: string; response: unknown }[], optionOrder?: string) =>
     fetch(`${API_URL}/api/student/attempts/${attemptId}/answers`, {
       method: "POST",
       keepalive: true,
       headers: { "Content-Type": "application/json", ...tokenHeader() },
-      body: JSON.stringify({ answers }),
+      body: JSON.stringify({ answers, optionOrder }),
     }).then((r) => (r.ok ? (r.json() as Promise<{ ok: boolean; answeredCount?: number; frozen?: boolean }>) : Promise.reject(new Error(`sync failed (${r.status})`)))),
   // Proctoring: flush violation events the moment they happen so the evidence
   // survives a crash / force-quit. keepalive lets a flush fired during page
@@ -160,7 +178,7 @@ export const api = {
   // Proctoring: presigned PUT for a violation snapshot (uploaded direct to storage).
   snapshotUrl: (attemptId: string) =>
     req<{ ok: boolean; url: string | null; key: string | null }>(`/student/attempts/${attemptId}/snapshot-url`, { method: "POST", body: JSON.stringify({}) }),
-  submit: (attemptId: string, payload: { answers: { questionId: string; response: unknown }[]; integrityEvents: { type: string; detail?: string; at?: number; photoKey?: string | null }[] }) =>
+  submit: (attemptId: string, payload: { answers: { questionId: string; response: unknown }[]; integrityEvents: { type: string; detail?: string; at?: number; photoKey?: string | null }[]; optionOrder?: string }) =>
     req<{ ok: boolean; score: number; integrityScore: number }>(`/student/attempts/${attemptId}/submit`, {
       method: "POST",
       body: JSON.stringify(payload),

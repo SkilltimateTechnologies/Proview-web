@@ -5,7 +5,7 @@ import { auth } from "./auth";
 import { hashPassword, verifyPassword } from "better-auth/crypto";
 import { db } from "./database";
 import * as schema from "./database/schema";
-import { INDEX_STATE, REQUIRED_UNIQUE_INDEXES } from "./database/invariants";
+import { INDEX_STATE, REQUIRED_COLUMNS, REQUIRED_UNIQUE_INDEXES } from "./database/invariants";
 import { authMiddleware, requireAuth, requireSuperAdmin, requirePermission } from "./middleware/auth";
 import type { SessionUser, ProfileCtx } from "./middleware/auth";
 import { id, displayId, computeYear, effectiveEndMs } from "./lib/util";
@@ -15,6 +15,7 @@ import { presignPut, presignGet, presignGetCached, getObject } from "./lib/s3";
 import { signStudentToken, verifyStudentToken } from "./lib/student-token";
 import { normalizeRoll, rollNoProblem, isDuplicateRollError } from "./lib/students";
 import { recordMonitorBuild, monitorTiming, recentExamChecks, failingExamChecks, checkExamData, MONITOR_POLL_MS, MONITOR_BUDGET_MS } from "./lib/watchdog";
+import { OPTION_ORDER_TOKEN, optionTranslator, tokenIsCurrent } from "./lib/option-order";
 import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
 import { isEligible, matchesCohort, loadRoster, loadRosters, ensureOptInOnlyLoaded, invalidateOptInOnlyCache, isOptInOnlyCode } from "./lib/roster";
 
@@ -111,6 +112,28 @@ async function persistIntegrityEvents(attemptId: string, raw: unknown): Promise<
     await db.insert(schema.integrityEvents).values(rows.slice(i, i + 50));
   }
   return rows.length;
+}
+
+/**
+ * Build the per-student option-order translator for one exam.
+ *
+ * `clientToken` is the scheme token the client reports (it came from the bundle it
+ * rendered). When it is missing or from an older build, the translator is inert
+ * and every index is passed through unchanged — that client is looking at the
+ * ORIGINAL option order, so its indices are already original.
+ *
+ * Only loads the question rows when translation is actually active, so the
+ * autosave path (called on every single answer) costs nothing extra for clients
+ * that don't need it.
+ */
+async function answerTranslator(examId: string, studentId: string, clientToken: unknown) {
+  if (!tokenIsCurrent(clientToken)) return optionTranslator(studentId, examId, [], false);
+  const eqs = await db.select({ questionId: schema.examQuestions.questionId }).from(schema.examQuestions).where(eq(schema.examQuestions.examId, examId));
+  const qids = eqs.map((e) => e.questionId);
+  const qs = qids.length
+    ? await db.select({ id: schema.questions.id, type: schema.questions.type, options: schema.questions.options }).from(schema.questions).where(inArray(schema.questions.id, qids))
+    : [];
+  return optionTranslator(studentId, examId, qs, true);
 }
 
 /** Find a student in a tenant by roll number, ignoring case and padding. */
@@ -408,6 +431,16 @@ const app = new Hono<{ Variables: Vars }>()
         return { index: spec.name, table: spec.table, columns: spec.columns, present, duplicateGroups: dupes, guards: spec.guards };
       }),
     );
+    // Additive columns `schema.ts` depends on. A missing one is worse than a missing
+    // index — every query on the table would fail — so it is reported alongside them.
+    const columns = await Promise.all(
+      REQUIRED_COLUMNS.map(async (spec) => {
+        const present = Number((await db.all<{ c: number }>(
+          dsql`SELECT COUNT(*) AS c FROM pragma_table_info(${spec.table}) WHERE name = ${spec.column}`,
+        ))[0]?.c ?? 0) > 0;
+        return { table: spec.table, column: spec.column, type: spec.type, present, guards: spec.guards };
+      }),
+    );
     const impossible = Number((await db.all<{ c: number }>(
       dsql`SELECT COUNT(*) AS c FROM attempts WHERE score > 100 OR score < 0`,
     ))[0]?.c ?? 0);
@@ -440,11 +473,12 @@ const app = new Hono<{ Variables: Vars }>()
          OR roll_no <> upper(roll_no)
       LIMIT 50
     `);
-    const ok = indexes.every((i) => i.present && i.duplicateGroups === 0) && impossible === 0 && denomMismatch === 0;
+    const ok = indexes.every((i) => i.present && i.duplicateGroups === 0) && columns.every((c2) => c2.present) && impossible === 0 && denomMismatch === 0;
     return c.json({
       ok,
       bootCheck: INDEX_STATE,
       indexes,
+      columns,
       attemptsWithImpossibleScore: impossible,
       attemptsWithDenominatorMismatch: denomMismatch,
       duplicateStudentSuspects: suspects.map((s) => ({ ...s, n: Number(s.n) })),
@@ -1403,6 +1437,12 @@ const app = new Hono<{ Variables: Vars }>()
     const qids = eqs.map((q) => q.questionId);
     const qs = qids.length ? await db.select().from(schema.questions).where(inArray(schema.questions.id, qids)) : [];
     const qById = new Map(qs.map((q) => [q.id, q]));
+    // Shuffle each question's OPTIONS for this student too. Question order alone
+    // left the answer key identical for everyone, so a paper keyed "B" on 55% of
+    // its questions rewarded anyone who just pressed B all the way down. The
+    // permutation is display-only: answers.response keeps storing the ORIGINAL
+    // index, so grading and every already-graded attempt are untouched.
+    const optOrder = optionTranslator(stu.id, exam.id, qs, true);
     // Ship only what the client needs to render — never the correct answer.
     const questions = eqs.map((eq2) => {
       const q = qById.get(eq2.questionId);
@@ -1418,7 +1458,7 @@ const app = new Hono<{ Variables: Vars }>()
         points: eq2.points,
         type: q?.type ?? "short",
         prompt: q?.prompt ?? "",
-        options: q?.options ?? null,
+        options: optOrder.display(eq2.questionId, (q?.options as string[] | null) ?? null),
         difficulty: q?.difficulty ?? "medium",
         topic: q?.topic ?? null,
         meta: safeMeta,
@@ -1442,6 +1482,12 @@ const app = new Hono<{ Variables: Vars }>()
       exam: { id: exam.id, title: exam.title, durationMin: exam.durationMin, totalPoints: exam.totalPoints, startAt: exam.startAt, endAt: exam.endAt },
       questions: shuffled,
       proctoring,
+      // Tells the server which rendering scheme this paper was built with. The
+      // client caches the bundle offline and echoes this back on every write, so a
+      // paper rendered by an older build (original option order) is still read
+      // correctly instead of being un-permuted twice. Not a secret — it identifies
+      // the scheme, never the permutation.
+      optionOrder: OPTION_ORDER_TOKEN,
     }, 200);
   })
 
@@ -1458,6 +1504,14 @@ const app = new Hono<{ Variables: Vars }>()
     if (!startStu || !startStu.enabled || !isEligible(exam, startStu, await loadRoster(eid))) {
       return c.json({ message: "Not eligible for this exam" }, 403);
     }
+    // The scheme token of the bundle the client actually rendered. Parsed up front
+    // because it gets STAMPED ONTO THE ATTEMPT: once the exam is over the bundle is
+    // gone from the client, so the review endpoint has no other way to know whether
+    // this student saw shuffled options or the original order. NULL on every attempt
+    // that predates this feature, which is exactly what makes old reviews render
+    // byte-for-byte as before.
+    const startBody = await c.req.json().catch(() => ({} as Record<string, unknown>));
+    const startScheme = tokenIsCurrent(startBody?.optionOrder) ? OPTION_ORDER_TOKEN : null;
 
     // Always resolve to the OLDEST attempt for this (exam, student) pair. A stable
     // deterministic pick means /start /status /heartbeat /resume all agree on the
@@ -1486,7 +1540,7 @@ const app = new Hono<{ Variables: Vars }>()
       // the conflict and re-read the winning row, so all callers converge on one attempt.
       try {
         [attempt] = await db.insert(schema.attempts)
-          .values({ id: id("att"), examId: eid, studentId: sid, status: "in_progress", startedAt, sectionSnapshot })
+          .values({ id: id("att"), examId: eid, studentId: sid, status: "in_progress", startedAt, sectionSnapshot, optionOrder: startScheme })
           .returning();
       } catch {
         [attempt] = await db.select().from(schema.attempts)
@@ -1500,17 +1554,30 @@ const app = new Hono<{ Variables: Vars }>()
         return c.json({ message: "Already submitted" }, 409);
       }
     } else if (attempt.status === "not_started") {
-      [attempt] = await db.update(schema.attempts).set({ status: "in_progress", startedAt: new Date(now) }).where(eq(schema.attempts.id, attempt.id)).returning();
+      [attempt] = await db.update(schema.attempts).set({ status: "in_progress", startedAt: new Date(now), optionOrder: startScheme }).where(eq(schema.attempts.id, attempt.id)).returning();
     }
-    // Mark the student as seen (drives Live Monitor online/offline).
-    await db.update(schema.attempts).set({ lastSeenAt: new Date(now) }).where(eq(schema.attempts.id, attempt.id));
+    // Mark the student as seen (drives Live Monitor online/offline). Also record the
+    // display scheme if it is not on the attempt yet — an attempt created by an older
+    // build, or by a /start that raced this one, still needs the stamp so its review
+    // renders in the order the student saw. Only ever written when the client reports
+    // the current scheme, and never overwritten with null.
+    const stampScheme = startScheme !== null && attempt.optionOrder !== startScheme;
+    await db.update(schema.attempts)
+      .set(stampScheme ? { lastSeenAt: new Date(now), optionOrder: startScheme } : { lastSeenAt: new Date(now) })
+      .where(eq(schema.attempts.id, attempt.id));
+    if (stampScheme) attempt = { ...attempt, optionOrder: startScheme };
     // Return the server-saved answers so a resume/reopen on a FRESH browser
     // (cleared cache, different machine, SEB kiosk that wipes local storage)
     // restores the student's prior work instead of showing a blank exam. The
     // client merges these under its own local answers (local wins per-question).
     const startSaved = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, attempt.id));
+    // Stored responses are ORIGINAL option indices; the client renders against the
+    // shuffled bundle, so translate them into ITS display order. Only when the
+    // client reports the current scheme token — a client on an older cached bundle
+    // sees the original order and must get its answers back untranslated.
+    const startTrans = await answerTranslator(attempt.examId, sid, startScheme);
     const startAnswers: Record<string, unknown> = {};
-    for (const a of startSaved) if (a.response != null) startAnswers[a.questionId] = a.response;
+    for (const a of startSaved) if (a.response != null) startAnswers[a.questionId] = startTrans.toDisplay(a.questionId, a.response);
     // Absolute deadline includes admin extra-minutes + global hold time.
     const endAtMs = effectiveEndMs(exam, attempt, now);
     return c.json({ attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), serverNow: new Date(now), durationMin: exam.durationMin, pausedMs: attempt.pausedMs ?? 0, held: !!exam.heldAt, answers: startAnswers }, 200);
@@ -1540,8 +1607,12 @@ const app = new Hono<{ Variables: Vars }>()
       // browser restores prior work rather than a blank exam (client merges
       // these under its local answers).
       const stSaved = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, attempt.id));
+      // Same translation as /start: stored indices are original, the client's screen
+      // is in ITS shuffled display order. GET, so the scheme token arrives as a query
+      // param rather than in a body.
+      const stTrans = await answerTranslator(attempt.examId, sid, c.req.query("optionOrder"));
       const stAnswers: Record<string, unknown> = {};
-      for (const a of stSaved) if (a.response != null) stAnswers[a.questionId] = a.response;
+      for (const a of stSaved) if (a.response != null) stAnswers[a.questionId] = stTrans.toDisplay(a.questionId, a.response);
       return c.json({ status: "in_progress", attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), serverNow: new Date(now), held: !!exam.heldAt, answers: stAnswers }, 200);
     }
     return c.json({ status: attempt.status, attemptId: attempt.id, startedAt: attempt.startedAt, endAt: null, serverNow: new Date(now), held: false, score: attempt.score }, 200);
@@ -1640,24 +1711,38 @@ const app = new Hono<{ Variables: Vars }>()
     const eqs = await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, attempt.examId));
     const validQ = new Set(eqs.map((e) => e.questionId));
 
+    // The client sends the option index it DISPLAYED. Options are shuffled per
+    // student, so convert back to the original index before storing — the grader and
+    // every report read original indices.
+    const saveTrans = await answerTranslator(attempt.examId, sid, body?.optionOrder);
+
     // Upsert against answers_attempt_question_uq. The old select-then-insert had
     // the same race as /start: two autosaves in flight for one question both saw
     // no existing row and both inserted, and the grader then counted both rows.
     // Only `response` is touched here — never clobber a score the grader wrote.
     for (const a of incoming) {
       if (!a || !validQ.has(a.questionId)) continue;
+      const stored = a.response == null ? null : saveTrans.toOriginal(a.questionId, a.response);
       await db.insert(schema.answers)
-        .values({ id: id("ans"), attemptId: aid, questionId: a.questionId, response: a.response ?? null, score: null, maxScore: null, autoGraded: false })
+        .values({ id: id("ans"), attemptId: aid, questionId: a.questionId, response: stored, score: null, maxScore: null, autoGraded: false })
         .onConflictDoUpdate({
           target: [schema.answers.attemptId, schema.answers.questionId],
-          set: { response: a.response ?? null },
+          set: { response: stored },
         });
     }
 
     // Recompute answeredCount from rows that carry real content.
     const rows = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, aid));
     const answeredCount = rows.filter((r) => hasContent(r.response)).length;
-    await db.update(schema.attempts).set({ answeredCount, lastSeenAt: new Date() }).where(eq(schema.attempts.id, aid));
+    // Backstop for the review stamp: /start may have run on an older build, or the
+    // attempt may have been created by the auto-submit sweep, and the review endpoint
+    // has no bundle to consult after the exam. Written at most once (only when it
+    // differs) and never cleared, so a client on a stale bundle cannot un-stamp an
+    // attempt that is genuinely being sat in shuffled order.
+    const saveScheme = saveTrans.active && attempt.optionOrder !== OPTION_ORDER_TOKEN ? OPTION_ORDER_TOKEN : null;
+    await db.update(schema.attempts)
+      .set(saveScheme ? { answeredCount, lastSeenAt: new Date(), optionOrder: saveScheme } : { answeredCount, lastSeenAt: new Date() })
+      .where(eq(schema.attempts.id, aid));
 
     return c.json({ ok: true, answeredCount }, 200);
   })
@@ -1710,7 +1795,25 @@ const app = new Hono<{ Variables: Vars }>()
     if (attempt.status === "submitted" || attempt.status === "graded") return c.json({ ok: true, alreadySubmitted: true }, 200);
 
     const body = await c.req.json().catch(() => ({}));
-    const respArr: { questionId: string; response: unknown }[] = Array.isArray(body.answers) ? body.answers : [];
+    const rawResp: { questionId: string; response: unknown }[] = Array.isArray(body.answers) ? body.answers : [];
+    // Convert displayed option indices back to original indices before grading — the
+    // same translation the autosave path applies, so a submit and an autosave of the
+    // same click always store the identical value.
+    const submitTrans = await answerTranslator(attempt.examId, sid, body?.optionOrder);
+    const respArr = rawResp.map((a) => (
+      a && typeof a.questionId === "string" && a.response != null
+        ? { ...a, response: submitTrans.toOriginal(a.questionId, a.response) }
+        : a
+    ));
+
+    // Last chance to stamp the display scheme on the attempt: after this the client
+    // clears its bundle, so if it is not recorded now the review can never know the
+    // student sat a shuffled paper. Write-once, never cleared (see autosave).
+    if (submitTrans.active && attempt.optionOrder !== OPTION_ORDER_TOKEN) {
+      try {
+        await db.update(schema.attempts).set({ optionOrder: OPTION_ORDER_TOKEN }).where(eq(schema.attempts.id, aid));
+      } catch { /* cosmetic for review only — never block a submit over it */ }
+    }
 
     // Backstop for proctoring evidence: the client flushes violations live to
     // /events, but resends the whole list here in case a flush failed offline.
@@ -1752,6 +1855,18 @@ const app = new Hono<{ Variables: Vars }>()
     const qs = qids.length ? await db.select().from(schema.questions).where(inArray(schema.questions.id, qids)) : [];
     const qById = new Map(qs.map((q) => [q.id, q]));
 
+    // Show the review in the SAME option order the student sat the exam in,
+    // otherwise "you chose B" contradicts the B they actually clicked. Options,
+    // correct answer and response are all translated together, so the payload is
+    // self-consistent; nothing stored changes.
+    //
+    // Gated on the scheme recorded ON THIS ATTEMPT, not on the current build. The
+    // exam is over, so there is no bundle left to ask; every attempt sat before
+    // shuffling existed has option_order = NULL and must render in the authored
+    // order it was actually taken in. Translating those would show a student an
+    // option list they never saw and move the tick onto a different line.
+    const revTrans = optionTranslator(sid, attempt.examId, qs, tokenIsCurrent(attempt.optionOrder));
+
     const questions = eqs.map((eq2) => {
       const q = qById.get(eq2.questionId);
       const a = aMap.get(eq2.questionId);
@@ -1759,10 +1874,10 @@ const app = new Hono<{ Variables: Vars }>()
         id: eq2.questionId,
         type: q?.type ?? "short",
         prompt: q?.prompt ?? "",
-        options: q?.options ?? null,
-        correct: q?.correct ?? null,
+        options: revTrans.display(eq2.questionId, (q?.options as string[] | null) ?? null),
+        correct: q?.correct != null ? revTrans.toDisplay(eq2.questionId, q.correct) : null,
         points: eq2.points,
-        response: a?.response ?? null,
+        response: a?.response != null ? revTrans.toDisplay(eq2.questionId, a.response) : null,
         score: a?.score ?? null,
         maxScore: a?.maxScore ?? eq2.points,
         aiNotes: a?.aiNotes ?? null,

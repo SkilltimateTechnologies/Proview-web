@@ -108,6 +108,15 @@ export function ExamRunner() {
   const proctoringRef = useRef(proctoring);
   proctoringRef.current = proctoring;
 
+  // Scheme token of the paper currently on screen. Options are shuffled per student,
+  // so every index this client sends or receives is a DISPLAY index and the server
+  // needs this token to map it back. Kept in a ref because the sync/heartbeat/poll
+  // callbacks are memoised with empty dep arrays and would otherwise capture a stale
+  // bundle. undefined when the cached bundle predates shuffling — the server then
+  // treats the indices as original and leaves them alone.
+  const optionOrderRef = useRef<string | undefined>(undefined);
+  optionOrderRef.current = bundle?.optionOrder;
+
   // Offline-first: when the internet drops we KEEP the exam running (answers are
   // saved locally and sync on reconnect). We only show a single toast on drop and
   // flip the network badge — no freeze, no logout. Time credit for a real outage
@@ -397,6 +406,18 @@ export function ExamRunner() {
     const cached = loadCachedBundle(examId);
     if (cached) setBundle(cached);
     api.bundle(examId).then((b) => {
+      // NEVER change the option order of a paper that is already being sat. Answers
+      // are held as indices into the options as displayed, so swapping the order
+      // underneath a student would silently repoint every answer they have already
+      // given at different text. This is a real case exactly once: a student who
+      // started before the shuffling deploy (cached bundle, no scheme token) and
+      // refreshes afterwards. Keep their order for the rest of the attempt — their
+      // client also sends no token, so the server stores their indices as original
+      // and the two halves stay consistent.
+      const inFlight = loadProgress(examId);
+      if (cached && inFlight?.attemptId && (cached.optionOrder ?? null) !== (b.optionOrder ?? null)) {
+        return;
+      }
       setBundle(b);
       cacheBundle(examId, b);
     }).catch(() => {
@@ -509,7 +530,7 @@ export function ExamRunner() {
       setDisplayCount(startDisplays);
     }
     try {
-      const start = await api.start(examId);
+      const start = await api.start(examId, optionOrderRef.current);
       // Restore any answers saved locally (offline-first: survives a crash/reload).
       const saved = loadProgress(examId);
       // Merge server-saved answers UNDER local ones: on a fresh browser (cleared
@@ -602,7 +623,7 @@ export function ExamRunner() {
     if (!navigator.onLine) { resumeOffline(); return; }
     void (async () => {
       try {
-        const st = await api.status(examId);
+        const st = await api.status(examId, optionOrderRef.current);
         if (st.status === "submitted" || st.status === "graded") {
           // Already finished elsewhere — clear any stale local progress + go home.
           clearProgress(examId);
@@ -759,7 +780,7 @@ export function ExamRunner() {
     const MAX_POLLS = 40;
     const poll = async () => {
       try {
-        const st = await api.status(examId);
+        const st = await api.status(examId, optionOrderRef.current);
         if (stop) return;
         // Admin RESET: the attempt was flipped back to in_progress (e.g. submitted
         // by accident, or reopened with leftover time). Drop the score screen and
@@ -998,7 +1019,7 @@ export function ExamRunner() {
       .map((q) => ({ questionId: q.id, response: s.answers[q.id] }));
     const answered = answers.length;
     const skipped = bundle.questions.length - answered;
-    const payload = { answers, integrityEvents: s.integrityEvents };
+    const payload = { answers, integrityEvents: s.integrityEvents, optionOrder: bundle.optionOrder };
 
     try {
       // Stop the camera / fullscreen immediately; show the "validating" screen
@@ -1058,7 +1079,7 @@ export function ExamRunner() {
     dirtyRef.current.clear();
     const answers = ids.map((questionId) => ({ questionId, response: s.answers[questionId] ?? null }));
     syncingRef.current = true;
-    void api.syncAnswers(s.attemptId, answers)
+    void api.syncAnswers(s.attemptId, answers, optionOrderRef.current)
       .catch(() => { for (const q of ids) dirtyRef.current.add(q); })
       .finally(() => { syncingRef.current = false; });
   }, []);

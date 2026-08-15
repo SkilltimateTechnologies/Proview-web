@@ -386,3 +386,108 @@ stall, or the server being gone entirely. Both banner variants state
 - `orphan-answers-delete-backup-*.json` is gitignored; the 797 orphan rows it
   contains were deleted after a dry run confirmed none of their 23 parent
   attempts still existed.
+
+## Incident 5 — the answer key rewarded guessers (15 Aug 2026)
+
+Not a crash — a fairness defect, and it had been live for every exam so far.
+
+### What was wrong
+
+Question order was already randomised per student, but **option order was not**,
+so the answer key was identical for all 268 candidates. Measured on the real
+question bank:
+
+| Category | MCQs | correct = A | B | C | D |
+|---|---|---|---|---|---|
+| General Set-1 (`cat_d11d8ce36cab420f`) | 40 | 6 | **22** | 12 | 0 |
+| Python DSA SET 4 (`cat_e0b71ddb435746c2`) | 20 | **16** | 2 | 2 | 0 |
+
+A student who knew nothing and pressed **B** down the whole General paper scored
+**55%**; on the DSA set, **A** scored **80%**. **D was never correct once.** That
+is not an exam, it is a lottery with a published winning ticket — and it silently
+penalised the students who actually attempted the questions.
+
+Bank-wide: 430 questions, 210 with options, all `mcq`, all exactly 4 options.
+
+### What was NOT done, and why
+
+**Rewriting `questions.options` / `questions.correct` was rejected.** Questions
+are shared across exams through categories, and `answers.response` stores the
+chosen option **index**. Reordering stored options would silently reinterpret
+every answer row ever written — a student who correctly picked index 1 in July
+would become wrong retroactively. Any fix had to leave stored data meaning
+exactly what it meant before.
+
+### The fix: permute for DISPLAY only
+
+Options are permuted per `(student, exam, question)` when the paper is rendered.
+The server translates displayed→original on write and original→displayed on
+read, so **`answers.response` always holds the ORIGINAL index**. Grading,
+history, reports and every already-graded attempt are byte-for-byte unaffected.
+
+Deterministic seed `${studentId}:${examId}:${questionId}:opt-v1`, so the order is
+stable across reloads, resumes and a different machine — a student never sees the
+paper shift under them.
+
+Five places carry the mapping. Missing any one of them silently corrupts an
+answer, so they are listed here for whoever touches this next:
+
+1. `GET /student/exams/:id/bundle` — render in display order, ship the token
+2. `POST .../answers` (autosave) — display → original before storing
+3. `POST .../submit` — display → original before grading
+4. `POST .../start` and `GET .../status` — original → display when prefilling a resume
+5. `GET .../review` — options, `correct` and `response` translated together
+
+Questions whose options reference each other ("All of the above", "Both A and B")
+are detected and left in authored order. The regex is deliberately narrow:
+production question `q_ce2e7ec9cff34e54` has options `["A | B","A & B","A - B",
+"A ^ B"]` — bitwise operators, not option references — and must still shuffle.
+
+### Two traps this design had to survive
+
+**Stale bundles.** The bundle is cached in `localStorage` and served offline
+first, so a client can be sitting on a paper rendered by an OLDER build, in the
+original order. Translating its indices would corrupt a correct answer. The
+bundle therefore carries `optionOrder: "v1"`, the client echoes it on every
+write, and the server translates **only** when the token is current. No token or
+an unknown token ⇒ inert pass-through. The token names the scheme; it never
+encodes the permutation. The client also refuses to adopt a background bundle
+refresh whose token differs while an attempt is in flight — the order of a paper
+being sat never changes.
+
+**Review after the fact.** A finished attempt has no bundle left to consult, so
+the scheme is stamped on the attempt itself: new nullable `attempts.option_order`
+(written at `/start`, backstopped at autosave and submit, never cleared). Every
+attempt sat before this deploy has **NULL**, and NULL renders in the authored
+order — which is exactly what those students saw.
+
+`option_order` is added by a new `REQUIRED_COLUMNS` check in
+`database/invariants.ts` (`pragma_table_info` + `ALTER TABLE`, idempotent, never
+throws), awaited **before** the server starts listening: Drizzle names every
+column in its SELECTs, so a missing one would break every attempts query, not
+just the new feature. There is still no migrate step in the deploy path.
+
+Rejected: forcing the correct answer into display slot `(k + studentOffset) % 4`
+("balanced rotation"). It couples the permutation to `correct` and to the
+student's shuffled question order for no extra benefit — a plain deterministic
+shuffle already removes the exploit.
+
+### Verified
+
+- `src/api/lib/option-order.test.ts` — **23 pass**, 2682 expect() calls:
+  exhaustive inverse round-trip for 2–6 options, displayed-text↔stored-index
+  equivalence, `autoGrade` still awards full marks, non-index answers untouched,
+  and a cohort check over 800 students where **every letter lands 18–32%** — no
+  letter beats chance any more. Mutation-tested: **all 10 mutations caught**.
+- `bun run verify:option-order` (new) — the wiring, which no unit test can reach.
+  Creates a throwaway exam from real bank MCQs, logs in as a real student over
+  HTTP, answers every question **by option TEXT**, and asserts against the
+  database: **21/21 PASS**, score **100**, stored responses still original
+  indices, review self-consistent, unstamped attempt renders authored order.
+  Cleans up everything it created, including on failure.
+- Mutation-tested end to end — all 5 wiring faults caught: inverted autosave
+  (3 fails), inverted submit (4 fails, score 50), review gate ignoring
+  `option_order` (2 fails), bundle not permuted (6 fails, score 25), `/start`
+  not stamping (2 fails), token check removed (1 fail).
+- `bun test` 56 pass / 0 fail; `typecheck:api` clean; `typecheck:web` still 57
+  pre-existing errors (unchanged); `bun run build` exit 0.

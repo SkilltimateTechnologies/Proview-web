@@ -73,11 +73,51 @@ export const REQUIRED_UNIQUE_INDEXES: IndexSpec[] = [
   },
 ];
 
+type ColumnSpec = {
+  table: string;
+  column: string;
+  /** SQLite column type + any default. Must be nullable — see the note below. */
+  type: string;
+  /** What breaks if this column is missing — used in the alert text. */
+  guards: string;
+};
+
+/**
+ * Columns that `schema.ts` declares but that no migration adds.
+ *
+ * This is the structural twin of REQUIRED_UNIQUE_INDEXES and it is even less
+ * optional: Drizzle names every column of a table in its SELECT list, so a column
+ * that exists in `schema.ts` but NOT in the connected database turns every query
+ * on that table into `no such column` — the exam would not run at all. There is no
+ * migrate step in the deploy path (see the header), so the column has to be
+ * asserted here.
+ *
+ * Rules for anything added to this list:
+ *  - NULLABLE, no NOT NULL. `ALTER TABLE ... ADD COLUMN` backfills existing rows
+ *    with NULL, and the code must treat NULL as "row predates this feature".
+ *  - Additive only. Never put a rename, a type change or a drop here; SQLite would
+ *    need a table rebuild and that is not something to do at boot on an exam server.
+ */
+export const REQUIRED_COLUMNS: ColumnSpec[] = [
+  {
+    table: "attempts",
+    column: "option_order",
+    type: "text",
+    guards:
+      "student answer review re-ordering options for attempts sat before per-student " +
+      "option shuffling existed (NULL = original authored order, render as-is)",
+  },
+];
+
 export type IndexState = {
   checkedAt: string | null;
   ok: boolean;
   present: string[];
   created: string[];
+  /** Columns already on the connected database, as `table.column`. */
+  columnsPresent: string[];
+  /** Columns this boot had to add, as `table.column`. */
+  columnsAdded: string[];
   failed: { index: string; error: string; duplicateGroups?: number }[];
 };
 
@@ -86,6 +126,8 @@ export const INDEX_STATE: IndexState = {
   ok: false,
   present: [],
   created: [],
+  columnsPresent: [],
+  columnsAdded: [],
   failed: [],
 };
 
@@ -118,6 +160,85 @@ function definitionSatisfies(spec: IndexSpec, definition: string): boolean {
   return spec.columns.every((col) => norm.includes(normalizeSql(col)));
 }
 
+/** True when `table` exists on the connected database. */
+async function tableExists(table: string): Promise<boolean> {
+  const rows = await db.all<{ c: number }>(
+    sql`SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'table' AND name = ${table}`,
+  );
+  return Number(rows[0]?.c ?? 0) > 0;
+}
+
+/**
+ * True when `column` exists on `table`.
+ *
+ * SQLite has no `ADD COLUMN IF NOT EXISTS`, and a second `ADD COLUMN` errors with
+ * "duplicate column name" — so the existence check IS the idempotency mechanism.
+ * `pragma_table_info` is the table-valued form of the pragma and takes a bound
+ * parameter, which keeps the table name out of the SQL string.
+ */
+async function columnExists(table: string, column: string): Promise<boolean> {
+  const rows = await db.all<{ c: number }>(
+    sql`SELECT COUNT(*) AS c FROM pragma_table_info(${table}) WHERE name = ${column}`,
+  );
+  return Number(rows[0]?.c ?? 0) > 0;
+}
+
+/**
+ * Ensure every column `schema.ts` relies on exists on the connected database.
+ *
+ * Split out from ensureDatabaseInvariants and awaited BEFORE the server starts
+ * listening (see server.ts): a missing column breaks reads outright, so unlike the
+ * unique indexes it cannot be repaired concurrently with serving traffic. Cheap —
+ * one pragma read per column on the happy path.
+ *
+ * Idempotent. Never throws.
+ */
+export async function ensureRequiredColumns(): Promise<Pick<IndexState, "columnsPresent" | "columnsAdded" | "failed">> {
+  const columnsPresent: string[] = [];
+  const columnsAdded: string[] = [];
+  const failed: { index: string; error: string }[] = [];
+
+  for (const spec of REQUIRED_COLUMNS) {
+    const label = `${spec.table}.${spec.column}`;
+    try {
+      if (await columnExists(spec.table, spec.column)) {
+        columnsPresent.push(label);
+        continue;
+      }
+      // No table at all means we are pointed at an empty/unprovisioned database.
+      // Adding a column is impossible and `db:push` is the right fix, so say that
+      // rather than emitting a confusing "no such table" from the ALTER.
+      if (!(await tableExists(spec.table))) {
+        const msg = `table ${spec.table} does not exist — run \`bun run db:push\` against this database`;
+        console.error(`[invariants] CRITICAL ${label}: ${msg}`);
+        failed.push({ index: label, error: msg });
+        continue;
+      }
+      await db.run(
+        sql`ALTER TABLE ${sql.raw(spec.table)} ADD COLUMN ${sql.raw(spec.column)} ${sql.raw(spec.type)}`,
+      );
+      console.warn(
+        `[invariants] added missing column ${label} ${spec.type} — guards against ${spec.guards}`,
+      );
+      columnsAdded.push(label);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // Two boots racing the same ALTER: one wins, the loser sees "duplicate column
+      // name". The column is there, which is all we wanted, so that is not a failure.
+      if (/duplicate column name/i.test(msg)) {
+        columnsPresent.push(label);
+        continue;
+      }
+      console.error(`[invariants] CRITICAL failed to ensure column ${label}:`, msg);
+      failed.push({ index: label, error: msg });
+    }
+  }
+
+  INDEX_STATE.columnsPresent = columnsPresent;
+  INDEX_STATE.columnsAdded = columnsAdded;
+  return { columnsPresent, columnsAdded, failed };
+}
+
 /** Count logical keys that already have more than one row. */
 async function countDuplicateGroups(spec: IndexSpec): Promise<number> {
   const [a, b] = spec.columns;
@@ -140,7 +261,15 @@ async function countDuplicateGroups(spec: IndexSpec): Promise<number> {
 export async function ensureDatabaseInvariants(): Promise<IndexState> {
   INDEX_STATE.present = [];
   INDEX_STATE.created = [];
+  INDEX_STATE.columnsPresent = [];
+  INDEX_STATE.columnsAdded = [];
   INDEX_STATE.failed = [];
+
+  // Columns first: an index cannot be built on a column that is not there, and
+  // this call is idempotent so it is safe even though server.ts already ran it
+  // before listening (a restored/swapped database would be caught here).
+  const cols = await ensureRequiredColumns();
+  INDEX_STATE.failed.push(...cols.failed);
 
   for (const spec of REQUIRED_UNIQUE_INDEXES) {
     try {

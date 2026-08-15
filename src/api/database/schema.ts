@@ -219,6 +219,12 @@ export const attempts = sqliteTable(
     // later section change (e.g. promotion into ELITE) never retroactively relabels
     // historical results. Null on old rows -> reports fall back to current section.
     sectionSnapshot: text("section_snapshot"),
+    // Which option-order scheme the student's paper was rendered with (see
+    // lib/option-order.ts). Options are shuffled per student, so the review screen
+    // needs to know whether to show this attempt in its shuffled order or in the
+    // authored order. NULL on every attempt sat before shuffling existed, which is
+    // exactly what makes those reviews render unchanged.
+    optionOrder: text("option_order"),
     submittedAt: integer("submitted_at", { mode: "timestamp_ms" }),
     createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
   },

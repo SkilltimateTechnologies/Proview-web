@@ -1,6 +1,6 @@
 import app from "./api";
 import { sweepPendingGrading, startAutoSubmitSweep } from "./api/lib/grade-queue";
-import { ensureDatabaseInvariants } from "./api/database/invariants";
+import { ensureDatabaseInvariants, ensureRequiredColumns } from "./api/database/invariants";
 
 // Never let a transient background failure (e.g. a brief Turso/libsql socket
 // ECONNRESET during a background grading/auto-submit sweep) take down the whole
@@ -11,6 +11,20 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
 });
+
+// Additive schema repair has to happen BEFORE the first request is served, unlike
+// the index checks below. Drizzle lists every column of a table in its SELECT, so a
+// column that exists in `schema.ts` but not yet in the connected database makes
+// every query on that table fail with `no such column` — students would see errors
+// instead of their exam. Bounded and non-throwing: if the database is unreachable
+// at boot we still come up (Railway's healthcheck must be able to answer) and the
+// full check inside ensureDatabaseInvariants retries it a moment later.
+await Promise.race([
+  ensureRequiredColumns(),
+  new Promise((resolve) => setTimeout(resolve, 15_000)).then(() =>
+    console.error("[invariants] column check did not finish in 15s — serving anyway, will retry"),
+  ),
+]);
 
 const port = Number(process.env.PORT ?? 3000);
 const distDir = `${import.meta.dir}/../dist`;

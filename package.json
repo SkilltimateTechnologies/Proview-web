@@ -12,6 +12,8 @@
     "test": "bun test",
     "//verify:db": "Ops check, needs DATABASE_URL. Asserts the unique indexes exist and no duplicate/impossible-score rows are present. Add --race <url> to fire concurrent writes at a live server and prove the upserts hold. Run after any change to answer persistence, grading, or schema — and after provisioning or restoring a database.",
     "verify:db": "bun scripts/verify-invariants.ts",
+    "//verify:option-order": "Ops check, needs DATABASE_URL and a running server. Creates a throwaway exam from real MCQs, answers it by option TEXT as a real student over HTTP, and requires 100%. Run after ANY change to the bundle, autosave, submit, resume or review paths — the option permutation is display-only and a single inverted mapping would score every correct answer zero. Add --base <url> to hit a deployed server.",
+    "verify:option-order": "bun scripts/verify-option-order.ts",
     "//typecheck": "Root tsconfig.json is `files: []` + project references, so a bare `tsc --noEmit` type-checks NOTHING. It exited 0 while two undefined identifiers (retryCounts, gradeSubjective) were live in production. Always point tsc at a real project.",
     "typecheck": "bun run typecheck:api",
     "typecheck:api": "tsc --noEmit -p tsconfig.node.json",
