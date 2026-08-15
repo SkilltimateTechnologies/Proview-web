@@ -225,6 +225,14 @@ Polls therefore overlapped, requests stacked up, and the page stopped responding
   **10 concurrent polls 1,870 ms → 135 ms** (14x). The clone is a local file DB, so
   it understates the win — the real cost was network round trips, which the
   query-level numbers above measure.
+- **Re-verified before deploy, both heavy exams live at once** on a fresh clone
+  (44,884 integrity events, 2,325 attempts, 1,124 students): payload identical
+  between old and new code (559,997 bytes; 1,123 student rows; violation totals
+  725 / 368; 452 snapshots). Sequential polls **321 ms → 126 ms**, **10 concurrent
+  polls 2,786 ms → 222 ms** (12.5x). Against the *production* (remote) database the
+  old per-exam pull was **27,153 rows / 1,712,100 photo-key bytes in 1,954 ms** for
+  one exam, versus **247 ms** for the SQL aggregation that replaced it — and
+  `ROW_NUMBER()` runs on the Turso server, not just local sqlite.
 
 ---
 
