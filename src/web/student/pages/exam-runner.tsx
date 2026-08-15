@@ -3,7 +3,7 @@ import { useLocation, useParams } from "wouter";
 import { api, type Bundle, type BundleQuestion, type ProctorConfig, DEFAULT_PROCTORING } from "../lib/api";
 import { useSession } from "../lib/session";
 import { requestFullscreen, exitFullscreen, startWebcam, getDisplayCount, startProctoring, captureFrame, isCameraActive, createObstructionDetector, isFrameClear, watchCameraPermission, type FrameMetrics, type ProctorEvent, type WebcamHandle } from "../lib/proctor";
-import { classifyCameraError, cameraLostFailure, type CameraFailure } from "../lib/camera-failure";
+import { classifyCameraError, cameraLostFailure, escalateFailure, type CameraFailure } from "../lib/camera-failure";
 import { Icon, NetBadge, useOnline } from "../components/ui";
 
 type Phase = "brief" | "preflight" | "resume" | "running" | "validating" | "done";
@@ -449,7 +449,10 @@ export function ExamRunner() {
     const cfg = proctoringRef.current;
     if (submittedRef.current) return;
     setCamReady(false);
-    const fail = failure ?? cameraLostFailure(reason);
+    // Never let a second, vaguer detector talk over a known denial — revoking
+    // access also ends the track, so the generic "camera turned off" arrives a
+    // beat after the permission watcher has already named the real cause.
+    const fail = escalateFailure(camDeniedRef.current, failure ?? cameraLostFailure(reason));
     setCamFail(fail);
     // A denied permission is a separate offence from a camera that died: it can
     // only happen by choice, and it is the one state the retry button cannot fix.
@@ -1488,9 +1491,14 @@ export function ExamRunner() {
                 far more common than a genuine permission block, and it is the one
                 thing they can fix without an invigilator.
                 Hidden once the camera is back: instructions for a problem that no
-                longer exists are just noise in front of a running clock. */}
+                longer exists are just noise in front of a running clock.
+
+                listStyle is set explicitly because Tailwind's preflight resets
+                `ol` to list-style:none, which silently turned these numbered
+                steps into an unordered wall of text. A candidate under pressure
+                needs to see "try 1, then 2, then 3", not a paragraph. */}
             {!camBack && camFail && camFail.steps.length > 0 && (
-              <ol style={{ textAlign: "left", margin: "0 0 16px", padding: "14px 16px 14px 32px", background: "var(--color-danger-bg)", borderRadius: 10, color: "var(--color-ink)", fontSize: 13, lineHeight: 1.65 }}>
+              <ol style={{ textAlign: "left", margin: "0 0 16px", padding: "14px 16px 14px 32px", background: "var(--color-danger-bg)", borderRadius: 10, color: "var(--color-ink)", fontSize: 13, lineHeight: 1.65, listStyle: "decimal outside" }}>
                 {camFail.steps.map((s, i) => <li key={i} style={{ marginBottom: i === camFail.steps.length - 1 ? 0 : 6 }}>{s}</li>)}
               </ol>
             )}

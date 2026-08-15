@@ -583,7 +583,7 @@ achievable from the seat.
    needed no change: blocking the camera buys no thinking time. The overlay says
    so explicitly.
 
-### Three defects found while verifying, all fixed
+### Four defects found while verifying, all fixed
 
 - **Evidence was thrown away when the freeze was off.** `engageLock` returned
   early on `!blockOnCameraLoss` *before recording anything*, so an exam with
@@ -607,10 +607,24 @@ achievable from the seat.
   while already locked. Recovery is unaffected: the unlock loop re-reads the live
   track via `isCameraActive`, so an OS un-mute is still noticed, and every
   re-acquisition builds a fresh handle with a fresh latch.
+- **The correct diagnosis was overwritten ~1.5s later by the vague one.** Found
+  only by scripting the *combined* real-world scenario, which the earlier browser
+  pass had not covered: it flipped the permission to `denied` but left the track
+  alive. Chromium does both — revoking access also **ends the live track**. So
+  the permission watcher correctly showed *"Camera access is blocked"*, and then
+  the track poll fired `engageLock` again with the generic
+  `cameraLostFailure`, which replaced `camFail` wholesale. The student ended up
+  looking at *"Camera turned off"*, hardware advice for a permission problem,
+  **and the countdown back on screen** — the exact two things this incident was
+  raised to fix. `escalateFailure(previouslyDenied, incoming)` now guards the
+  latch: once access is known to be denied, only a real diagnosis
+  (`no_device`, `in_use`, `unsupported`) may replace it, never the
+  non-diagnosis `unknown`. Deliberately narrow — a webcam genuinely unplugged
+  after a denial is a new fact the student needs.
 
 ### Verification
 
-`camera-failure.test.ts`, 34 tests: every `DOMException.name` maps to the right
+`camera-failure.test.ts`, 39 tests: every `DOMException.name` maps to the right
 code; a real `DOMException` classifies the same as a plain object; non-Error
 inputs (`null`, `undefined`, `""`, numbers, `Symbol`, `[]`, a numeric `name`)
 never throw; every branch returns non-empty steps, always names a way out, and
@@ -623,24 +637,40 @@ relaunch instruction, swapping the relaunch step for address-bar advice, droppin
 either 200-char cap, making `cameraLostFailure` accuse the candidate, and letting
 `OverconstrainedError`/`AbortError` fall through.
 
-Then driven in a real Chromium against a throwaway student and exam, from login
-through the brief and the preflight gate into a running exam, with a stubbed
-Permissions API and a `getUserMedia` that rejects `NotAllowedError` the way a
-recorded Block does. **21/21 browser checks passed** across two scenarios:
+Then driven in a **real Chromium** against a throwaway SQLite database seeded
+with a live exam — full student flow: login, first-sign-in password gate, the
+brief, the preflight system check with a fake camera device, into a running
+attempt. The camera is then blocked the way Chromium actually does it: a stubbed
+Permissions API flips to `denied`, `getUserMedia` starts rejecting
+`NotAllowedError`, **and the live track is stopped**. Kept as
+`scripts/verify-camera-block.py` (`bun run verify:camera-block`) because none of
+this is reachable from a unit test.
 
-- *Deliberate block:* overlay up, title "Camera access is blocked", 4 kiosk-true
-  steps, no countdown, no dismiss control, exam controls confirmed unreachable
-  via `elementFromPoint`, exam timer still counting down, exactly one
-  `camera_blocked` row, copy switching to "Camera is back" on grant, and the
-  overlay clearing itself with **no click** followed by one `camera_restored`.
-- *Track death, no permission change:* stays neutral ("Camera turned off"), shows
-  the countdown, records exactly **one** `camera_lost` (two before the latch fix).
+**The first run of that script failed 2 of 15 checks** — title and countdown —
+which is what uncovered the fourth defect above. A previous browser pass had
+missed it by revoking permission without ending the track, so the two detectors
+never raced. After the `escalateFailure` fix, **15/15 pass**:
 
-Admin surfaces confirmed in-browser: Live Monitor renders "Camera access
-blocked", the report timeline renders "Camera access blocked by candidate", both
-with the detail string. Fixture torn down and verified gone; 0 `in_progress`
-attempts left behind.
+- Overlay up and covering the viewport; `elementFromPoint` at the exam controls
+  returns the overlay, so nothing underneath is clickable.
+- Title *"Camera access is blocked"*, four kiosk-true numbered steps, and no
+  step naming the address bar, padlock, site settings or a lock icon.
+- **No countdown** — asserted absent, not merely unread.
+- No dismiss control; the only button is "I've turned my camera back on".
+- Exam timer confirmed still counting down while locked (59:48 → 59:44).
+- Exactly one `camera_blocked` row in `integrity_events`, detail *"Camera access
+  blocked by the candidate (permission denied)"*.
+- On regaining access the overlay switches to "Camera is back" **with no click**.
 
-Gates: `bun run typecheck:api` clean, `bun test` 90/90, `vite build` clean, and
-`typecheck:web` held at its pre-existing **57** errors (confirmed by a `git
-stash` A/B — the app code adds none).
+`escalateFailure` is covered by 5 unit tests and **mutation tested, 3/3 killed**:
+making it a no-op (which reproduces the original bug), escalating everything
+(which would hide a real `no_device`), and ignoring the latch.
+
+One cosmetic bug caught in the screenshot: Tailwind's preflight resets `ol` to
+`list-style:none`, so the numbered remedies rendered as an unbroken wall of
+text. `listStyle` is now set explicitly and the steps read 1–4.
+
+Gates: `bun run typecheck:api` clean, `bun test` **95/95**, `vite build` clean,
+and `typecheck:web` held at its pre-existing **57** errors (the app code adds
+none — an earlier reading of 8 was tsc bailing out on a syntax error, not an
+improvement).

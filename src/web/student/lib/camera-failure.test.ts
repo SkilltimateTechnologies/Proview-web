@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { type CameraFailure, cameraLostFailure, classifyCameraError } from "./camera-failure";
+import { type CameraFailure, cameraLostFailure, classifyCameraError, escalateFailure } from "./camera-failure";
 
 /**
  * These tests guard two promises the overlay makes to a candidate sitting in a
@@ -197,5 +197,55 @@ describe("every failure is safe to show inside SEB", () => {
       expect(fail.eventDetail.length).toBeGreaterThan(0);
       expect(fail.eventDetail.length).toBeLessThanOrEqual(200);
     }
+  });
+});
+
+/**
+ * Regression: caught by driving a real browser through a live exam, not by
+ * reading the code. Blocking the camera mid-exam showed the generic "Camera
+ * turned off" with a running countdown instead of "Camera access is blocked" —
+ * because revoking access in Chromium ALSO ends the track, so the vague
+ * track-poll detector fired ~1.5s after the permission watcher and overwrote the
+ * correct diagnosis. The student was then told to open a privacy shutter they
+ * had never closed, and shown a clock that could not help them.
+ */
+describe("escalateFailure — a known denial is not talked over", () => {
+  const denied = classifyCameraError({ name: "NotAllowedError" });
+
+  test("the vague track-poll report cannot overwrite a known denial", () => {
+    const vague = cameraLostFailure("track ended");
+    expect(vague.code).toBe("unknown"); // the exact report that caused the bug
+    const shown = escalateFailure(true, vague);
+    expect(shown.code).toBe("permission_denied");
+    expect(shown.title).toBe(denied.title);
+  });
+
+  test("without a prior denial the incoming report is shown unchanged", () => {
+    const vague = cameraLostFailure("track ended");
+    expect(escalateFailure(false, vague)).toBe(vague);
+  });
+
+  test("a denial reported again stays the same failure", () => {
+    expect(escalateFailure(true, denied)).toBe(denied);
+  });
+
+  test("a real new diagnosis after a denial is still allowed through", () => {
+    // Only the non-diagnosis is overridden: an unplugged or busy camera is a new
+    // fact the student needs, and suppressing it would show the wrong remedy.
+    for (const name of ["NotFoundError", "NotReadableError", "TypeError"]) {
+      const incoming = classifyCameraError({ name });
+      expect(incoming.code).not.toBe("unknown");
+      expect(escalateFailure(true, incoming)).toBe(incoming);
+    }
+  });
+
+  test("the escalated failure never shows a step the kiosk hides", () => {
+    const shown = escalateFailure(true, cameraLostFailure("track ended"));
+    for (const step of shown.steps) {
+      for (const banned of IMPOSSIBLE_UI) {
+        expect(step.toLowerCase()).not.toContain(banned);
+      }
+    }
+    expect(shown.needsInvigilator).toBe(true);
   });
 });

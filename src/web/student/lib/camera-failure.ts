@@ -150,6 +150,33 @@ export function classifyCameraError(err: unknown): CameraFailure {
 }
 
 /**
+ * Decide which diagnosis wins when a second detector reports a failure for an
+ * incident the first one has already explained.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * Two independent detectors notice a dead camera, and one incident routinely
+ * trips both. Revoking camera access in Chromium does not just make
+ * `getUserMedia` reject — it ENDS the live track too. So the permission watcher
+ * correctly reports "access is blocked", and up to 1.5s later the track poll
+ * reports the vague "camera stopped sending video" for the very same act.
+ *
+ * Letting the later, vaguer report win was a real regression, caught driving a
+ * browser: the overlay flipped back to hardware advice ("open your privacy
+ * shutter") for a student who had blocked permission, and re-showed a countdown
+ * that could never fix it. Once we KNOW access was denied, only a real
+ * diagnosis may replace it — never the absence of one.
+ *
+ * Deliberately narrow: a genuine `no_device` or `in_use` after a denial is a new
+ * fact worth showing, so only the non-diagnosis ("unknown") is talked over.
+ */
+export function escalateFailure(previouslyDenied: boolean, incoming: CameraFailure): CameraFailure {
+  if (!previouslyDenied) return incoming;
+  if (incoming.code !== "unknown") return incoming;
+  return classifyCameraError({ name: "NotAllowedError" });
+}
+
+/**
  * The failure to show when the camera dies mid-exam but nothing threw — the track
  * ended or went muted, which is what an OS privacy toggle, a closed shutter and a
  * yanked USB cable all look like from JavaScript.
