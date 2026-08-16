@@ -134,7 +134,7 @@ the type for the whole exam after the first loss.
 - [x] wired into `engageLock` + a dedicated 2s camera-health feeder
 - [x] browser-verified — `scripts/verify-camera-episode.py`, 14/14 checks
 - [x] mutation-tested the browser check itself — `scripts/mutate-verify-camera-episode.sh`, 2/2 killed
-- [ ] gates, commit, push, prod verify
+- [x] gates, commit, push, prod verify — see below
 - [ ] re-run the cadence audit after the next real exam: `camera_lost` must stop
       tripping the SUSPECT rule
 
@@ -149,3 +149,40 @@ the type for the whole exam after the first loss.
 
 Measured effect on the case that started this: 5 lock cycles wrote **1** row
 instead of 5, and a genuinely separate failure afterwards still wrote its own.
+
+## Shipped
+
+Commit `324ba0f`, pushed to `main` 16 Aug 11:2x UTC. Railway rebuilt on the push:
+boot check `2026-08-16T11:16:44Z`, bundle `index-CjmUoJZ6.js` -> `index-JyX1_AkR.js`.
+
+Gates at `324ba0f`: `typecheck:api` exit 0 · `bun test` **136 pass / 0 fail**
+(3235 expects, 7 files, was 117/6) · `build` exit 0 · `typecheck:web` **57**
+(pre-existing baseline, unchanged).
+
+Prod verified after the deploy:
+
+- `/api/health` → `status: ok`, `invariants.ok: true`
+- `/api/admin/invariants` → `ok:true`, all 3 unique indexes present,
+  `failed: []`, every `duplicateGroups: 0`
+- `/api/monitor` → `live: []`, `degraded:false`, `lastBuildMs 463` (budget 2500)
+
+The deployed bundle was read back and the machine is in it — minified names
+differ from a local build, the logic is byte-identical:
+
+```
+const XKe=1e4,_D=()=>({lost:!1,recorded:null,liveSince:null});
+function YKe(e,t,n){const a=e.lost&&e.recorded==="camera_lost"&&t==="camera_blocked",i=!e.lost||a;
+  return{record:i,episode:{lost:!0,recorded:i?t:e.recorded,liveSince:null}}}
+function QKe(e,t,n){return t?e.lost?e.liveSince===null?{...e,liveSince:n}
+  :n-e.liveSince>=XKe?_D():e:e:e.liveSince===null?e:{...e,liveSince:null}}
+```
+
+and all three wiring points are live in it too: the gated write
+(`Ke=YKe(ce.current,...)` … `Ke.record&&wn.current(...)`), the 2s feeder
+(`setInterval(...QKe(ce.current,dp(me.current),Date.now())...,2e3)`), and the
+per-attempt reset (`ce.current=_D()`).
+
+Left open on purpose: `camera_blocked` / `camera_obstructed` have still never
+been seen rendering in the LIVE prod Live Monitor, because no real event of
+either type exists in prod. Proven locally (16/16) and the strings are in the
+deployed bundle.

@@ -861,3 +861,12 @@ The 14 Aug rows are not being retro-edited. They are the historical record, the
 timeline already groups them, and the count that misleads is computed live — so
 it corrects itself from the next exam onward. Re-run the cadence audit after the
 next real exam: `camera_lost` should no longer trip the SUSPECT rule.
+
+Shipped as `324ba0f`. Gates: `typecheck:api` 0 · `bun test` 136 pass / 0 fail
+(was 117) · `build` 0 · `typecheck:web` 57 (baseline held). Prod rebuilt on the
+push — boot check `2026-08-16T11:16:44Z`, bundle `index-JyX1_AkR.js`. Verified
+after the deploy: `/api/health` ok with `invariants.ok:true`,
+`/api/admin/invariants` `ok:true` with all 3 unique indexes present and every
+`duplicateGroups` 0, `/api/monitor` `live:[] degraded:false lastBuildMs 463`.
+The deployed bundle was read back and contains the episode machine and all three
+wiring points — the gated write, the 2s feeder, and the per-attempt reset.
