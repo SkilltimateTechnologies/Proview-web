@@ -164,8 +164,9 @@ export default function Settings() {
             </span>
           </Field>
         )}
-        {pc.requireWebcam && pc.webcamSnapshots && (
-          <Toggle label="Detect a blocked camera" sub="A camera covered with tape or paper still reports as working, so Proview checks the picture itself and flags a frame that is flat or black. Recorded for review with a warning to the student — it never locks the exam, because a dark room looks the same. Turn off for poorly lit exam halls." checked={pc.detectCameraBlock} onChange={(v) => setPc({ detectCameraBlock: v })} />
+        {pc.requireWebcam && (
+          <Toggle label="Detect a blocked camera" sub="A camera covered with tape or paper still reports as working, so Proview checks the picture itself every 10 seconds and flags a frame that is flat or black. A covered lens LOCKS the exam for 2 minutes — served in full even if the student uncovers it immediately, and repeated while it stays covered — with the exam timer still running. A dark room looks the same to the check, so an unlit hall costs a student 2 minutes: turn this off for poorly lit venues. Checking needs no snapshots; the evidence frame saved with each flag does."
+            checked={pc.detectCameraBlock} onChange={(v) => setPc({ detectCameraBlock: v })} />
         )}
 
         {/* --- Connection & auto-actions --- */}

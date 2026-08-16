@@ -713,3 +713,78 @@ of my own**, which is the real value of the exercise:
 After tightening, each mutant is killed by 2 checks, and the restored source
 passes 16/16. Re-seed between runs: a leftover `in_progress` attempt turns the
 student's Start button into Resume and phase A times out.
+
+### The other camera failure: a lens that is simply covered
+
+The block work above is about a camera that is **dead** — permission denied, the
+track ended, the browser tells us so. It says nothing about the cheaper trick:
+leave the camera running and put tape, a sticky note or a hand over the lens. The
+track stays `live` and unmuted, frames keep arriving, every track-level signal
+reports a healthy camera. Only the picture knows, and until now the response to
+that picture was a warning the candidate could click away.
+
+**It was not a control.** After 60s the overlay offered *"My room is just dim —
+continue the exam"*. A candidate covering their lens deliberately only had to
+wait one minute and click. The detector produced a flag for the reviewer and
+nothing else, which is the same as producing nothing while the exam is live.
+
+The lock is now a **timer, and only a timer**:
+
+- A covered lens locks the exam for **two minutes**, with the countdown on screen.
+- There is **no dismiss control** of any kind.
+- **Uncovering early does not release it.** This is the part that makes it work.
+  If early release were allowed the optimal cheat would be: cover, do the thing,
+  uncover, resume — the lock would cost nothing. The period IS the penalty, and
+  the exam timer keeps running underneath it.
+- Still covered when the period expires? Another two minutes, repeating for as
+  long as the lens stays covered.
+
+The uncomfortable part, stated plainly: **the detector cannot tell a taped lens
+from an unlit room.** Both are flat, dark frames. So this deliberately punishes a
+candidate sitting in the dark — they lose two minutes and are told to turn on a
+light. What it never does is lock them out of their paper: it is a pure timer, so
+they always get back in. That trade is the whole reason there is no "my room is
+dim" button. The old button was an escape hatch for exactly the person it was
+built to catch, and it is worth two minutes of an honest candidate's time to
+close it. Venues that cannot light a hall should turn the check off in Settings —
+whose help text claimed "it never locks the exam" and has been rewritten.
+
+A **frozen** feed (a still image or virtual camera injected into the stream) is
+flagged and warned about, but deliberately does **not** lock: unlike a covered
+lens, a candidate cannot fix a driver repeating a frame from their chair, and a
+repeating lock with no available remedy is a lockout, not a penalty.
+
+Detection went from ~54-81s to **~30s**, by splitting the two things the webcam
+loop was doing at once. `grabFrame` used to upload every frame it analysed, so
+sampling faster meant uploading faster — a 150-candidate hall would have gone
+from ~333 to ~900 uploads a minute, with R2 and the reviewer's ZIP growing to
+match. Analysis is a local canvas read that never touches the server, so it is
+now its own 10s loop (`analyzeOnly`) and the 27s upload loop is untouched. One
+consequence worth naming: the analysis loop is the **sole** producer feeding the
+detector. Two producers on different clocks would make its "3 consecutive bad
+frames" rule meaningless, so `capturePeriodic` no longer pushes into it.
+
+The lock machine is DOM-free in `src/web/student/lib/obstruction-lock.ts` — 22
+unit tests, **5/5 mutants killed** (release while still covered, drop the
+early-tick guard, extend from `until` instead of `now`, make `isLocked` inclusive
+at the deadline, unclamp the remaining time).
+
+But a state machine passing tests proves nothing about what a candidate can do
+with a mouse, so `scripts/verify-camera-covered.py` (`bun run
+verify:camera-covered`) drives a real Chromium through a real attempt and covers
+the lens at the pixel boundary. **24/24 pass**, including: the lock appears 25s
+after covering, the countdown starts at `2:00` and ticks, the overlay contains
+**zero** buttons or links, uncovering at 25s leaves it locked with 90s still to
+serve, it releases only after the full period, and covering again then holding
+through expiry sends the countdown from 1s back over 100s without the overlay
+ever dropping.
+
+**Mutation tested, 2/2 killed**, both restoring exactly the behaviour that was
+removed: re-adding the "my room is just dim" button was caught by the
+no-controls check, and releasing the lock as soon as the lens reads clear was
+caught by the early-uncover check.
+
+It takes ~6 minutes to run, because the lock is two real minutes and there is no
+way to shorten it from the page. That is not an oversight — a test hook that
+shortens a lock is a cheat vector, since anything the script can call from the
+page a candidate can call from a console.
