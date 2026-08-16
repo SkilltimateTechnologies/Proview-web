@@ -788,3 +788,76 @@ It takes ~6 minutes to run, because the lock is two real minutes and there is no
 way to shorten it from the page. That is not an oversight — a test hook that
 shortens a lock is a cheat vector, since anything the script can call from the
 page a candidate can call from a console.
+
+### One broken webcam, forty-three violations
+
+Pulled the numbers to confirm a backlog item ("recount violations now that
+`focus_loss` is non-scoring") and found it was already a no-op — counts are
+computed live in SQL, there is no denormalised column, every read already
+excludes the type. The audit that proved it surfaced something worse.
+
+`scripts/audit-violation-cadence.py` asks of every event type in a finished exam:
+does this repeat on a machine-regular cadence, or at irregular human intervals?
+Against prod exam `ex_de2e60a8be504057` (186 attempts), `camera_lost` had the
+exact signature `focus_loss` was demoted for — **65% of gaps within 1s of a 60.0s
+median, longest run 36 consecutive gaps** — while the genuinely human types were
+irregular (`context_menu` 3%, `copy_in_answer` 0%, `tab_switch` 0%).
+
+The top of that exam's violation table:
+
+```
+  46  23K91A66K3  camera_lost=43, focus_loss=32     <- one failing webcam
+  21  24K95A6612  camera_lost=20
+  16  23K91A66C8  paste_in_answer=9, copy_in_answer=5, cut=1   <- the actual case
+```
+
+42 of those 43 rows carry the identical detail "Camera disconnected". **The harm
+is the ordering**: a TPO scanning "most violations" sees two students with broken
+hardware above the one student in the hall with a real copy/paste pattern. The
+flag that should start an investigation is buried under noise from a USB port.
+
+`camera_lost` still scores — a camera dying mid-exam is a real integrity gap. The
+duplicate billing is what is wrong, and the existing per-handle latch in
+`startWebcam` cannot fix it: the unlock poll builds a **new handle with a new
+latch** every 2.5s, and in `engageLock` the `lockedRef` guard sits below the
+record call by design (it only protects the countdown). So the rule moved into a
+DOM-free machine, `src/web/student/lib/camera-episode.ts`: one row per
+**episode**, one permitted escalation `camera_lost` → `camera_blocked`, never a
+de-escalation. 19 unit tests, **8/8 mutants killed**.
+
+**The unit tests were not enough, and this is the part worth remembering.** The
+first version also cleared the episode when the exam unlocked, reasoning that
+resuming is unambiguous proof the camera is back. `scripts/verify-camera-episode.py`
+— real Chromium, real attempt, a webcam faked to die 700ms after every open —
+failed it on the first run: five lock cycles, five rows.
+
+```
+camera_lost  ->  15s lock  ->  camera_restored  ->  dead 700ms later  ->  camera_lost
+```
+
+One row per lock period. Which is **precisely the 60.0s cadence measured on prod**,
+where the lock is 60s: the unlock was never the cure, it was the storm's clock.
+The unlock poll releases on a *single instantaneous* `isCameraActive()` reading,
+and a flapping camera hands it one every time the device is re-opened. `onRestored()`
+was deleted; an episode now ends only after the camera stays continuously live for
+10s, which a real recovery clears within seconds of the unlock anyway.
+
+That reading has to arrive even while the exam is locked, so it comes from a
+dedicated 2s feeder rather than an existing loop — the snapshot tick skips while
+`lockedRef` is set, and the obstruction loop is gated on `detectCameraBlock`.
+
+`bun run verify:camera-episode` now passes **14/14**: one row across five
+lock/re-open cycles, with the `camera_restored` count proving the failure really
+did recur (otherwise "1 row" is also what you get when nothing ever retried), and
+a genuinely new failure after a real recovery still getting its own row. The
+browser check is itself mutation tested (`scripts/mutate-verify-camera-episode.sh`,
+**2/2 killed**): restoring the original bug, and restoring the unlock-resets-the-
+episode leak. Its harness bundles with `vite build` directly rather than
+`bun run build`, because the latter runs the unit suite first and mutant 1 is a
+bug the unit tests already kill — the build would abort before the browser ever
+opened.
+
+The 14 Aug rows are not being retro-edited. They are the historical record, the
+timeline already groups them, and the count that misleads is computed live — so
+it corrects itself from the next exam onward. Re-run the cadence audit after the
+next real exam: `camera_lost` should no longer trip the SUSPECT rule.

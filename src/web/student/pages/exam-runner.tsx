@@ -5,6 +5,7 @@ import { useSession } from "../lib/session";
 import { requestFullscreen, exitFullscreen, startWebcam, getDisplayCount, startProctoring, captureFrame, isCameraActive, createObstructionDetector, isFrameClear, watchCameraPermission, type FrameMetrics, type ProctorEvent, type WebcamHandle } from "../lib/proctor";
 import { OBSTRUCTION_LOCK_MS, startLock, isLocked, lockRemainingMs, nextLockState, formatLockClock, type ObstructionLock } from "../lib/obstruction-lock";
 import { classifyCameraError, cameraLostFailure, escalateFailure, type CameraFailure } from "../lib/camera-failure";
+import { freshEpisode, onLoss, onCameraSeen } from "../lib/camera-episode";
 import { Icon, NetBadge, useOnline } from "../components/ui";
 
 type Phase = "brief" | "preflight" | "resume" | "running" | "validating" | "done";
@@ -183,6 +184,11 @@ export function ExamRunner() {
   // the multi-monitor check this FLAGS and warns — it never locks the exam, because
   // an unlit room is a legitimate false positive.
   const obstructionRef = useRef(createObstructionDetector());
+  // One camera failure = one violation. See camera-episode.ts: a webcam that can
+  // be opened but dies immediately used to write a fresh row every few seconds,
+  // because every detector — and every re-acquired handle from the 2.5s recovery
+  // poll — carries its own "report once" latch.
+  const camEpisodeRef = useRef(freshEpisode());
   const [camBlocked, setCamBlocked] = useState<string | null>(null);
   // A covered lens LOCKS the exam for a strict two minutes (see obstruction-lock.ts
   // for why there is no dismiss and why uncovering early does not release). Held in
@@ -496,7 +502,18 @@ export function ExamRunner() {
     // invigilator gets to see: an exam with that toggle off used to swallow a
     // deliberate camera block entirely, leaving no trace in the timeline or the
     // report. Evidence is always kept; only the freeze is optional.
-    recordEventRef.current(denied ? "camera_blocked" : "camera_lost", fail.eventDetail, { snapshot: true, minGapMs: 3000 });
+    //
+    // ONE row per episode, not one per detection. Three separate detectors watch
+    // this (the per-handle track poll, the permission watcher, the 2.5s recovery
+    // poll that re-opens the device with a brand-new latch), so a single failing
+    // webcam used to bill the same student over and over — 43 rows in one measured
+    // exam, enough to outrank the only real copy/paste case in the hall. The
+    // episode state machine decides what is new; minGapMs stays as a second belt.
+    const loss = onLoss(camEpisodeRef.current, denied ? "camera_blocked" : "camera_lost");
+    camEpisodeRef.current = loss.episode;
+    if (loss.record) {
+      recordEventRef.current(denied ? "camera_blocked" : "camera_lost", fail.eventDetail, { snapshot: true, minGapMs: 3000 });
+    }
     if (!cfg.blockOnCameraLoss) {
       // Warn and carry on. The status pill already reads "Camera off".
       pushAlert(denied ? "Camera access is blocked. This has been recorded for review." : `Camera turned off. ${reason}`, "danger");
@@ -647,6 +664,7 @@ export function ExamRunner() {
       }
       // Fresh detector state for the exam itself — gate readings must not carry over.
       obstructionRef.current.reset();
+      camEpisodeRef.current = freshEpisode();
       setCamBlocked(null);
       // Record the setup we started with, so the report shows the conditions.
       if (startDisplays > 1) {
@@ -794,6 +812,12 @@ export function ExamRunner() {
       setCamReady(true);
       setCamError("");
       setCamBack(false);
+      // NOTE: the camera episode is deliberately NOT reset here. Reaching this line
+      // means the poll got ONE live reading, which a camera that dies a moment after
+      // every open supplies on every attempt — resetting here billed a fresh
+      // `camera_lost` once per lock period. The episode ends only after the camera
+      // has stayed continuously live (camera-episode.ts), which a working camera
+      // does within seconds of this point anyway.
       recordEventRef.current("camera_restored", "Camera restored — exam resumed");
       pushAlert("Camera restored — exam resumed. This was recorded.", "warn");
       if (proctoringRef.current.fullscreenRequired) void requestFullscreen();
@@ -1074,6 +1098,23 @@ export function ExamRunner() {
     if (phase !== "running" || !proctoringRef.current.requireWebcam) return;
     if (webcamRef.current) attachVideo(webcamRef.current);
   }, [phase, attachVideo]);
+
+  // ---- Camera-health feeder: when is a camera incident actually OVER? ----
+  //
+  // Deliberately its own loop rather than a line inside an existing one. The
+  // snapshot tick skips while `lockedRef` is set and the obstruction loop is
+  // gated on detectCameraBlock — but the state machine needs an unbroken stream
+  // of readings precisely while the exam IS locked, since that is when a flapping
+  // camera is being re-acquired every 2.5s. Track state is read straight off the
+  // handle (no capture, no upload), so 2s costs nothing.
+  useEffect(() => {
+    if (phase !== "running" || !proctoringRef.current.requireWebcam) return;
+    const t = setInterval(() => {
+      if (submittedRef.current) return;
+      camEpisodeRef.current = onCameraSeen(camEpisodeRef.current, isCameraActive(webcamRef.current), Date.now());
+    }, 2000);
+    return () => clearInterval(t);
+  }, [phase]);
 
   // Cleanup webcam + lock timer on unmount.
   useEffect(() => {
