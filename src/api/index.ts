@@ -66,10 +66,13 @@ const FRAME_EVENT_TYPES = ["periodic_snapshot", "preflight_snapshot"] as const;
 const isFrameEvent = (t: string) => (FRAME_EVENT_TYPES as readonly string[]).includes(t);
 // Informational rows that belong on the integrity timeline (a reviewer wants to
 // see when a blocked camera view cleared) but are not themselves violations.
-// `camera_block_dismissed` is the student's own claim that the room is merely dim,
-// recorded so a reviewer can weigh it. It is context for the `camera_obstructed`
-// row that always precedes it, not a second offence, so counting it too would
-// double-count a single episode.
+// `camera_block_dismissed` is retired: it was the student's own claim that the room
+// was merely dim, written when a covered lens was dismissable after 60s. Covering the
+// lens now locks the exam outright and nothing emits this type any more. It stays in
+// this set so the rows already in the table keep scoring the way they did when they
+// were written — it was context for the `camera_obstructed` row that always precedes
+// it, not a second offence, and counting it now would retroactively double-count a
+// single episode for students who sat the exam under the old rule.
 // `focus_loss` is window.blur, which fires for things the student does not control:
 // an OS/antivirus/notification toast stealing focus. Measured live, 36 attempts logged
 // it on a near-perfect 60s cadence (median gap 60.0s, each machine with its own fixed
