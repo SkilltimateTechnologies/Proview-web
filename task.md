@@ -674,3 +674,42 @@ Gates: `bun run typecheck:api` clean, `bun test` **95/95**, `vite build` clean,
 and `typecheck:web` held at its pre-existing **57** errors (the app code adds
 none — an earlier reading of 8 was tsc bailing out on a syntax error, not an
 improvement).
+
+#### The invigilator's half of the same promise
+
+Stopping the candidate is only half of it: if a block never surfaces on the Live
+Monitor, an invigilator cannot act on it and the evidence is invisible until
+after the exam. That path was previously argued from the diff, never observed —
+and it is not obvious, because the monitor drawer loads its events from the
+**reports** endpoint (`/api/reports/:examId/attempt/:attemptId`), not from
+`/api/monitor`. `EVENT_LABEL` can be perfectly correct while the data never
+arrives.
+
+`scripts/verify-monitor-camera-block.py` (`bun run verify:monitor-camera-block`)
+now drives both sides in one run: phase A blocks a real candidate's camera,
+phase B signs in as the tenant admin and asserts what they see. **16/16 pass**:
+
+- `/api/monitor` lists the exam as live and the candidate as `in_progress`, with
+  `violations: 1` and an `examId` (without which the drawer cannot load evidence).
+- The reports endpoint returns exactly `['camera_blocked']`.
+- The row's **FLAGS cell reads `1`** — visible without opening anything.
+- The drawer's title element reads *"Camera access blocked"*, not the raw
+  `camera_blocked`, with detail *"…by the candidate (permission denied)"*, and
+  the badge computes to `rgb(192, 69, 59)` — serious red, not routine amber.
+- It never falls back to "No violations recorded".
+
+**Mutation tested, 2/2 killed — and both mutants first exposed a vacuous check
+of my own**, which is the real value of the exercise:
+
+1. Removing `camera_blocked` from `EVENT_LABEL` + `SERIOUS` initially killed only
+   the colour check. The label assertion searched the whole page for "Camera
+   access blocked" — but the *detail* line starts with those exact words, so it
+   passed with the label gone. It now asserts on the title **element**.
+2. Adding `camera_blocked` to `NON_VIOLATION_TYPES` initially killed only the API
+   count check. The row assertion looked for `"1"` anywhere in the row text and
+   matched the **roll number** `STU-21CS102`, passing while the cell displayed
+   "Clean". It now reads the FLAGS cell by its column header.
+
+After tightening, each mutant is killed by 2 checks, and the restored source
+passes 16/16. Re-seed between runs: a leftover `in_progress` attempt turns the
+student's Start button into Resume and phase A times out.
