@@ -73,6 +73,36 @@ export const REQUIRED_UNIQUE_INDEXES: IndexSpec[] = [
   },
 ];
 
+/**
+ * Non-unique indexes the app needs to stay fast enough to serve a full exam hall.
+ *
+ * Same deploy problem as the unique indexes above: `schema.ts` declaring an index
+ * only affects databases someone remembers to `db:push`, and there is no migrate
+ * step, so production would never get them. Unlike the unique ones these carry NO
+ * correctness weight — a missing perf index makes the app slow, not wrong — so a
+ * failure here is reported but must never flip `/api/health` to 503.
+ *
+ * Keep in sync with the `index(...)` declarations in `schema.ts`.
+ */
+export const REQUIRED_PERF_INDEXES: IndexSpec[] = [
+  {
+    name: "integrity_attempt_type_idx",
+    table: "integrity_events",
+    columns: ["attempt_id", "type"],
+    guards:
+      "the Live Monitor's per-attempt violation count scanning every integrity row " +
+      "of every attempt (hundreds of thousands of rows in a 1000-student exam)",
+  },
+  {
+    name: "integrity_attempt_at_idx",
+    table: "integrity_events",
+    columns: ["attempt_id", "at"],
+    guards:
+      "the every-10s event-flush dedupe re-reading an attempt's entire event history " +
+      "instead of the recent window it can actually collide with",
+  },
+];
+
 type ColumnSpec = {
   table: string;
   column: string;
@@ -114,6 +144,8 @@ export type IndexState = {
   ok: boolean;
   present: string[];
   created: string[];
+  /** Performance indexes: informational only, never part of `ok`. */
+  perf: { present: string[]; created: string[]; failed: { index: string; error: string }[] };
   /** Columns already on the connected database, as `table.column`. */
   columnsPresent: string[];
   /** Columns this boot had to add, as `table.column`. */
@@ -126,6 +158,7 @@ export const INDEX_STATE: IndexState = {
   ok: false,
   present: [],
   created: [],
+  perf: { present: [], created: [], failed: [] },
   columnsPresent: [],
   columnsAdded: [],
   failed: [],
@@ -239,6 +272,42 @@ export async function ensureRequiredColumns(): Promise<Pick<IndexState, "columns
   return { columnsPresent, columnsAdded, failed };
 }
 
+/**
+ * Ensure the performance indexes exist. Idempotent, never throws, and never
+ * affects `INDEX_STATE.ok` — this is speed, not correctness. A non-unique
+ * `CREATE INDEX IF NOT EXISTS` cannot fail on existing data the way a unique one
+ * can, so there is no duplicate pre-check to do here.
+ */
+async function ensurePerformanceIndexes(): Promise<void> {
+  const present: string[] = [];
+  const created: string[] = [];
+  const failed: { index: string; error: string }[] = [];
+
+  for (const spec of REQUIRED_PERF_INDEXES) {
+    try {
+      if ((await indexDefinition(spec.name)) !== null) {
+        present.push(spec.name);
+        continue;
+      }
+      await db.run(
+        sql`CREATE INDEX IF NOT EXISTS ${sql.raw(spec.name)} ON ${sql.raw(spec.table)} (${sql.raw(spec.columns.join(", "))})`,
+      );
+      console.warn(
+        `[invariants] created missing performance index ${spec.name} on ` +
+          `${spec.table}(${spec.columns.join(", ")}) — guards against ${spec.guards}`,
+      );
+      created.push(spec.name);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // Slow is survivable; do not let this stop the exam server.
+      console.error(`[invariants] could not ensure performance index ${spec.name}:`, msg);
+      failed.push({ index: spec.name, error: msg });
+    }
+  }
+
+  INDEX_STATE.perf = { present, created, failed };
+}
+
 /** Count logical keys that already have more than one row. */
 async function countDuplicateGroups(spec: IndexSpec): Promise<number> {
   const [a, b] = spec.columns;
@@ -264,6 +333,7 @@ export async function ensureDatabaseInvariants(): Promise<IndexState> {
   INDEX_STATE.columnsPresent = [];
   INDEX_STATE.columnsAdded = [];
   INDEX_STATE.failed = [];
+  INDEX_STATE.perf = { present: [], created: [], failed: [] };
 
   // Columns first: an index cannot be built on a column that is not there, and
   // this call is idempotent so it is safe even though server.ts already ran it
@@ -319,6 +389,9 @@ export async function ensureDatabaseInvariants(): Promise<IndexState> {
       INDEX_STATE.failed.push({ index: spec.name, error: msg });
     }
   }
+
+  // After the correctness invariants, and deliberately outside `ok`.
+  await ensurePerformanceIndexes();
 
   INDEX_STATE.checkedAt = new Date().toISOString();
   INDEX_STATE.ok = INDEX_STATE.failed.length === 0;

@@ -51,7 +51,7 @@ export default function Login() {
         <div
           style={{
             position: "relative",
-            backgroundImage: "url('/exam-lab.png')",
+            backgroundImage: "url('/exam-lab.webp')",
             backgroundSize: "cover",
             backgroundPosition: "center",
           }}

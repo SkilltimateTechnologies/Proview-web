@@ -47,3 +47,6 @@ _*.ts
 _*.json
 student-merge-backup-*.json
 orphan-answers-delete-backup-*.json
+
+# local throwaway verification database
+.tmp-verify.db*

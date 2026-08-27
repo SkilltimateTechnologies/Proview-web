@@ -33,4 +33,27 @@ const client = createClient({
   }) as unknown as typeof fetch,
 });
 
-export const db = drizzle(client, { schema });
+/**
+ * Statements this process has sent to the database, since boot.
+ *
+ * The exam pages failing at ~1000 concurrent students was a round-trip problem:
+ * the database is remote (Turso over HTTP), so "how many statements does this
+ * endpoint run" is the number that decides whether the app survives the load.
+ * Counting them is one increment per query and makes that number observable in
+ * `/api/health` instead of something we have to guess at.
+ */
+let queryCount = 0;
+export const dbStats = {
+  get queries() {
+    return queryCount;
+  },
+};
+
+export const db = drizzle(client, {
+  schema,
+  logger: {
+    logQuery() {
+      queryCount += 1;
+    },
+  },
+});

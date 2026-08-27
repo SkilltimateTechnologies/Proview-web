@@ -280,7 +280,17 @@ export const integrityEvents = sqliteTable(
     photoUrl: text("photo_url"), // webcam snapshot captured at the moment of the event
     at: integer("at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
   },
-  (t) => [index("integrity_attempt_idx").on(t.attemptId)],
+  (t) => [
+    index("integrity_attempt_idx").on(t.attemptId),
+    // Violation counts aggregate per attempt with `type NOT IN (...)`, and the
+    // dedupe read on every event flush is a per-attempt range over `at`. Both were
+    // scanning every row of an attempt (a 90-minute exam leaves hundreds each, and
+    // 1000 students leave hundreds of thousands in the table). Keep these in sync
+    // with REQUIRED_PERF_INDEXES in database/invariants.ts — nothing in the deploy
+    // path runs a migration, so the boot check is what actually creates them.
+    index("integrity_attempt_type_idx").on(t.attemptId, t.type),
+    index("integrity_attempt_at_idx").on(t.attemptId, t.at),
+  ],
 );
 
 /** Platform-global settings: API keys + usage limits (single row, id = "global"). */

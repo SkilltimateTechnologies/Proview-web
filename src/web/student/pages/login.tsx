@@ -3,7 +3,7 @@ import { api } from "../lib/api";
 import { useSession } from "../lib/session";
 import { Icon } from "../components/ui";
 import logo from "../assets/skilltimate-logo.png";
-import labPhoto from "../assets/exam-lab.png";
+import labPhoto from "../assets/exam-lab.webp";
 
 export function Login() {
   const { login } = useSession();

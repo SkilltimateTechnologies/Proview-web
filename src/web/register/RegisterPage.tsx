@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Icon } from "../student/components/ui";
 import logo from "../student/assets/skilltimate-logo.png";
-import labPhoto from "../student/assets/exam-lab.png";
+import labPhoto from "../student/assets/exam-lab.webp";
 
 type Section = { id: string; code: string };
 type Meta = { tenant: { id: string; name: string; code?: string }; sections: Section[] };

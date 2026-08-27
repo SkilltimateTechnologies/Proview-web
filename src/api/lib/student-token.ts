@@ -8,14 +8,31 @@ function secret(): string {
   return process.env.BETTER_AUTH_SECRET || "examly-dev-secret-please-change";
 }
 
-async function hmacKey(): Promise<CryptoKey> {
-  return crypto.subtle.importKey(
+// Every single student request verifies a token, so importing the key each time
+// is pure repeated work: at 1000 students the exam client sends hundreds of
+// requests a second and the key never changes for the life of the process. Keyed
+// by the secret so a changed BETTER_AUTH_SECRET (tests, a rotated env) is picked
+// up instead of silently verifying against the old one.
+let cachedKey: { secret: string; key: Promise<CryptoKey> } | null = null;
+
+function hmacKey(): Promise<CryptoKey> {
+  const current = secret();
+  if (cachedKey && cachedKey.secret === current) return cachedKey.key;
+  const key = crypto.subtle.importKey(
     "raw",
-    enc.encode(secret()),
+    enc.encode(current),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign", "verify"],
   );
+  // Cache the promise, not the awaited key: concurrent verifications during boot
+  // then share one import instead of racing several.
+  cachedKey = { secret: current, key };
+  key.catch(() => {
+    // A failed import must not be cached forever.
+    if (cachedKey?.key === key) cachedKey = null;
+  });
+  return key;
 }
 
 function b64url(bytes: Uint8Array): string {

@@ -1,11 +1,11 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { eq, ne, and, or, desc, inArray, like, sql as dsql } from "drizzle-orm";
+import { eq, ne, and, or, desc, gte, inArray, like, sql as dsql } from "drizzle-orm";
 import { auth } from "./auth";
 import { hashPassword, verifyPassword } from "better-auth/crypto";
-import { db } from "./database";
+import { db, dbStats } from "./database";
 import * as schema from "./database/schema";
-import { INDEX_STATE, REQUIRED_COLUMNS, REQUIRED_UNIQUE_INDEXES } from "./database/invariants";
+import { INDEX_STATE, REQUIRED_COLUMNS, REQUIRED_PERF_INDEXES, REQUIRED_UNIQUE_INDEXES } from "./database/invariants";
 import { authMiddleware, requireAuth, requireSuperAdmin, requirePermission } from "./middleware/auth";
 import type { SessionUser, ProfileCtx } from "./middleware/auth";
 import { id, displayId, computeYear, effectiveEndMs } from "./lib/util";
@@ -18,15 +18,101 @@ import { recordMonitorBuild, monitorTiming, recentExamChecks, failingExamChecks,
 import { OPTION_ORDER_TOKEN, optionTranslator, tokenIsCurrent } from "./lib/option-order";
 import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
 import { isEligible, matchesCohort, loadRoster, loadRosters, ensureOptInOnlyLoaded, invalidateOptInOnlyCache, isOptInOnlyCode } from "./lib/roster";
+import { TtlCache } from "./lib/ttl-cache";
 
 type Vars = { user: SessionUser | null; profile: ProfileCtx | null };
+
+/* ---------------------------------------------------------------------------
+ * Read caches for the rows that 1000 students read simultaneously.
+ *
+ * The database is remote (Turso over HTTP), so every `await db.…` is a network
+ * round trip. During an exam the client fleet re-reads the same handful of
+ * admin-authored rows over and over — the exam row on every 15s heartbeat, the
+ * exam's question list on every autosave, the single global settings row on every
+ * bundle fetch and code run. At 1000 students that is hundreds of identical
+ * queries a second for rows that change a couple of times an hour, and it is
+ * what stopped pages from loading.
+ *
+ * TtlCache also coalesces concurrent misses, so a thundering herd on one exam id
+ * collapses into ONE query rather than 67. Only admin-authored data is cached;
+ * per-attempt state a student is actively mutating (answers, attempt status) is
+ * always read live. Writes invalidate their key so an admin action still lands
+ * immediately instead of waiting out the TTL.
+ * ------------------------------------------------------------------------- */
+/** Settings are edited from one admin screen; 5s stale is invisible there. */
+const SETTINGS_CACHE_MS = 5_000;
+/** Holds/extra time must reach students fast, and the heartbeat is 15s anyway. */
+const EXAM_CACHE_MS = 3_000;
+/** An exam's question set is frozen for the duration of the exam in practice. */
+const EXAM_QUESTIONS_CACHE_MS = 30_000;
+
+type SettingsRow = typeof schema.settings.$inferSelect;
+type ExamRow = typeof schema.exams.$inferSelect;
+type TranslatorQuestion = { id: string; type: string; options: unknown };
+
+const settingsCache = new TtlCache<SettingsRow>(SETTINGS_CACHE_MS);
+const examCache = new TtlCache<ExamRow | null>(EXAM_CACHE_MS);
+const examQuestionsCache = new TtlCache<{ questionIds: string[]; questions: TranslatorQuestion[] }>(
+  EXAM_QUESTIONS_CACHE_MS,
+);
 
 /** Platform-global settings live in a single row (id = "global"). */
 const GLOBAL_SETTINGS = "global";
 async function getGlobalSettings() {
-  let [s] = await db.select().from(schema.settings).where(eq(schema.settings.id, GLOBAL_SETTINGS));
-  if (!s) [s] = await db.insert(schema.settings).values({ id: GLOBAL_SETTINGS }).returning();
-  return s;
+  return settingsCache.load(GLOBAL_SETTINGS, async () => {
+    let [s] = await db.select().from(schema.settings).where(eq(schema.settings.id, GLOBAL_SETTINGS));
+    if (!s) [s] = await db.insert(schema.settings).values({ id: GLOBAL_SETTINGS }).returning();
+    return s;
+  });
+}
+/** Call after writing the settings row so the next read is authoritative. */
+function invalidateGlobalSettings() {
+  settingsCache.invalidate(GLOBAL_SETTINGS);
+}
+
+/**
+ * Exam row for the student polling paths (heartbeat / status).
+ *
+ * Deliberately NOT used by /start, /submit or any admin write: those must decide
+ * against live state. Returns null (a cached negative) for an unknown id so a bogus
+ * examId cannot be used to hammer the database.
+ */
+async function getExamForPolling(eid: string): Promise<ExamRow | null> {
+  return examCache.load(eid, async () => {
+    const [exam] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    return exam ?? null;
+  });
+}
+/** Call whenever an exam row changes (hold, resume, extra time, edit, delete). */
+function invalidateExam(eid: string) {
+  examCache.invalidate(eid);
+}
+
+/**
+ * The exam's question ids plus the fields option-order translation needs.
+ *
+ * One cached read now serves what used to be three separate queries per autosave
+ * (the valid-question check, and the translator's own two reads).
+ */
+async function getExamQuestionSet(examId: string) {
+  return examQuestionsCache.load(examId, async () => {
+    const eqs = await db
+      .select({ questionId: schema.examQuestions.questionId })
+      .from(schema.examQuestions)
+      .where(eq(schema.examQuestions.examId, examId));
+    const questionIds = eqs.map((e) => e.questionId);
+    const questions = questionIds.length
+      ? await db
+          .select({ id: schema.questions.id, type: schema.questions.type, options: schema.questions.options })
+          .from(schema.questions)
+          .where(inArray(schema.questions.id, questionIds))
+      : [];
+    return { questionIds, questions };
+  });
+}
+/** Call when an exam's question set or a question's options change. */
+function invalidateExamQuestions(examId: string) {
+  examQuestionsCache.invalidate(examId);
 }
 
 // Resolve the tenant for the public registration page from a URL code.
@@ -89,10 +175,23 @@ async function persistIntegrityEvents(attemptId: string, raw: unknown): Promise<
   const incoming = (raw as RawIntegrityEvent[]).slice(0, 300);
 
   // Existing (type|at) keys for this attempt so a resend can't double-insert.
+  //
+  // Bounded to `at >= the oldest incoming event`: nothing older than that can
+  // possibly collide with this batch, and by the end of a 90-minute exam an attempt
+  // has hundreds of rows (a snapshot every 27s) that the every-10s flush was
+  // re-reading in full. `integrity_attempt_at_idx` makes this a narrow range scan.
+  const incomingAtMs = incoming
+    .map((ev) => Number(ev?.at))
+    .filter((ms) => Number.isFinite(ms) && ms > 0);
+  const sinceMs = incomingAtMs.length ? Math.min(...incomingAtMs) : 0;
   const existing = await db
     .select({ type: schema.integrityEvents.type, at: schema.integrityEvents.at })
     .from(schema.integrityEvents)
-    .where(eq(schema.integrityEvents.attemptId, attemptId));
+    .where(
+      sinceMs > 0
+        ? and(eq(schema.integrityEvents.attemptId, attemptId), gte(schema.integrityEvents.at, new Date(sinceMs)))
+        : eq(schema.integrityEvents.attemptId, attemptId),
+    );
   const seen = new Set(existing.map((e) => `${e.type}|${new Date(e.at).getTime()}`));
 
   const rows: { id: string; attemptId: string; type: string; detail: string | null; photoUrl: string | null; at: Date }[] = [];
@@ -131,12 +230,8 @@ async function persistIntegrityEvents(attemptId: string, raw: unknown): Promise<
  */
 async function answerTranslator(examId: string, studentId: string, clientToken: unknown) {
   if (!tokenIsCurrent(clientToken)) return optionTranslator(studentId, examId, [], false);
-  const eqs = await db.select({ questionId: schema.examQuestions.questionId }).from(schema.examQuestions).where(eq(schema.examQuestions.examId, examId));
-  const qids = eqs.map((e) => e.questionId);
-  const qs = qids.length
-    ? await db.select({ id: schema.questions.id, type: schema.questions.type, options: schema.questions.options }).from(schema.questions).where(inArray(schema.questions.id, qids))
-    : [];
-  return optionTranslator(studentId, examId, qs, true);
+  const { questions } = await getExamQuestionSet(examId);
+  return optionTranslator(studentId, examId, questions, true);
 }
 
 /** Find a student in a tenant by roll number, ignoring case and padding. */
@@ -413,6 +508,14 @@ const app = new Hono<{ Variables: Vars }>()
         invariants: { ok: inv.ok, checkedAt: inv.checkedAt },
         monitor,
         examChecks: badExams,
+        // Statements sent to the remote database since boot, plus what the read
+        // caches are holding. The scale incident was a round-trip problem, so this
+        // is the number to watch during an exam: divide the delta by the requests
+        // served and you have the cost per request.
+        db: {
+          queries: dbStats.queries,
+          cached: { settings: settingsCache.size, exams: examCache.size, examQuestions: examQuestionsCache.size },
+        },
       },
       200,
     );
@@ -442,6 +545,18 @@ const app = new Hono<{ Variables: Vars }>()
           dsql`SELECT COUNT(*) AS c FROM pragma_table_info(${spec.table}) WHERE name = ${spec.column}`,
         ))[0]?.c ?? 0) > 0;
         return { table: spec.table, column: spec.column, type: spec.type, present, guards: spec.guards };
+      }),
+    );
+    // Performance indexes. Informational: a missing one makes the app slow, not
+    // wrong, so it is reported but deliberately kept out of `ok`. It still has to be
+    // verifiable from outside the process — nothing in the deploy path runs a
+    // migration, so this is how we confirm a deploy actually created them.
+    const perfIndexes = await Promise.all(
+      REQUIRED_PERF_INDEXES.map(async (spec) => {
+        const present = (await db.all<{ name: string }>(
+          dsql`SELECT name FROM sqlite_master WHERE type='index' AND name=${spec.name}`,
+        )).length > 0;
+        return { index: spec.name, table: spec.table, columns: spec.columns, present, guards: spec.guards };
       }),
     );
     const impossible = Number((await db.all<{ c: number }>(
@@ -481,6 +596,7 @@ const app = new Hono<{ Variables: Vars }>()
       ok,
       bootCheck: INDEX_STATE,
       indexes,
+      perfIndexes,
       columns,
       attemptsWithImpossibleScore: impossible,
       attemptsWithDenominatorMismatch: denomMismatch,
@@ -1594,7 +1710,8 @@ const app = new Hono<{ Variables: Vars }>()
     const sid = await verifyStudentToken(c.req.header("x-student-token"));
     if (!sid) return c.json({ message: "Unauthorized" }, 401);
     const eid = c.req.param("examId");
-    const [exam] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    // Cached read: this is a poll, and the exam row is identical for every student.
+    const exam = await getExamForPolling(eid);
     if (!exam) return c.json({ message: "Not found" }, 404);
     const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid))).orderBy(schema.attempts.createdAt, schema.attempts.id).limit(1);
     const now = Date.now();
@@ -1609,7 +1726,12 @@ const app = new Hono<{ Variables: Vars }>()
       // Include server-saved answers so a refresh/reopen resume on a fresh
       // browser restores prior work rather than a blank exam (client merges
       // these under its local answers).
-      const stSaved = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, attempt.id));
+      // Two columns, not the whole row: a coding answer's response is the big field
+      // and the score/feedback columns are not used here.
+      const stSaved = await db
+        .select({ questionId: schema.answers.questionId, response: schema.answers.response })
+        .from(schema.answers)
+        .where(eq(schema.answers.attemptId, attempt.id));
       // Same translation as /start: stored indices are original, the client's screen
       // is in ITS shuffled display order. GET, so the scheme token arrives as a query
       // param rather than in a body.
@@ -1674,16 +1796,28 @@ const app = new Hono<{ Variables: Vars }>()
   // the Live Monitor online/offline dot) and returns the current hold state +
   // the up-to-date absolute deadline (so an admin hold/resume or extra-time grant
   // is picked up by every student without a page reload).
+  //
+  // This is the highest-volume endpoint during an exam (1000 students / 15s ≈ 67
+  // requests a second) and it used to cost three remote round trips each time:
+  // read the exam, read the attempt, write lastSeenAt. Now it costs ONE — the exam
+  // row comes from a 3s coalesced cache (every student is reading the same row),
+  // and the write returns the attempt it just stamped instead of us reading it
+  // first. UPDATE ... RETURNING matches at most one row because
+  // `attempts_exam_student_uq` makes (exam_id, student_id) unique, and that index
+  // is asserted on every boot and reported by /api/health.
   .post("/student/heartbeat/:examId", async (c) => {
     const sid = await verifyStudentToken(c.req.header("x-student-token"));
     if (!sid) return c.json({ message: "Unauthorized" }, 401);
     const eid = c.req.param("examId");
-    const [exam] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+    const exam = await getExamForPolling(eid);
     if (!exam) return c.json({ message: "Not found" }, 404);
-    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid))).orderBy(schema.attempts.createdAt, schema.attempts.id).limit(1);
-    if (!attempt) return c.json({ message: "No attempt" }, 404);
     const now = Date.now();
-    await db.update(schema.attempts).set({ lastSeenAt: new Date(now) }).where(eq(schema.attempts.id, attempt.id));
+    const [attempt] = await db
+      .update(schema.attempts)
+      .set({ lastSeenAt: new Date(now) })
+      .where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid)))
+      .returning();
+    if (!attempt) return c.json({ message: "No attempt" }, 404);
     const endAtMs = effectiveEndMs(exam, attempt, now);
     return c.json({ held: !!exam.heldAt, endAt: new Date(endAtMs), serverNow: new Date(now) }, 200);
   })
@@ -1711,8 +1845,10 @@ const app = new Hono<{ Variables: Vars }>()
       : body.questionId ? [{ questionId: body.questionId, response: body.response }] : [];
 
     // Restrict to questions that actually belong to this exam (ignore stray ids).
-    const eqs = await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, attempt.examId));
-    const validQ = new Set(eqs.map((e) => e.questionId));
+    // Cached per exam: this list is frozen while the exam runs, and it used to be
+    // re-read on every autosave — then read AGAIN inside answerTranslator.
+    const { questionIds } = await getExamQuestionSet(attempt.examId);
+    const validQ = new Set(questionIds);
 
     // The client sends the option index it DISPLAYED. Options are shuffled per
     // student, so convert back to the original index before storing — the grader and
@@ -1723,19 +1859,43 @@ const app = new Hono<{ Variables: Vars }>()
     // the same race as /start: two autosaves in flight for one question both saw
     // no existing row and both inserted, and the grader then counted both rows.
     // Only `response` is touched here — never clobber a score the grader wrote.
+    // One statement for the whole batch instead of one per answer. A reconnect
+    // flush can carry every question in the paper, and each upsert was its own
+    // remote round trip. Deduped by questionId first (keeping the latest value):
+    // SQLite refuses to apply ON CONFLICT twice to the same row in one statement.
+    const byQuestion = new Map<string, unknown>();
     for (const a of incoming) {
       if (!a || !validQ.has(a.questionId)) continue;
-      const stored = a.response == null ? null : saveTrans.toOriginal(a.questionId, a.response);
+      byQuestion.set(a.questionId, a.response == null ? null : saveTrans.toOriginal(a.questionId, a.response));
+    }
+    const answerRows = [...byQuestion].map(([questionId, stored]) => ({
+      id: id("ans"),
+      attemptId: aid,
+      questionId,
+      response: stored,
+      score: null,
+      maxScore: null,
+      autoGraded: false,
+    }));
+    // Chunked because SQLite/libSQL caps bound variables per statement.
+    for (let i = 0; i < answerRows.length; i += 50) {
       await db.insert(schema.answers)
-        .values({ id: id("ans"), attemptId: aid, questionId: a.questionId, response: stored, score: null, maxScore: null, autoGraded: false })
+        .values(answerRows.slice(i, i + 50))
         .onConflictDoUpdate({
           target: [schema.answers.attemptId, schema.answers.questionId],
-          set: { response: stored },
+          // `excluded` is the row we just tried to insert — the same value the
+          // per-answer upsert used to write, applied row by row by SQLite.
+          set: { response: dsql`excluded.response` },
         });
     }
 
-    // Recompute answeredCount from rows that carry real content.
-    const rows = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, aid));
+    // Recompute answeredCount from rows that carry real content. Only the response
+    // column is read: `hasContent` is the one thing that decides this, and pulling
+    // whole rows meant shipping every coding answer back over the wire.
+    const rows = await db
+      .select({ response: schema.answers.response })
+      .from(schema.answers)
+      .where(eq(schema.answers.attemptId, aid));
     const answeredCount = rows.filter((r) => hasContent(r.response)).length;
     // Backstop for the review stamp: /start may have run on an older build, or the
     // attempt may have been created by the auto-submit sweep, and the review endpoint
@@ -2054,10 +2214,14 @@ const app = new Hono<{ Variables: Vars }>()
       .set(patch)
       .where(eq(schema.questions.id, c.req.param("id")))
       .returning();
+    // Option-order translation is derived from the option list, so a cached copy of
+    // this question must not outlive the edit. Cheap: exams are few.
+    examQuestionsCache.clear();
     return c.json({ question: row }, 200);
   })
   .delete("/questions/:id", requireAuth, requirePermission("questionBank"), async (c) => {
     await db.delete(schema.questions).where(eq(schema.questions.id, c.req.param("id")));
+    examQuestionsCache.clear();
     return c.json({ ok: true }, 200);
   })
   // AI question generation (preview, not saved)
@@ -2268,6 +2432,10 @@ const app = new Hono<{ Variables: Vars }>()
       }
     }
     const [row] = await db.update(schema.exams).set(patch).where(eq(schema.exams.id, eid)).returning();
+    // Students read the exam row (and its question set) through short-lived caches;
+    // drop them so an admin edit is visible on the next heartbeat, not one TTL later.
+    invalidateExam(eid);
+    invalidateExamQuestions(eid);
     return c.json({ exam: row }, 200);
   })
 
@@ -2279,6 +2447,7 @@ const app = new Hono<{ Variables: Vars }>()
     const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
     if (!ex) return c.json({ message: "Not found" }, 404);
     if (!ex.heldAt) await db.update(schema.exams).set({ heldAt: new Date() }).where(eq(schema.exams.id, eid));
+    invalidateExam(eid);
     return c.json({ ok: true, held: true }, 200);
   })
   // Resume a held exam: fold the elapsed hold into holdMs and clear heldAt so
@@ -2291,6 +2460,7 @@ const app = new Hono<{ Variables: Vars }>()
       const elapsed = Math.max(0, Date.now() - new Date(ex.heldAt).getTime());
       await db.update(schema.exams).set({ heldAt: null, holdMs: (ex.holdMs ?? 0) + elapsed }).where(eq(schema.exams.id, eid));
     }
+    invalidateExam(eid);
     return c.json({ ok: true, held: false }, 200);
   })
   // Grant extra minutes to the whole exam (shifts every deadline forward).
@@ -2304,6 +2474,7 @@ const app = new Hono<{ Variables: Vars }>()
     if (!ex) return c.json({ message: "Not found" }, 404);
     const next = Math.max(0, (ex.extraMin ?? 0) + minutes);
     const [row] = await db.update(schema.exams).set({ extraMin: next }).where(eq(schema.exams.id, eid)).returning();
+    invalidateExam(eid);
     return c.json({ ok: true, extraMin: row.extraMin }, 200);
   })
 
@@ -3031,6 +3202,7 @@ const app = new Hono<{ Variables: Vars }>()
     }
     await getGlobalSettings(); // ensure row exists
     const [s] = await db.update(schema.settings).set(patch).where(eq(schema.settings.id, GLOBAL_SETTINGS)).returning();
+    invalidateGlobalSettings();
     return c.json({ ok: true, aiProvider: s.aiProvider }, 200);
   })
 

@@ -18,7 +18,25 @@ export type ProfileCtx = {
   permissions: Record<string, boolean> | null;
 };
 
+/**
+ * Routes the running exam client calls, which authenticate with the HMAC
+ * `x-student-token` (see lib/student-token.ts) and never read `user`/`profile`.
+ *
+ * Students are not Better Auth users, so resolving a session for them was work
+ * with no consumer: at 1000 concurrent students these paths carry hundreds of
+ * requests a second (autosave, heartbeat, events, snapshots) and each one ran
+ * `getSession` on the way in. Skipping it here removes that from the hot path.
+ * `user`/`profile` are still set (to null) so any handler that reads them keeps
+ * seeing a well-defined value rather than undefined.
+ */
+const STUDENT_PATH = /^\/api\/student\//;
+
 export const authMiddleware = createMiddleware(async (c, next) => {
+  if (STUDENT_PATH.test(c.req.path)) {
+    c.set("user", null);
+    c.set("profile", null);
+    return next();
+  }
   const session = await auth.api.getSession({ headers: c.req.raw.headers });
   const user = (session?.user ?? null) as SessionUser | null;
   c.set("user", user);

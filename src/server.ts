@@ -1,6 +1,18 @@
+import { readdir, stat } from "node:fs/promises";
+import { promisify } from "node:util";
+import { brotliCompress, constants as zlibConstants, gzip } from "node:zlib";
 import app from "./api";
 import { sweepPendingGrading, startAutoSubmitSweep } from "./api/lib/grade-queue";
 import { ensureDatabaseInvariants, ensureRequiredColumns } from "./api/database/invariants";
+import {
+	CompressedAssets,
+	buildManifest,
+	planResponse,
+	routeFor,
+	type Encoding,
+	type ManifestInput,
+	type StaticEntry,
+} from "./api/lib/static-assets";
 
 // Never let a transient background failure (e.g. a brief Turso/libsql socket
 // ECONNRESET during a background grading/auto-submit sweep) take down the whole
@@ -28,7 +40,124 @@ await Promise.race([
 
 const port = Number(process.env.PORT ?? 3000);
 const distDir = `${import.meta.dir}/../dist`;
-const indexPath = `${distDir}/index.html`;
+
+/* ---------------------------------------------------------------------------
+ * Static serving.
+ *
+ * At ~1000 concurrent students the exam pages stopped loading, and the measured
+ * cause was here rather than in the database: prod served `/assets/index-*.js`
+ * as 1.6 MB of *uncompressed* text with no `cache-control`, no `etag` and no
+ * `last-modified` (verified with `curl -sSI -H 'Accept-Encoding: gzip, br'`), so
+ * every student re-downloaded the whole bundle on every page load, refresh and
+ * SEB restart — roughly 1.5 GB of egress through a single Bun process with no
+ * CDN in front of it. The old handler also did an `await file.exists()` stat on
+ * every request. Now: one directory walk at boot, brotli/gzip variants held in
+ * memory, immutable caching on vite's content-hashed filenames and ETag/304 on
+ * everything else. Policy lives in `api/lib/static-assets.ts` (unit-tested);
+ * this file only does the I/O.
+ * ------------------------------------------------------------------------- */
+
+const brotliCompressAsync = promisify(brotliCompress);
+const gzipAsync = promisify(gzip);
+
+// Quality 9 rather than 11: measured on our real bundle, q9 is 474 KB in 158 ms
+// while q11 is 433 KB in 3.8 s. The extra 41 KB is not worth ~24x the CPU on a
+// single-core container that may still be answering requests.
+const BROTLI_QUALITY = 9;
+
+async function collectStaticFiles(dir: string, prefix = ""): Promise<ManifestInput[]> {
+	const collected: ManifestInput[] = [];
+	let entries;
+	try {
+		entries = await readdir(dir, { withFileTypes: true });
+	} catch {
+		// No dist directory yet (fresh checkout without a build). The handler
+		// below reports that clearly instead of crashing the server at boot.
+		return collected;
+	}
+	for (const entry of entries) {
+		const absolute = `${dir}/${entry.name}`;
+		const route = `${prefix}/${entry.name}`;
+		if (entry.isDirectory()) {
+			collected.push(...(await collectStaticFiles(absolute, route)));
+			continue;
+		}
+		if (!entry.isFile()) continue;
+		const stats = await stat(absolute);
+		collected.push({ route, path: absolute, size: stats.size, mtimeMs: stats.mtimeMs });
+	}
+	return collected;
+}
+
+const staticManifest = buildManifest(await collectStaticFiles(distDir));
+
+const compressedAssets = new CompressedAssets(
+	async (bytes: Uint8Array, encoding: Encoding) => {
+		if (encoding === "br") {
+			return new Uint8Array(
+				await brotliCompressAsync(bytes, {
+					params: {
+						[zlibConstants.BROTLI_PARAM_QUALITY]: BROTLI_QUALITY,
+						[zlibConstants.BROTLI_PARAM_SIZE_HINT]: bytes.byteLength,
+					},
+				}),
+			);
+		}
+		return new Uint8Array(await gzipAsync(bytes, { level: 9 }));
+	},
+	(path: string) => Bun.file(path).bytes(),
+);
+
+// Routes we have already looked for on disk and not found. Without this a bot
+// probing paths would put a filesystem stat back on the request path.
+const knownMissing = new Set<string>();
+
+async function registerLateFile(route: string): Promise<StaticEntry | undefined> {
+	if (knownMissing.has(route)) return undefined;
+	const absolute = `${distDir}${route}`;
+	try {
+		const stats = await stat(absolute);
+		if (!stats.isFile()) throw new Error("not a file");
+		const [entry] = buildManifest([
+			{ route, path: absolute, size: stats.size, mtimeMs: stats.mtimeMs },
+		]).values();
+		if (entry) staticManifest.set(route, entry);
+		return entry;
+	} catch {
+		if (knownMissing.size > 5000) knownMissing.clear();
+		knownMissing.add(route);
+		return undefined;
+	}
+}
+
+function staticResponse(route: string, entry: StaticEntry, request: Request): Response {
+	const available = compressedAssets.available(route);
+	const plan = planResponse(
+		entry,
+		{
+			method: request.method,
+			ifNoneMatch: request.headers.get("if-none-match"),
+			acceptEncoding: request.headers.get("accept-encoding"),
+		},
+		available,
+		(encoding) => compressedAssets.sizeOf(route, encoding),
+	);
+
+	// Compression is never awaited by a request: schedule anything still missing
+	// and serve what we have right now.
+	if (entry.compressible && available.length < 2) {
+		compressedAssets.warmInBackground(route, entry);
+	}
+
+	if (!plan.body) {
+		return new Response(null, { status: plan.status, headers: plan.headers });
+	}
+	const variant = plan.encoding ? compressedAssets.get(route, plan.encoding) : undefined;
+	// A Uint8Array is a valid body at runtime; the cast is only needed because the
+	// DOM `BodyInit` union in our TS lib does not include ArrayBufferView.
+	const body = (variant as unknown as BodyInit | undefined) ?? Bun.file(entry.path);
+	return new Response(body, { status: plan.status, headers: plan.headers });
+}
 
 const server = Bun.serve({
   port,
@@ -46,19 +175,21 @@ const server = Bun.serve({
       return app.fetch(request);
     }
 
-    const filePath = getStaticFilePath(url.pathname);
-    const file = Bun.file(filePath);
+    const route = routeFor(url.pathname);
+    const hit = staticManifest.get(route);
+    if (hit) return staticResponse(route, hit, request);
 
-    if (await file.exists()) {
-      return new Response(file);
+    // A path that looks like a file but was not in the boot manifest: it can
+    // exist after a local rebuild without a restart, so check the disk once and
+    // remember the answer either way.
+    if (route !== "/" && /\.[A-Za-z0-9]+$/.test(route)) {
+      const late = await registerLateFile(route);
+      if (late) return staticResponse(route, late, request);
     }
 
-    const index = Bun.file(indexPath);
-    if (await index.exists()) {
-      return new Response(index, {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
-      });
-    }
+    // Everything else is a client-side route: hand back the SPA shell.
+    const shell = staticManifest.get("/index.html");
+    if (shell) return staticResponse("/index.html", shell, request);
 
     return new Response("Build output not found. Run `bun run build` first.", {
       status: 500,
@@ -68,6 +199,24 @@ const server = Bun.serve({
 });
 
 console.log(`Web server listening on http://localhost:${server.port}`);
+
+// Pre-compress the bundle off the boot path so the very first student of the day
+// already gets brotli instead of 1.6 MB of plain JavaScript. Sequential on
+// purpose: zlib runs on the thread pool and this must never starve request
+// handling. Largest first, because that is the file every student downloads.
+void (async () => {
+  const compressible = [...staticManifest.entries()]
+    .filter(([, entry]) => entry.compressible)
+    .sort(([, a], [, b]) => b.size - a.size);
+  const started = Date.now();
+  for (const [route, entry] of compressible) {
+    await compressedAssets.warm(route, entry);
+  }
+  console.log(
+    `[static] ${compressible.length} asset(s) pre-compressed in ${Date.now() - started}ms, ` +
+      `${(compressedAssets.heldBytes / 1024).toFixed(0)}KB held`,
+  );
+})();
 
 // Assert the database's uniqueness guarantees before doing any background work.
 // These indexes are what actually make duplicate attempts/answers impossible —
@@ -86,11 +235,3 @@ void sweepPendingGrading();
 // `in_progress` attempts (student closed the browser / lost connection at the
 // cutoff) so they never stay stuck in-progress. Runs every 60s.
 startAutoSubmitSweep(60_000);
-
-function getStaticFilePath(pathname: string) {
-  const cleanPath = decodeURIComponent(pathname)
-    .replace(/^\/+/, "")
-    .replaceAll("..", "");
-
-  return cleanPath ? `${distDir}/${cleanPath}` : indexPath;
-}
