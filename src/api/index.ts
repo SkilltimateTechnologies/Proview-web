@@ -19,6 +19,7 @@ import { OPTION_ORDER_TOKEN, optionTranslator, tokenIsCurrent } from "./lib/opti
 import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
 import { isEligible, matchesCohort, loadRoster, loadRosters, ensureOptInOnlyLoaded, invalidateOptInOnlyCache, isOptInOnlyCode } from "./lib/roster";
 import { TtlCache } from "./lib/ttl-cache";
+import { examEffStatus, isConcluded, isReportable, toMs, type StatusExam } from "./lib/exam-status";
 
 type Vars = { user: SessionUser | null; profile: ProfileCtx | null };
 
@@ -2846,38 +2847,16 @@ const app = new Hono<{ Variables: Vars }>()
     // exam whose start time has passed is effectively live, so include it for
     // non-TPO roles too (mirrors the Live Monitor / Schedule list behaviour).
     const now = Date.now();
-    const startMs = (e: { startAt: Date | number | string | null }) => {
-      if (e.startAt == null) return null;
-      const ms = typeof e.startAt === "number" ? e.startAt : new Date(e.startAt).getTime();
-      return Number.isNaN(ms) ? null : ms;
-    };
-    const isStarted = (e: { startAt: Date | number | string | null }) => {
-      const ms = startMs(e);
-      return ms !== null && now >= ms;
-    };
-    const endMs = (e: { endAt: Date | number | string | null }) => {
-      if (e.endAt == null) return null;
-      const ms = typeof e.endAt === "number" ? e.endAt : new Date(e.endAt).getTime();
-      return Number.isNaN(ms) ? null : ms;
-    };
+    const endMs = (e: { endAt: Date | number | string | null }) => toMs(e.endAt);
     // A scheduled exam whose start time has passed is effectively LIVE — until its
     // window (endAt + admin extra time + hold time) closes, after which it has ENDED.
-    const effStatus = (e: { status: string; startAt: Date | number | string | null; endAt: Date | number | string | null; extraMin?: number | null; holdMs?: number | null; heldAt?: number | string | Date | null }) => {
-      if (e.status === "draft" || e.status === "finished") return e.status;
-      const end = endMs(e);
-      if (!e.heldAt && end !== null) {
-        const extra = (e.extraMin ?? 0) * 60_000 + (e.holdMs ?? 0);
-        if (now > end + extra) return "ended";
-      }
-      if (e.status === "live") return "live";
-      if (e.status === "scheduled" && isStarted(e)) return "live";
-      return e.status;
-    };
+    // Derivation lives in lib/exam-status so every caller agrees; see effStatus below.
+    const effStatus = (e: StatusExam) => examEffStatus(e, now);
     const allExams = await db.select().from(schema.exams).where(eq(schema.exams.tenantId, tid)).orderBy(desc(schema.exams.createdAt));
-    const rows =
-      p.role === "tpo"
-        ? allExams.filter((e) => e.status === "finished")
-        : allExams.filter((e) => e.status === "finished" || e.status === "live" || (e.status === "scheduled" && isStarted(e)));
+    // Filter on DERIVED status, never the raw column. The raw column is admin intent
+    // and never self-updates, so an exam conducted last month still reads "scheduled":
+    // matching `status === "finished"` here hid every conducted exam from TPOs.
+    const rows = allExams.filter((e) => (p.role === "tpo" ? isConcluded(e, now) : isReportable(e, now)));
     // All students in the tenant — used to size the "assigned" cohort per exam.
     const allStudents = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, tid), eq(schema.students.enabled, true)));
     const reportRosters = await loadRosters(rows.map((e) => e.id));
@@ -2917,7 +2896,9 @@ const app = new Hono<{ Variables: Vars }>()
     const eid = c.req.param("examId");
     const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid));
     if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
-    if (p.role === "tpo" && ex.status !== "finished") return c.json({ message: "Report not available until finished" }, 403);
+    // Same rule as the /reports list: gate on DERIVED status, not the raw column, or a
+    // TPO who can see a conducted exam in the list gets a 403 when opening it.
+    if (p.role === "tpo" && !isConcluded(ex)) return c.json({ message: "Report not available until finished" }, 403);
     const atts = await db.select().from(schema.attempts).where(eq(schema.attempts.examId, eid));
     // Total questions on the exam so the report can show "answered N/total".
     const totalQuestions = (await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, eid))).length;
