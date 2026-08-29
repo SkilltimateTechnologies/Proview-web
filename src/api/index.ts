@@ -19,6 +19,7 @@ import { OPTION_ORDER_TOKEN, optionTranslator, tokenIsCurrent } from "./lib/opti
 import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
 import { isEligible, matchesCohort, loadRoster, loadRosters, ensureOptInOnlyLoaded, invalidateOptInOnlyCache, isOptInOnlyCode } from "./lib/roster";
 import { TtlCache } from "./lib/ttl-cache";
+import { TenantDirectory } from "./lib/tenant-directory";
 import { examEffStatus, isConcluded, isReportable, toMs, type StatusExam } from "./lib/exam-status";
 
 type Vars = { user: SessionUser | null; profile: ProfileCtx | null };
@@ -56,6 +57,30 @@ const examCache = new TtlCache<ExamRow | null>(EXAM_CACHE_MS);
 const examQuestionsCache = new TtlCache<{ questionIds: string[]; questions: TranslatorQuestion[] }>(
   EXAM_QUESTIONS_CACHE_MS,
 );
+
+/**
+ * The admin side has the same round-trip problem the student side had, for a
+ * different reason: nine staff endpoints (/dashboard, /reports, /reports/:examId,
+ * /monitor, the roster pickers) each OPENED by reading the tenant's entire
+ * students table plus the entire classes table, just to turn a studentId into a
+ * name and a classId into a section code. Measured on prod that was 7.9 SQL
+ * statements per admin request against 2.23 for the tuned student path.
+ *
+ * Students and classes are admin-authored and change on a human timescale, and
+ * every write below invalidates its tenant, so the only staleness a real operator
+ * can observe is a concurrent edit by a DIFFERENT admin landing up to 15s late on
+ * a dashboard. Worth it to stop re-reading 1,124 rows per page load.
+ */
+const DIRECTORY_CACHE_MS = 15_000;
+
+type StudentRow = typeof schema.students.$inferSelect;
+type ClassRow = typeof schema.classes.$inferSelect;
+
+const directory = new TenantDirectory<StudentRow, ClassRow>({
+  ttlMs: DIRECTORY_CACHE_MS,
+  loadStudents: (tid) => db.select().from(schema.students).where(eq(schema.students.tenantId, tid)),
+  loadClasses: (tid) => db.select().from(schema.classes).where(eq(schema.classes.tenantId, tid)),
+});
 
 /** Platform-global settings live in a single row (id = "global"). */
 const GLOBAL_SETTINGS = "global";
@@ -299,23 +324,19 @@ async function buildMonitorSnapshot(tid: string) {
     if (upcoming) nextScheduled = { examId: upcoming.id, title: upcoming.title, startAt: startMs(upcoming) };
   }
 
-  // Every student in the tenant, INCLUDING disabled ones — one query, used for
-  // two purposes:
+  // Students and classes for the tenant, served from the shared directory cache
+  // (see TenantDirectory above) so a 5s monitor poll does not re-read ~1200 rows:
   //   * `studentById` resolves an attempt's student name/roll. It must include
   //     disabled students because someone can be disabled mid-term while their
   //     attempt still exists. Resolving from this map instead of querying per
   //     attempt turns ~1200 round trips into one.
   //   * `allStudents` (enabled only) is the assignable cohort, used to work out
   //     who has not started yet.
-  // These used to be two separate full-table reads of the same ~1200 rows on
-  // every 5s poll; one read plus an in-memory filter is equivalent and halves
-  // the cost.
-  const tenantStudents = await db.select().from(schema.students).where(eq(schema.students.tenantId, tid));
-  const studentById = new Map(tenantStudents.map((s) => [s.id, s]));
-  const allStudents = tenantStudents.filter((s) => s.enabled);
+  const studentIdx = await directory.studentIndex(tid);
+  const studentById = studentIdx.byId;
+  const allStudents = studentIdx.enabled;
   // Resolve a student's classId to a readable section code (e.g. "CSE-C").
-  const allClasses = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, tid));
-  const classCodeById = new Map(allClasses.map((cl) => [cl.id, cl.code]));
+  const classCodeById = (await directory.classIndex(tid)).codeById;
   const sectionOf = (classId: string | null) => (classId ? classCodeById.get(classId) ?? "" : "");
   const liveRosters = await loadRosters(liveExams.map((e) => e.id));
   const assignedStudents = (e: { id: string; classId: string | null; sectionIds: string[] | null }) =>
@@ -515,7 +536,16 @@ const app = new Hono<{ Variables: Vars }>()
         // served and you have the cost per request.
         db: {
           queries: dbStats.queries,
-          cached: { settings: settingsCache.size, exams: examCache.size, examQuestions: examQuestionsCache.size },
+          cached: {
+            settings: settingsCache.size,
+            exams: examCache.size,
+            examQuestions: examQuestionsCache.size,
+            // Tenants whose student/class directory is warm. Admin pages used to
+            // re-read the whole students table per request; these two counters are
+            // how you tell the directory cache is actually being hit.
+            directoryStudents: directory.stats().students,
+            directoryClasses: directory.stats().classes,
+          },
         },
       },
       200,
@@ -836,6 +866,8 @@ const app = new Hono<{ Variables: Vars }>()
       if (isDuplicateRollError(e)) return c.json({ message: "This roll number is already registered", exists: true }, 409);
       throw e;
     }
+    // A new student changes the assignable cohort every admin screen reads.
+    directory.invalidateStudents(tid);
 
     // Late-registrant enrolment: a student who registers after exams were set up
     // must still land in the exam meant for their branch. Cohort matching already
@@ -1043,6 +1075,7 @@ const app = new Hono<{ Variables: Vars }>()
       .returning();
     // A new ELITE-style cohort changes who is opt-in-only — drop the cache.
     if (isOptInOnlyCode(code) || isOptInOnlyCode(b.branch)) invalidateOptInOnlyCache();
+    directory.invalidateClasses(tid);
     return c.json({ class: row }, 201);
   })
   .patch("/classes/:id", requireAuth, requirePermission("users"), async (c) => {
@@ -1057,6 +1090,8 @@ const app = new Hono<{ Variables: Vars }>()
       .returning();
     // Renaming a class can add/remove ELITE status — always drop the cache.
     invalidateOptInOnlyCache();
+    // A renamed section changes the code every report labels rows with.
+    directory.invalidateClasses(row?.tenantId);
     return c.json({ class: row }, 200);
   })
   .delete("/classes/:id", requireAuth, requirePermission("users"), async (c) => {
@@ -1068,6 +1103,9 @@ const app = new Hono<{ Variables: Vars }>()
     await db.update(schema.students).set({ originalClassId: null }).where(eq(schema.students.originalClassId, cid));
     await db.delete(schema.classes).where(eq(schema.classes.id, cid));
     invalidateOptInOnlyCache();
+    // Touched BOTH tables (students were unassigned), and the tenant id is not in
+    // scope here, so drop every tenant rather than risk serving a dangling classId.
+    directory.invalidate();
     return c.json({ ok: true }, 200);
   })
 
@@ -1143,6 +1181,7 @@ const app = new Hono<{ Variables: Vars }>()
       if (isDuplicateRollError(e)) return c.json({ message: `Roll number ${roll} already exists` }, 409);
       throw e;
     }
+    directory.invalidateStudents(tid);
     return c.json({ student: row }, 201);
   })
   .post("/students/bulk", requireAuth, requirePermission("users"), async (c) => {
@@ -1231,6 +1270,8 @@ const app = new Hono<{ Variables: Vars }>()
     for (let i = 0; i < values.length; i += 200) {
       await db.insert(schema.students).values(values.slice(i, i + 200)).onConflictDoNothing();
     }
+    // An import can create sections as well as students — drop both for the tenant.
+    directory.invalidate(tid);
     return c.json({ inserted, skipped, createdSections, rejected }, 201);
   })
   .patch("/students/:id", requireAuth, requirePermission("users"), async (c) => {
@@ -1266,6 +1307,8 @@ const app = new Hono<{ Variables: Vars }>()
 
     try {
       const [row] = await db.update(schema.students).set(patch).where(eq(schema.students.id, sid)).returning();
+      // Name/roll/section/enabled all feed the cached index.
+      directory.invalidateStudents(row?.tenantId);
       return c.json({ student: row }, 200);
     } catch (e) {
       if (isDuplicateRollError(e)) return c.json({ message: "Another student already has that roll number" }, 409);
@@ -1344,6 +1387,7 @@ const app = new Hono<{ Variables: Vars }>()
       await db.update(schema.students).set({ classId: elite.id, originalClassId: keepOriginal }).where(eq(schema.students.id, s.id));
       moved.push({ id: s.id, rollNo: s.rollNo, name: s.name, from: codeById.get(s.classId ?? "") ?? "(none)" });
     }
+    directory.invalidateStudents(tid);
     return c.json({ ok: true, eliteClassId: elite.id, movedCount: moved.length, moved, alreadyElite, notFound }, 200);
   })
 
@@ -1373,6 +1417,7 @@ const app = new Hono<{ Variables: Vars }>()
       await db.update(schema.students).set({ classId: dest, originalClassId: null }).where(eq(schema.students.id, s.id));
       restored.push({ id: s.id, rollNo: s.rollNo, to: codeById.get(dest) ?? dest });
     }
+    directory.invalidateStudents(tid);
     return c.json({ ok: true, restoredCount: restored.length, restored, noOriginal }, 200);
   })
 
@@ -1397,6 +1442,8 @@ const app = new Hono<{ Variables: Vars }>()
     const b = await c.req.json();
     const newPassword: string = b.password && String(b.password).length >= 6 ? String(b.password) : "Welcome@123";
     await db.update(schema.students).set({ password: await hashPassword(newPassword), mustChangePassword: true }).where(eq(schema.students.id, sid));
+    // Only a studentId is in scope, so clear every tenant. Rare enough to be free.
+    directory.invalidateStudents();
     // Return the plaintext ONCE so the admin can hand it to the student; never stored/readable after.
     return c.json({ ok: true, password: newPassword }, 200);
   })
@@ -1417,6 +1464,7 @@ const app = new Hono<{ Variables: Vars }>()
     await db.delete(schema.attempts).where(eq(schema.attempts.studentId, sid));
     await db.delete(schema.examRoster).where(eq(schema.examRoster.studentId, sid));
     await db.delete(schema.students).where(eq(schema.students.id, sid));
+    directory.invalidateStudents();
     return c.json({ ok: true }, 200);
   })
   // Student login verification for the Phase 2 desktop client. Public (no staff session).
@@ -1470,6 +1518,7 @@ const app = new Hono<{ Variables: Vars }>()
     if (!valid) return c.json({ ok: false, message: "Your current password is incorrect." }, 400);
     if (newPassword === currentPassword) return c.json({ ok: false, message: "Choose a password different from your current one." }, 400);
     await db.update(schema.students).set({ password: await hashPassword(newPassword), mustChangePassword: false }).where(eq(schema.students.id, sid));
+    directory.invalidateStudents();
     return c.json({ ok: true }, 200);
   })
 
@@ -2491,10 +2540,10 @@ const app = new Hono<{ Variables: Vars }>()
     const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
     if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
     const overrides = await db.select().from(schema.examRoster).where(eq(schema.examRoster.examId, eid));
-    const classes = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, p.tenantId!));
-    const clmap = new Map(classes.map((cl) => [cl.id, cl]));
-    const studs = await db.select().from(schema.students).where(eq(schema.students.tenantId, p.tenantId!));
-    const smap = new Map(studs.map((s) => [s.id, s]));
+    // Names and section codes come from the directory cache — this handler only
+    // needs them to label rows, so two full-table reads per open were pure waste.
+    const clmap = (await directory.classIndex(p.tenantId!)).byId;
+    const smap = (await directory.studentIndex(p.tenantId!)).byId;
     const shape = (o: typeof overrides[number]) => {
       const s = smap.get(o.studentId);
       return { id: o.studentId, name: s?.name ?? "—", rollNo: s?.rollNo ?? "", email: s?.email ?? null, section: s?.classId ? clmap.get(s.classId)?.code ?? "" : "" };
@@ -2512,9 +2561,8 @@ const app = new Hono<{ Variables: Vars }>()
     const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
     if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
     const roster = await loadRoster(eid);
-    const allStudents = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, p.tenantId!), eq(schema.students.enabled, true)));
-    const classes = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, p.tenantId!));
-    const clmap = new Map(classes.map((cl) => [cl.id, cl]));
+    const allStudents = (await directory.studentIndex(p.tenantId!)).enabled;
+    const clmap = (await directory.classIndex(p.tenantId!)).byId;
     const candidates = allStudents
       .filter((stu) => !isEligible(ex, stu, roster))
       .filter((stu) => !q || (stu.name ?? "").toLowerCase().includes(q) || (stu.rollNo ?? "").toLowerCase().includes(q) || (stu.email ?? "").toLowerCase().includes(q))
@@ -2531,9 +2579,8 @@ const app = new Hono<{ Variables: Vars }>()
     const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
     if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
     const roster = await loadRoster(eid);
-    const allStudents = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, p.tenantId!), eq(schema.students.enabled, true)));
-    const classes = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, p.tenantId!));
-    const clmap = new Map(classes.map((cl) => [cl.id, cl]));
+    const allStudents = (await directory.studentIndex(p.tenantId!)).enabled;
+    const clmap = (await directory.classIndex(p.tenantId!)).byId;
     const eligible = allStudents
       .filter((stu) => isEligible(ex, stu, roster))
       .filter((stu) => !q || (stu.name ?? "").toLowerCase().includes(q) || (stu.rollNo ?? "").toLowerCase().includes(q) || (stu.email ?? "").toLowerCase().includes(q))
@@ -2760,9 +2807,13 @@ const app = new Hono<{ Variables: Vars }>()
     const avg = graded.length ? graded.reduce((s, a) => s + (a.score ?? 0), 0) / graded.length : 0;
     const passRate = graded.length ? (graded.filter((a) => (a.score ?? 0) >= 40).length / graded.length) * 100 : 0;
 
-    // class-wise average
-    const classes = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, tid));
-    const students = await db.select().from(schema.students).where(eq(schema.students.tenantId, tid));
+    // class-wise average. Students and classes come from the directory cache: the
+    // dashboard only needs them to label and group scores, and re-reading 1,124
+    // rows on every load was most of this endpoint's latency.
+    const classIdx = await directory.classIndex(tid);
+    const studentIdx = await directory.studentIndex(tid);
+    const classes = classIdx.all;
+    const students = studentIdx.all;
     const stuClass = new Map(students.map((s) => [s.id, s.classId]));
     const classScores = new Map<string, number[]>();
     for (const a of graded) {
@@ -2858,7 +2909,8 @@ const app = new Hono<{ Variables: Vars }>()
     // matching `status === "finished"` here hid every conducted exam from TPOs.
     const rows = allExams.filter((e) => (p.role === "tpo" ? isConcluded(e, now) : isReportable(e, now)));
     // All students in the tenant — used to size the "assigned" cohort per exam.
-    const allStudents = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, tid), eq(schema.students.enabled, true)));
+    // Directory cache: the list only counts eligibility, it never returns students.
+    const allStudents = (await directory.studentIndex(tid)).enabled;
     const reportRosters = await loadRosters(rows.map((e) => e.id));
     const assignedFor = (e: { id: string; classId: string | null; sectionIds: string[] | null }) =>
       allStudents.filter((stu) => isEligible(e, stu, reportRosters.get(e.id))).length;
@@ -2902,10 +2954,11 @@ const app = new Hono<{ Variables: Vars }>()
     const atts = await db.select().from(schema.attempts).where(eq(schema.attempts.examId, eid));
     // Total questions on the exam so the report can show "answered N/total".
     const totalQuestions = (await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, eid))).length;
-    const students = await db.select().from(schema.students).where(eq(schema.students.tenantId, p.tenantId!));
-    const smap = new Map(students.map((s) => [s.id, s]));
-    const classes = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, p.tenantId!));
-    const clmap = new Map(classes.map((cl) => [cl.id, cl]));
+    // Directory cache. This report used to read all 1,124 students and every class
+    // on EVERY open, purely to label attempt rows with a name and a section code.
+    const studentIdx = await directory.studentIndex(p.tenantId!);
+    const smap = studentIdx.byId;
+    const clmap = (await directory.classIndex(p.tenantId!)).byId;
     // Prefer the section frozen on the attempt (historical truth). Fall back to the
     // student's current section for older rows that predate the snapshot.
     const sectionOf = (sid: string) => {
@@ -2926,7 +2979,9 @@ const app = new Hono<{ Variables: Vars }>()
     const exRoster = await loadRoster(eid);
     const absentRows = !deadlineOver
       ? []
-      : students
+      // `.all` (not `.enabled`) because the filter below drops disabled students
+      // itself — keeping that explicit check preserves the previous behaviour.
+      : studentIdx.all
           .filter((stu) => {
             if (stu.enabled === false) return false;
             if (attemptedIds.has(stu.id)) return false;
@@ -3020,9 +3075,8 @@ const app = new Hono<{ Variables: Vars }>()
     const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid));
     if (!ex || ex.tenantId !== p.tenantId) return c.json({ message: "Not found" }, 404);
     const roster = await loadRoster(eid);
-    const allStudents = await db.select().from(schema.students).where(and(eq(schema.students.tenantId, p.tenantId!), eq(schema.students.enabled, true)));
-    const classes = await db.select().from(schema.classes).where(eq(schema.classes.tenantId, p.tenantId!));
-    const clmap = new Map(classes.map((cl) => [cl.id, cl]));
+    const allStudents = (await directory.studentIndex(p.tenantId!)).enabled;
+    const clmap = (await directory.classIndex(p.tenantId!)).byId;
     const candidates = allStudents
       // Not already eligible (so the picker only offers students you can add).
       .filter((stu) => !isEligible(ex, stu, roster))
