@@ -65,3 +65,45 @@ Call sites (src/api/index.ts): 313/317 (monitor snapshot), 2494/2496 (exam roste
 - PATCH /api/exams/:id has a destructive roster reconcile — never send `studentIds`.
 - typecheck:web has 57 pre-existing errors, not a regression.
 - Duplicate-account audit is CLOSED by the user. No writes to student records.
+
+## Measured after (deployed e423f25, boot 2026-08-29T16:40:47Z)
+
+Both columns are best-of-3 with NO Accept-Encoding, so they are directly comparable.
+The ~480 ms sandbox->Railway round trip (= near-empty /api/monitor) is in every number.
+
+| endpoint | before | after | server-side (minus ~480 ms floor) |
+|---|---:|---:|---|
+| /api/admin/invariants | 1063 | 1056 | 583 -> 576 (flat, untouched) |
+| /api/reports/ex_d0414a4afb984401 | 978 | 744 | 498 -> 264 (-47%) |
+| /api/reports | 936 | 824 | 456 -> 344 (-25%) |
+| /api/dashboard | 872 | 682 | 392 -> 202 (-48%) |
+| /api/students | 709 | 645 | not a directory user; noise |
+| /api/questions?limit=50 | 685 | 685 | flat (untouched) |
+| /api/classes | 546 | 522 | flat |
+| /api/exams | 530 | 523 | flat |
+| /api/monitor | 479 | 486 | flat (already had its own cache) |
+
+Behaviour: all 8 captured payloads byte-identical to /tmp/perf_before (sha256), including
+dashboard. /api/health db.cached shows directoryStudents:1, directoryClasses:1, status ok.
+
+### Honest miss on the aggregate statement count
+
+Same 27-request burst: 213 statements before -> 205 after = 7.9 -> 7.59 per request. Almost
+no movement, for two reasons worth writing down:
+- 5 of the 9 endpoints in that burst (invariants, students, questions, classes, exams) never
+  touched the directory, and /admin/invariants alone is a large share of the statements.
+- The burst spans ~20 s while the directory TTL is 15 s, so later rounds re-loaded anyway.
+
+Warm-cache, per-endpoint (5 requests each, straight after a warming hit):
+- /api/dashboard 5.6 statements/request
+- /api/reports/ex_d0414a4afb984401 8.0
+- /api/reports **16.6** <- next thing to fix; the reports list still does per-exam queries.
+
+## Next (not done)
+
+1. /api/reports at 16.6 statements/request is a per-exam N+1 in the list handler. Biggest
+   remaining admin win.
+2. /api/admin/invariants (~576 ms of server time) is a full audit and by far the slowest
+   endpoint. Untouched on purpose; it is admin-triggered, not on a hot path.
+3. Consider raising DIRECTORY_CACHE_MS above 15 s only if staff report stale rosters is not
+   an issue; 15 s was chosen so a just-added student shows up on the next page load.
