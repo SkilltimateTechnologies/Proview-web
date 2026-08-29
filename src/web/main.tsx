@@ -1,12 +1,56 @@
-import { StrictMode } from "react";
+import { StrictMode, Suspense, lazy } from "react";
 import { createRoot } from "react-dom/client";
 import { Router } from "wouter";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import "./styles.css";
-import App from "./app.tsx";
 import { StudentApp } from "./student";
-import { RegisterPage } from "./register/RegisterPage.tsx";
 import { ErrorBoundary } from "./components/error-boundary";
+import { importWithRetry, installChunkErrorRecovery } from "./lib/lazy-chunk";
+
+/* Only one of these three roots ever renders — the URL decides, below, before
+ * anything mounts. They used to be three static imports, which put all three in
+ * one chunk: a student sat down to an exam and downloaded the entire admin
+ * console (13 pages, recharts, the whole question bank UI) to render a login
+ * box. Measured at 2.06 MB / 474 KB brotli in one file, served by the same
+ * single Bun process that is answering their heartbeats, with no CDN.
+ *
+ * The student app stays a STATIC import on purpose. It is the exam-critical
+ * path, so it must arrive in the first round trip, and it must be listed in the
+ * document's own resources for the service worker's offline pre-cache (see
+ * below) to see it. Admin and register become lazy chunks a student never
+ * fetches; an admin pays one extra round trip at a desk, not mid-exam.
+ */
+const AdminApp = lazy(() => importWithRetry(() => import("./app.tsx"), { key: "admin" }));
+const RegisterPage = lazy(() =>
+	importWithRetry(() => import("./register/RegisterPage.tsx"), { key: "register" }).then(
+		(module) => ({ default: module.RegisterPage }),
+	),
+);
+
+// A chunk that never arrives is the other way to get a blank page, and the
+// error boundary cannot catch it because nothing ever renders. Recover once.
+installChunkErrorRecovery();
+
+/** Shown only while a lazy admin/register chunk is in flight. Inline-styled so
+ *  it cannot itself depend on a chunk that has not arrived yet. */
+function BootSplash() {
+	return (
+		<div
+			style={{
+				minHeight: "100vh",
+				display: "flex",
+				alignItems: "center",
+				justifyContent: "center",
+				background: "#0f172a",
+				color: "#94a3b8",
+				fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+				fontSize: 14,
+			}}
+		>
+			Loading…
+		</div>
+	);
+}
 
 const queryClient = new QueryClient();
 
@@ -73,16 +117,22 @@ createRoot(document.getElementById("root")!).render(
 		    reload button instead of the white screen students reported during a
 		    live exam. There was no boundary in the app at all before this. */}
 		<ErrorBoundary>
-			{isRegister ? (
-				<RegisterPage />
-			) : isStudent ? (
+			{isStudent ? (
+				// No Suspense: the student app is a static import, so it is already
+				// in the entry chunk and never suspends on a network fetch.
 				<StudentApp />
 			) : (
-				<QueryClientProvider client={queryClient}>
-					<Router>
-						<App />
-					</Router>
-				</QueryClientProvider>
+				<Suspense fallback={<BootSplash />}>
+					{isRegister ? (
+						<RegisterPage />
+					) : (
+						<QueryClientProvider client={queryClient}>
+							<Router>
+								<AdminApp />
+							</Router>
+						</QueryClientProvider>
+					)}
+				</Suspense>
 			)}
 		</ErrorBoundary>
 	</StrictMode>,

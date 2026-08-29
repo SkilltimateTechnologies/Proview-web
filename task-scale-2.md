@@ -413,3 +413,97 @@ students' cadence *produces*, not a ceiling.
   remaining admin win.
 - **Turso plan: still no evidence it is the problem.** Nothing here changes §11. The dashboard
   check for the incident window remains worth 5 minutes as *confirmation*.
+
+---
+
+# Addendum 4 — the blank pages (2026-08-29)
+
+Submit is fixed and live (`b3a1e40`). This addendum covers the **other** symptom students
+reported: **blank pages**. §15 listed the JS bundle as "the most likely cause… still the single
+process serving a 473 KB chunk". That is now addressed at the cause, not just made recoverable.
+
+## 16. What a student was actually downloading
+
+`src/web/main.tsx` decides between three roots — the admin console, the student exam client and the
+public register page — from the URL, before anything mounts. All three were **static imports**, so
+Rollup put all three in one chunk. A student sitting down to an exam downloaded the entire admin
+console (13 pages, recharts, the whole question-bank UI) to render a login box. [from code]
+
+| | raw | brotli q9 |
+|---|---|---|
+| `assets/index-*.js`, one file, everything | 2,112,465 B | **474,795 B** |
+
+[measured, `node zlib brotliCompressSync` at the same q9 the server uses]
+
+Served by the one Bun process that is simultaneously answering 300 students' heartbeats, autosaves
+and submits, with no CDN in front of it.
+
+There was also a second, separate blank-page path: **a chunk that fails to fetch renders nothing, so
+the error boundary from §12 cannot catch it** — there is no component mounted to catch anything. Two
+causes: a transient fetch failure (plausible during a start stampede), and a stale `index.html`
+pointing at hashed filenames a deploy has replaced, which 404s forever no matter how many times it
+is retried.
+
+## 17. What changed
+
+**1. The admin console left the student's critical path.** [from code]
+Admin and register are now lazy chunks behind `Suspense`; **the student app stays a static import**
+on purpose — it is the exam-critical path, so it must arrive in the first round trip, and it must
+appear in the document's own resource list for the service worker's offline pre-cache to see it
+(that pre-cache is what lets an exam survive an internet drop plus a refresh; a lazily-loaded
+student chunk could miss it and reintroduce the exact blank page it was written to prevent).
+
+**2. A chunk that cannot be fetched now recovers instead of showing nothing.** New
+`src/web/lib/lazy-chunk.ts`: retry with jittered exponential backoff, then **reload once per session**
+(sessionStorage guard) to pick up a new deploy's hashes, then rethrow so the error boundary renders
+something readable. Plus `installChunkErrorRecovery()` for Vite's `vite:preloadError`, which would
+otherwise become an unhandled rejection and a white screen.
+
+The reload guard is the part that had to be right in both directions: no reload and the student
+keeps the blank page; an unguarded reload and they are trapped in a flicker they cannot read or
+escape. It fires at most once per chunk key per session.
+
+## 18. Measured result
+
+| chunk | raw | brotli | who fetches it |
+|---|---|---|---|
+| `index-*.js` (entry + student client) | 1,178,403 | **275,646** | everyone |
+| `app-*.js` (admin console) | 910,662 | 202,318 | admins only |
+| `RegisterPage-*.js` | 18,351 | 3,024 | register page only |
+| `react-pdf.browser-*.js` | 1,623,166 | 473,637 | admin, on PDF export (already lazy) |
+
+**A student's JS drops from 474,795 B to 275,646 B — 42% less, 199 KB saved per cold load.** Across
+300 students that is ~58 MB less egress through the single process per load wave. [measured]
+
+Verified in a real browser, not inferred from the build output — `scripts/verify-chunks.py` drives
+Chromium at both pages and records every JS request: [measured]
+
+```
+student page /px9k2m7/login →  index-BgZIRisR.js
+admin page   /            →  index-BgZIRisR.js, app-Cgo2colK.js
+PASS  admin console stays off the student's wire, both pages render
+```
+
+That script exists because the thing that can silently regress is Rollup's chunk graph, not our
+source: one stray static import from the student tree into an admin page would quietly put the whole
+console back into the entry chunk, the build would still pass, and 300 students would download it
+again.
+
+Tests: **271 pass** (was 261) — 10 new in `src/web/lib/lazy-chunk.test.ts`, all with injected clock,
+sleep, storage and reload so there is no timer and no browser in the suite. `bun run build` green.
+`typecheck:web` still has its 57 pre-existing errors, none in the touched files. [measured]
+
+## 19. The honest cost, and what is still not fixed
+
+- **Admins pay for this, slightly.** Their total is now 275,646 + 202,318 = **477,964 B across two
+  files plus one extra round trip**, against 474,795 B in one file before. ~3 KB and one RTT worse,
+  at a desk, not mid-exam. Deliberate. [arithmetic]
+- **The CSS is untouched** (49,755 B / 9,700 B brotli, one file). Tailwind emits a single sheet and
+  the student components use those utilities; splitting it risks an unstyled exam for a 9.7 KB
+  saving. Not worth it.
+- **Still no CDN.** 275 KB is a much smaller blast radius, not a different architecture: one process
+  still serves every student's bundle. [unverified] whether this alone would have prevented the
+  blank pages in the last exam — 42% fewer bytes and a recoverable failure are strictly better, but
+  I cannot claim it as the proven root cause without the Railway metrics for that window.
+- **`/api/reports` still runs 16.6 statements.** Unchanged, still the biggest remaining admin win.
+- **Turso plan: still no evidence it is the problem.** Nothing here changes §11.
