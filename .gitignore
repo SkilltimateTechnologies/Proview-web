@@ -50,3 +50,7 @@ orphan-answers-delete-backup-*.json
 
 # local throwaway verification database
 .tmp-verify.db*
+
+# Throwaway load-test database (scripts/loadtest-exam.py) — never commit
+.tmp-load.db*
+scripts/__pycache__/

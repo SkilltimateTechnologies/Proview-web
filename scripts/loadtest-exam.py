@@ -24,6 +24,20 @@ Cadence per student, taken from src/web/student/pages/exam-runner.tsx:
     event flush      every 30s   (POST /student/attempts/:id/events)
     snapshot url     every 27s   (POST /student/attempts/:id/snapshot-url)
     status poll        once      (GET  /student/attempts/:examId/status)
+
+THREE THINGS A REAL EXAM HAS THAT STUDENT CADENCE ALONE DOES NOT, each opt-in:
+
+    --monitor-poll    an invigilator with the Live Monitor open, polling
+                      /api/monitor every 5s for the whole run. This path has
+                      frozen the app before (see src/api/lib/watchdog.ts) and it
+                      is the one thing a pure student load test never touches.
+    --submit-storm    the end-of-exam bell: every student submits inside
+                      --submit-window seconds, and submit grades inline on the
+                      request path (finalizeAttempt).
+    DB_FAKE_LATENCY_MS on the SERVER (not this script) — production is Turso over
+                      HTTP at ~13ms per statement, a local SQLite file is
+                      microseconds. Without it this test deletes the dominant
+                      cost in production and everything looks healthy.
 """
 
 import argparse
@@ -127,9 +141,18 @@ def seed_students(db_path: str, count: int):
                 (attempt_id, exam_id, student_id, now, now, now),
             )
         students.append({"studentId": student_id, "attemptId": attempt_id})
+    # A previous run with --submit-storm left these attempts submitted/graded, and
+    # the exam endpoints correctly freeze a submitted attempt (autosave returns
+    # frozen:true without writing). Reset them so every run measures the same work.
+    con.execute(
+        "UPDATE attempts SET status = 'in_progress', submitted_at = NULL, score = NULL,"
+        " integrity_score = NULL WHERE exam_id = ? AND status IN ('submitted','graded')"
+        " AND student_id IN (SELECT id FROM students WHERE roll_no LIKE 'LOAD-%')",
+        (exam_id,),
+    )
     con.commit()
     con.close()
-    return exam_id, question_ids, students
+    return exam_id, tenant_id, question_ids, students
 
 
 class Stats:
@@ -184,6 +207,96 @@ def blocking_request(method, url, token, body):
         res.read()
         if res.status >= 400:
             raise RuntimeError(f"status {res.status}")
+
+
+def admin_session(base, email, password):
+    """Sign in over HTTP and return the session cookie, for the Live Monitor poll."""
+    req = urllib.request.Request(
+        base + "/api/auth/sign-in/email",
+        data=json.dumps({"email": email, "password": password}).encode(),
+        method="POST",
+    )
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=30) as res:
+        res.read()
+        cookies = res.headers.get_all("Set-Cookie") or []
+    jar = "; ".join(c.split(";", 1)[0] for c in cookies)
+    if not jar:
+        raise SystemExit(f"admin sign-in returned no cookie for {email}")
+    return jar
+
+
+def monitor_request(base, cookie, tenant_id):
+    req = urllib.request.Request(base + "/api/monitor", method="GET")
+    req.add_header("Cookie", cookie)
+    req.add_header("X-Tenant-Id", tenant_id)
+    with urllib.request.urlopen(req, timeout=60) as res:
+        body = res.read()
+        if res.status >= 400:
+            raise RuntimeError(f"status {res.status}")
+    return json.loads(body)
+
+
+async def monitor_loop(pool, stats, base, cookie, tenant_id, deadline, every=5.0):
+    """One invigilator watching the Live Monitor, at the real 5s client poll rate.
+
+    A student-only load test leaves monitor.builds at 0 — yet this is the path that
+    seized up during a live exam, because it aggregates every attempt in the tenant.
+    """
+    verdicts = []
+    while time.monotonic() < deadline:
+        started = time.perf_counter()
+        ok = True
+        try:
+            payload = await asyncio.get_running_loop().run_in_executor(
+                pool, lambda: monitor_request(base, cookie, tenant_id)
+            )
+            health = payload.get("health") or {}
+            verdicts.append((health.get("lastBuildMs"), health.get("degraded")))
+        except Exception:
+            ok = False
+        stats.record("MONITOR", (time.perf_counter() - started) * 1000, ok)
+        await asyncio.sleep(max(0.0, every - (time.perf_counter() - started)))
+    return verdicts
+
+
+async def submit_storm(pool, stats, base, exam_id, question_ids, students, tokens, window):
+    """The end-of-exam bell: every student submits inside `window` seconds.
+
+    Submit grades objective questions inline on the request path (finalizeAttempt),
+    so this is the heaviest thing the exam server ever does, and it all lands at once.
+    """
+    async def one(student, token, delay):
+        await asyncio.sleep(delay)
+        answers = [{"questionId": q, "response": random.randint(0, 3)} for q in question_ids]
+        await call(pool, stats, "SUBMIT", "POST",
+                   f"{base}/api/student/attempts/{student['attemptId']}/submit", token,
+                   {"answers": answers, "optionOrder": "v1", "integrityEvents": []})
+
+    await asyncio.gather(*[
+        one(s, tokens[s["studentId"]], random.uniform(0, window)) for s in students
+    ])
+
+
+async def start_burst(pool, stats, base, exam_id, students, tokens, window):
+    """The exam-start stampede: every student fetches the paper and starts, at once.
+
+    This is the heaviest read in the app — /bundle reads every exam question, joins
+    the question rows and builds a per-student option permutation — and in a real
+    exam all N students do it inside the first couple of minutes, which the steady
+    state cadence never covers.
+    """
+    async def one(student, token, delay):
+        await asyncio.sleep(delay)
+        await call(pool, stats, "BUNDLE", "GET",
+                   f"{base}/api/student/exams/{exam_id}/bundle", token)
+        await call(pool, stats, "START", "POST",
+                   f"{base}/api/student/attempts/{exam_id}/start", token,
+                   {"optionOrder": "v1"})
+
+    await asyncio.gather(*[
+        one(s, tokens[s["studentId"]], random.uniform(0, window)) for s in students
+    ])
 
 
 async def student_loop(pool, stats, base, exam_id, question_ids, student, token, deadline):
@@ -291,35 +404,74 @@ def main():
     parser.add_argument("--students", type=int, default=1000)
     parser.add_argument("--seconds", type=float, default=60)
     parser.add_argument("--workers", type=int, default=64, help="OS threads issuing requests")
+    parser.add_argument("--monitor-poll", action="store_true",
+                        help="also run one invigilator polling /api/monitor every 5s")
+    parser.add_argument("--start-burst", action="store_true",
+                        help="before the run, every student fetches /bundle and starts")
+    parser.add_argument("--start-window", type=float, default=60,
+                        help="seconds the exam-start stampede is spread over")
+    parser.add_argument("--submit-storm", action="store_true",
+                        help="after the run, every student submits (grades inline)")
+    parser.add_argument("--submit-window", type=float, default=60,
+                        help="seconds the submits are spread over")
+    parser.add_argument("--admin-email", default="meera@grce.edu")
+    parser.add_argument("--admin-password", default="Admin@123")
+    parser.add_argument("--skip-page-load", action="store_true",
+                        help="skip the cold page load measurement (already known)")
     args = parser.parse_args()
 
     if "localhost" not in args.base and "127.0.0.1" not in args.base:
         raise SystemExit("refusing to load-test a non-local server")
 
     secret = read_secret(args.env)
-    exam_id, question_ids, students = seed_students(args.db, args.students)
+    exam_id, tenant_id, question_ids, students = seed_students(args.db, args.students)
+    tokens = {s["studentId"]: student_token(s["studentId"], secret) for s in students}
     print(f"exam {exam_id}: {len(students)} virtual students, {len(question_ids)} questions")
     print(f"cadence: heartbeat {HEARTBEAT_S}s · autosave {AUTOSAVE_S}s · events {EVENTS_S}s · snapshot {SNAPSHOT_S}s")
+    cookie = None
+    if args.monitor_poll:
+        cookie = admin_session(args.base, args.admin_email, args.admin_password)
+        print(f"live monitor: 1 invigilator polling /api/monitor every 5s as {args.admin_email}")
+    if args.submit_storm:
+        print(f"submit storm: {len(students)} submits spread over {args.submit_window:.0f}s after the run")
 
-    page_load_cost(args.base)
+    if not args.skip_page_load:
+        page_load_cost(args.base)
 
     stats = Stats()
+    verdicts = []
     from concurrent.futures import ThreadPoolExecutor
 
     async def run():
-        deadline = time.monotonic() + args.seconds
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            await asyncio.gather(*[
+            if args.start_burst:
+                await start_burst(pool, stats, args.base, exam_id, students, tokens,
+                                  args.start_window)
+            deadline = time.monotonic() + args.seconds
+            tasks = [
                 student_loop(pool, stats, args.base, exam_id, question_ids, student,
-                             student_token(student["studentId"], secret), deadline)
+                             tokens[student["studentId"]], deadline)
                 for student in students
-            ])
+            ]
+            if cookie:
+                tasks.append(monitor_loop(pool, stats, args.base, cookie, tenant_id, deadline))
+            results = await asyncio.gather(*tasks)
+            if cookie and isinstance(results[-1], list):
+                verdicts.extend(results[-1])
+            if args.submit_storm:
+                await submit_storm(pool, stats, args.base, exam_id, question_ids,
+                                   students, tokens, args.submit_window)
 
     print(f"\n=== {len(students)} students, {args.seconds:.0f}s ===")
     started = time.perf_counter()
     asyncio.run(run())
     elapsed = time.perf_counter() - started
     failures = stats.report(elapsed)
+    if verdicts:
+        builds = [v[0] for v in verdicts if v[0] is not None]
+        if builds:
+            print(f"  monitor build ms: n={len(builds)} p50={statistics.median(builds):.0f} "
+                  f"max={max(builds):.0f}  degraded_reports={sum(1 for v in verdicts if v[1])}")
 
     health = urllib.request.urlopen(args.base + "/api/health").read()
     payload = json.loads(health)

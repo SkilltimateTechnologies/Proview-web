@@ -6,6 +6,7 @@ import "./styles.css";
 import App from "./app.tsx";
 import { StudentApp } from "./student";
 import { RegisterPage } from "./register/RegisterPage.tsx";
+import { ErrorBoundary } from "./components/error-boundary";
 
 const queryClient = new QueryClient();
 
@@ -68,16 +69,21 @@ if ("serviceWorker" in navigator) {
 
 createRoot(document.getElementById("root")!).render(
 	<StrictMode>
-		{isRegister ? (
-			<RegisterPage />
-		) : isStudent ? (
-			<StudentApp />
-		) : (
-			<QueryClientProvider client={queryClient}>
-				<Router>
-					<App />
-				</Router>
-			</QueryClientProvider>
-		)}
+		{/* Outermost boundary: a render crash anywhere below shows a message and a
+		    reload button instead of the white screen students reported during a
+		    live exam. There was no boundary in the app at all before this. */}
+		<ErrorBoundary>
+			{isRegister ? (
+				<RegisterPage />
+			) : isStudent ? (
+				<StudentApp />
+			) : (
+				<QueryClientProvider client={queryClient}>
+					<Router>
+						<App />
+					</Router>
+				</QueryClientProvider>
+			)}
+		</ErrorBoundary>
 	</StrictMode>,
 );

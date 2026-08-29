@@ -9,7 +9,7 @@
  * rate limits. When every subjective answer of an attempt is graded, the score
  * is recomputed and the attempt flips to "graded".
  */
-import { and, eq, inArray, notInArray } from "drizzle-orm";
+import { and, eq, inArray, notInArray, sql as dsql } from "drizzle-orm";
 import { db } from "../database";
 import * as schema from "../database/schema";
 import { gradeSubjective } from "./ai";
@@ -339,10 +339,32 @@ export async function finalizeAttempt(
   // same row instead of creating a second one. autoGrade is deterministic and the
   // merged `response` prefers content, so whichever call lands last writes the
   // same values.
-  for (const r of rows) {
-    await db.insert(schema.answers).values(r).onConflictDoUpdate({
+  //
+  // ONE statement for the whole paper, not one per question. This used to be a
+  // `for (const r of rows) await db.insert(...)` loop, which is invisible on a
+  // local SQLite file and brutal on Turso over HTTP: every iteration is its own
+  // remote round trip, so a 15-question paper spent 15 sequential latencies
+  // inside submit. Measured at a 13ms/statement simulation, submit was ~21
+  // statements / 334ms p50 while autosave (already batched, below) was ~4/62ms.
+  // `excluded` is the row we tried to insert, applied row by row by SQLite, so
+  // each row still lands its own response/score/maxScore/aiNotes/autoGraded —
+  // identical values to the loop, in a single trip.
+  //
+  // Deduped by questionId first: SQLite refuses to apply ON CONFLICT twice to
+  // the same row within one statement. `eqs` is one row per exam question and the
+  // unique index makes twins impossible, so this is defence in depth, matching
+  // the autosave path. Chunked because libSQL caps bound variables per statement.
+  const writeRows = [...new Map(rows.map((r) => [r.questionId, r])).values()];
+  for (let i = 0; i < writeRows.length; i += 50) {
+    await db.insert(schema.answers).values(writeRows.slice(i, i + 50)).onConflictDoUpdate({
       target: [schema.answers.attemptId, schema.answers.questionId],
-      set: { response: r.response, score: r.score, maxScore: r.maxScore, aiNotes: r.aiNotes, autoGraded: r.autoGraded },
+      set: {
+        response: dsql`excluded.response`,
+        score: dsql`excluded.score`,
+        maxScore: dsql`excluded.max_score`,
+        aiNotes: dsql`excluded.ai_notes`,
+        autoGraded: dsql`excluded.auto_graded`,
+      },
     });
   }
   // Drop stray rows for questions that are no longer part of the paper (the old

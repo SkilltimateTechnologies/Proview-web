@@ -34,6 +34,39 @@ const client = createClient({
 });
 
 /**
+ * LOAD TESTING ONLY — off unless DB_FAKE_LATENCY_MS is set, and never set in prod.
+ *
+ * Production talks to Turso over HTTP (~13ms per statement, measured). A load test
+ * against a local SQLite file pays microseconds per statement, which deletes the
+ * single dominant cost in production: a 300-student run looked perfectly healthy
+ * locally while the real exam slowed down. This makes a local file behave like a
+ * remote database so a round-trip-bound slowdown can be reproduced without
+ * pointing load at the real database.
+ *
+ * Only `execute` and `batch` are delayed — the two methods drizzle sends
+ * statements through. With the variable unset this is an exact no-op: the same
+ * client object is handed to drizzle, unwrapped.
+ */
+const fakeLatencyMs = Number(process.env.DB_FAKE_LATENCY_MS ?? 0);
+const dbClient = fakeLatencyMs > 0
+  ? new Proxy(client, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if (typeof value !== "function") return value;
+        const fn = value as (...a: unknown[]) => unknown;
+        if (prop !== "execute" && prop !== "batch") return fn.bind(target);
+        return async (...args: unknown[]) => {
+          await new Promise((resolve) => setTimeout(resolve, fakeLatencyMs));
+          return fn.apply(target, args);
+        };
+      },
+    })
+  : client;
+if (fakeLatencyMs > 0) {
+  console.warn(`[db] SIMULATED LATENCY: +${fakeLatencyMs}ms per statement (load testing only)`);
+}
+
+/**
  * Statements this process has sent to the database, since boot.
  *
  * The exam pages failing at ~1000 concurrent students was a round-trip problem:
@@ -49,7 +82,7 @@ export const dbStats = {
   },
 };
 
-export const db = drizzle(client, {
+export const db = drizzle(dbClient, {
   schema,
   logger: {
     logQuery() {

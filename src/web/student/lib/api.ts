@@ -116,16 +116,78 @@ function tokenHeader(): Record<string, string> {
   return t ? { "X-Student-Token": t } : {};
 }
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_URL}/api${path}`, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...tokenHeader(), ...(init?.headers || {}) },
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error((body as { message?: string }).message || `Request failed (${res.status})`);
+/**
+ * Per-call reliability policy. Opt-in, because retrying is only safe for calls
+ * that are idempotent server-side.
+ *
+ * `retries` = extra attempts AFTER the first, `timeoutMs` = per-attempt abort.
+ * Without a timeout a request that never answers hangs forever: `fetch` has no
+ * default deadline, so a student watching a dead socket got no error and no
+ * retry — the submit button just stayed stuck.
+ */
+type ReqOpts = { retries?: number; timeoutMs?: number };
+
+/** An HTTP status that a retry could plausibly fix. 4xx means "don't bother". */
+function isRetriableStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Carries the HTTP status through to the caller so submit can tell "the server
+ * refused this" from "we never reached the server".
+ */
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
   }
-  return res.json() as Promise<T>;
+}
+
+async function req<T>(path: string, init?: RequestInit, opts?: ReqOpts): Promise<T> {
+  const retries = opts?.retries ?? 0;
+  const timeoutMs = opts?.timeoutMs ?? 0;
+  let lastErr: unknown;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    // Fresh controller per attempt — an aborted one stays aborted.
+    const ctl = timeoutMs > 0 ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs) : null;
+    try {
+      const res = await fetch(`${API_URL}/api${path}`, {
+        ...init,
+        signal: ctl?.signal ?? init?.signal,
+        headers: { "Content-Type": "application/json", ...tokenHeader(), ...(init?.headers || {}) },
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        const err = new ApiError(
+          (body as { message?: string }).message || `Request failed (${res.status})`,
+          res.status,
+        );
+        // A 4xx is the server's considered answer (already submitted, bad token,
+        // exam closed). Repeating it just wastes the student's time.
+        if (!isRetriableStatus(res.status) || attempt === retries) throw err;
+        lastErr = err;
+      } else {
+        return (await res.json()) as T;
+      }
+    } catch (e) {
+      // Network failure, DNS, dropped connection or our own timeout abort.
+      if (e instanceof ApiError && !isRetriableStatus(e.status)) throw e;
+      lastErr = e;
+      if (attempt === retries) throw e;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    // Exponential backoff (400ms, 800ms, 1600ms...) capped at 4s, with jitter so
+    // 300 students whose submits failed together don't retry in lockstep and
+    // rebuild the same spike that broke them.
+    const backoff = Math.min(400 * 2 ** attempt, 4000);
+    await sleep(backoff * (0.5 + Math.random() * 0.5));
+  }
+  throw lastErr instanceof Error ? lastErr : new Error("Request failed");
 }
 
 export const api = {
@@ -145,16 +207,25 @@ export const api = {
   pause: (examId: string) =>
     req<{ ok: boolean }>(`/student/attempts/${examId}/pause`, { method: "POST", body: JSON.stringify({}) }),
   heartbeat: (examId: string) =>
-    req<HeartbeatInfo>(`/student/heartbeat/${examId}`, { method: "POST" }),
+    // Pure keepalive, no side effect worth protecting: retry freely so one blip
+    // does not surface as a scary "connection lost" to a student mid-exam.
+    req<HeartbeatInfo>(`/student/heartbeat/${examId}`, { method: "POST" }, { retries: 2, timeoutMs: 10000 }),
   exams: () => req<{ exams: ExamListItem[]; student: { id: string; name: string; rollNo: string; email: string | null } }>("/student/exams"),
-  bundle: (examId: string) => req<Bundle>(`/student/exams/${examId}/bundle`),
+  // Read-only, and the paper is what the student came for: retry hard. A failed
+  // bundle fetch falls back to the localStorage cache, so this only has to win
+  // on a student's FIRST sitting — where there is no cache to fall back to.
+  bundle: (examId: string) => req<Bundle>(`/student/exams/${examId}/bundle`, undefined, { retries: 3, timeoutMs: 20000 }),
   // optionOrder (all four answer-carrying calls below): the scheme token from the
   // bundle currently on screen. Passed explicitly rather than read from storage so
   // it can never disagree with the paper the student is actually looking at.
   start: (examId: string, optionOrder?: string) =>
-    req<StartInfo>(`/student/attempts/${examId}/start`, { method: "POST", body: JSON.stringify({ optionOrder }) }),
+    // Idempotent by design: a second /start resumes the existing attempt instead
+    // of creating a new one, so retrying cannot cost a student their timer.
+    req<StartInfo>(`/student/attempts/${examId}/start`, { method: "POST", body: JSON.stringify({ optionOrder }) }, { retries: 3, timeoutMs: 15000 }),
   status: (examId: string, optionOrder?: string) =>
-    req<StatusInfo>(`/student/attempts/${examId}/status${optionOrder ? `?optionOrder=${encodeURIComponent(optionOrder)}` : ""}`),
+    // Read-only. Drives the post-submit confirmation screen, so a blip here is
+    // what makes a successful submit LOOK like a failure.
+    req<StatusInfo>(`/student/attempts/${examId}/status${optionOrder ? `?optionOrder=${encodeURIComponent(optionOrder)}` : ""}`, undefined, { retries: 3, timeoutMs: 15000 }),
   // Real-time per-answer autosave. keepalive lets the request survive a page
   // hide/unload so the last answer still reaches the server. Never throws — a
   // failed sync just leaves the answer in the client's dirty set to retry.
@@ -182,7 +253,14 @@ export const api = {
     req<{ ok: boolean; score: number; integrityScore: number }>(`/student/attempts/${attemptId}/submit`, {
       method: "POST",
       body: JSON.stringify(payload),
-    }),
+    },
+    // The fix for "not able to submit". This used to be a single bare fetch: one
+    // dropped packet and the student was stuck staring at a Submit button that
+    // blamed their wifi. Safe to retry — the server treats a repeat submit as
+    // idempotent and answers { ok: true, alreadySubmitted: true } rather than
+    // re-grading. Generous deadline because submit is the heaviest call in the
+    // exam and the one we must not give up on.
+    { retries: 4, timeoutMs: 20000 }),
   review: (attemptId: string) => req<Review>(`/student/attempts/${attemptId}/review`),
   runCode: (source: string, language: string, stdin?: string, languageId?: number) =>
     req<{ ok: boolean; stdout: string; stderr: string; compileOutput: string; status: string; time: string | null; memory: number | null }>("/student/run-code", {

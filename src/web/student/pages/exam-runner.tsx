@@ -1205,12 +1205,23 @@ export function ExamRunner() {
       setResult({ answered, skipped, events: s.integrityEvents.length, attemptId: s.attemptId, score: res.score ?? null });
       setSubmitting(false);
       setPhase("done");
-    } catch {
-      // Live exam requires connectivity to submit — retry once online returns.
+    } catch (e) {
+      // We got here only AFTER api.submit exhausted its own retries (4 attempts
+      // with backoff), so this is a real, persistent failure — not a blip.
       submittedRef.current = false;
       setSubmitting(false);
       setPhase("running");
-      setErr("Couldn't submit — connection lost. Reconnect and press Submit again. Your answers are safe on this device.");
+      // The old copy always said "connection lost", which blamed the student's
+      // wifi even when the server had returned a 500. Distinguish the two: a
+      // status means we reached the server and it refused.
+      const status = (e as { status?: number } | null)?.status;
+      setErr(
+        status && status >= 500
+          ? `Couldn't submit — the server returned an error (${status}) after several retries. Your answers are safe on this device. Tell your invigilator, then press Submit again.`
+          : status
+            ? `Couldn't submit — ${(e as Error).message} Your answers are safe on this device. Tell your invigilator before pressing Submit again.`
+            : "Couldn't submit — we couldn't reach the server after several attempts. Check your connection and press Submit again. Your answers are safe on this device.",
+      );
     }
   }, [bundle, examId]);
 
