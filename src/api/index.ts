@@ -21,6 +21,7 @@ import { isEligible, matchesCohort, loadRoster, loadRosters, ensureOptInOnlyLoad
 import { TtlCache } from "./lib/ttl-cache";
 import { heartbeats } from "./lib/heartbeat-queue";
 import { integrityRollup } from "./lib/integrity-rollup";
+import { attemptOwners } from "./lib/attempt-owner";
 import { EMPTY_ROLLUP, loadAttemptRollups, rollupAvg } from "./lib/report-rollup";
 import { TenantDirectory } from "./lib/tenant-directory";
 import { examEffStatus, isConcluded, isReportable, toMs, type StatusExam } from "./lib/exam-status";
@@ -1456,6 +1457,9 @@ const app = new Hono<{ Variables: Vars }>()
     // forward from a rowid watermark - a reused rowid would land below it. Force a
     // full rebuild; see lib/integrity-rollup.ts.
     integrityRollup.invalidateAll();
+    // The attempts themselves are gone, so the owner cache must not keep
+    // authorizing their former owners; see lib/attempt-owner.ts.
+    attemptOwners.invalidateAll();
     await db.delete(schema.attempts).where(eq(schema.attempts.studentId, sid));
     await db.delete(schema.examRoster).where(eq(schema.examRoster.studentId, sid));
     await db.delete(schema.students).where(eq(schema.students.id, sid));
@@ -1988,8 +1992,10 @@ const app = new Hono<{ Variables: Vars }>()
     const sid = await verifyStudentToken(c.req.header("x-student-token"));
     if (!sid) return c.json({ message: "Unauthorized" }, 401);
     const aid = c.req.param("attemptId");
-    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.id, aid), eq(schema.attempts.studentId, sid))).limit(1);
-    if (!attempt) return c.json({ message: "Not found" }, 404);
+    // Authorization is ALL this route needs from the attempt - nothing below reads
+    // a single column off it. Answered from memory, because attemptId -> studentId
+    // is written once and never updated; see lib/attempt-owner.ts.
+    if (!(await attemptOwners.authorize(db, aid, sid))) return c.json({ message: "Not found" }, 404);
     const body = await c.req.json().catch(() => ({}));
     const saved = await persistIntegrityEvents(aid, body.events ?? body.integrityEvents);
     return c.json({ ok: true, saved }, 200);
@@ -2003,8 +2009,10 @@ const app = new Hono<{ Variables: Vars }>()
     const sid = await verifyStudentToken(c.req.header("x-student-token"));
     if (!sid) return c.json({ message: "Unauthorized" }, 401);
     const aid = c.req.param("attemptId");
-    const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.id, aid), eq(schema.attempts.studentId, sid))).limit(1);
-    if (!attempt) return c.json({ message: "Not found" }, 404);
+    // Authorization is ALL this route needs from the attempt - nothing below reads
+    // a single column off it. Answered from memory, because attemptId -> studentId
+    // is written once and never updated; see lib/attempt-owner.ts.
+    if (!(await attemptOwners.authorize(db, aid, sid))) return c.json({ message: "Not found" }, 404);
     const key = `${INTEGRITY_PREFIX(aid)}${Date.now()}-${id()}.jpg`;
     try {
       const url = await presignPut(key, "image/jpeg");
@@ -2492,6 +2500,9 @@ const app = new Hono<{ Variables: Vars }>()
           // forward from a rowid watermark - a reused rowid would land below it. Force a
           // full rebuild; see lib/integrity-rollup.ts.
           integrityRollup.invalidateAll();
+          // The attempts themselves are gone, so the owner cache must not keep
+          // authorizing their former owners; see lib/attempt-owner.ts.
+          attemptOwners.invalidateAll();
           if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, r.studentId)));
           await db.delete(schema.examRoster).where(eq(schema.examRoster.id, r.id));
         }
@@ -2653,6 +2664,9 @@ const app = new Hono<{ Variables: Vars }>()
     // forward from a rowid watermark - a reused rowid would land below it. Force a
     // full rebuild; see lib/integrity-rollup.ts.
     integrityRollup.invalidateAll();
+    // The attempts themselves are gone, so the owner cache must not keep
+    // authorizing their former owners; see lib/attempt-owner.ts.
+    attemptOwners.invalidateAll();
     if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
     await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
     // Only need a "remove" override if the student would otherwise be a cohort match.
@@ -3200,6 +3214,9 @@ const app = new Hono<{ Variables: Vars }>()
     // forward from a rowid watermark - a reused rowid would land below it. Force a
     // full rebuild; see lib/integrity-rollup.ts.
     integrityRollup.invalidateAll();
+    // The attempts themselves are gone, so the owner cache must not keep
+    // authorizing their former owners; see lib/attempt-owner.ts.
+    attemptOwners.invalidateAll();
     if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
     // Record the remove override (clear any prior override first).
     await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
@@ -3227,6 +3244,9 @@ const app = new Hono<{ Variables: Vars }>()
       // forward from a rowid watermark - a reused rowid would land below it. Force a
       // full rebuild; see lib/integrity-rollup.ts.
       integrityRollup.invalidateAll();
+      // The attempts themselves are gone, so the owner cache must not keep
+      // authorizing their former owners; see lib/attempt-owner.ts.
+      attemptOwners.invalidateAll();
       if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
       await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
       await db.insert(schema.examRoster).values({ id: id("rst"), examId: eid, studentId, mode: "remove", createdBy: p.userId ?? null });
@@ -3258,6 +3278,9 @@ const app = new Hono<{ Variables: Vars }>()
     // forward from a rowid watermark - a reused rowid would land below it. Force a
     // full rebuild; see lib/integrity-rollup.ts.
     integrityRollup.invalidateAll();
+    // The attempts themselves are gone, so the owner cache must not keep
+    // authorizing their former owners; see lib/attempt-owner.ts.
+    attemptOwners.invalidateAll();
     if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
     // Guarantee roster eligibility: clear a stray "remove"; add an "add" override
     // only if the student isn't already a cohort match.
