@@ -1135,3 +1135,120 @@ was never captured and no change can create it. And it is detection, not prevent
 camera never works still starts, still submits, still scores. Blocking them outright is a policy
 decision, not an engineering one, and nobody has asked for it. What changes is that the next such
 student is visible on the roster the same day instead of two months later.
+
+---
+
+## 35. Heartbeats: 67 writes a second become one every five (`4707fb5`)
+
+**Not a complaint — headroom.** Nobody reported anything. This is the P1 item queued behind the
+deferred-grading work in §33, and it removes the single largest write source on the platform.
+
+### What it cost
+
+`POST /student/heartbeat/:examId` [from code]. Every running client pings it every ~15s so the Live
+Monitor can show an online/offline dot. At 1000 concurrent students that is **~67 requests a
+second**, and each one was a **write**:
+
+```sql
+UPDATE attempts SET last_seen_at = ? WHERE exam_id = ? AND student_id = ?
+```
+
+The endpoint was already well optimised for *round trips* — §7 took it from three to one (exam row
+from a 3s coalesced cache, `UPDATE … RETURNING` doubling as the attempt read). What was left wrong
+was not the count but the **kind**. Writes are the scarce resource twice over:
+
+- **Quota** [measured]: the Developer plan allows **25M writes/month** against **2.5B reads** — reads
+  have literally 100x the headroom. A 90-minute exam with 1000 students is ~360,000 heartbeat writes
+  on its own, i.e. **1.4% of the monthly write budget for one exam**, spent entirely on a dot.
+- **Serialization** [from code, Turso/SQLite model]: there is a single writer. Every heartbeat write
+  queued behind every submit, every autosave and every grading write happening at the same moment —
+  the exact resource a submit storm is already contending for.
+
+### Why presence is the right thing to make cheap
+
+`last_seen_at` is **presence, not evidence**. It is overwritten four times a minute per student, it
+is never read historically, and the worst consequence of losing a few seconds of it is a dot in the
+monitor turning grey slightly late. Compare that with an integrity event or an answer, where losing
+seconds is losing data. That asymmetry is the whole justification: this is the one high-volume write
+on the platform that can safely become eventually-consistent.
+
+### The change
+
+The route now does a **narrow SELECT** (`id`, `startedAt`, `pausedMs` — the row `effectiveEndMs`
+needs anyway) and hands the timestamp to an in-process coalescing map. **Still exactly one round
+trip, now a read.** A flusher folds every student's pending ping into ONE batched `UPDATE` every 5s:
+
+**67 writes/s → ~0.2 writes/s.** [arithmetic] The same 1000-student, 90-minute exam goes from
+~360,000 writes to **~1,080** — a 99.7% reduction — because the cost stops scaling with student
+count and starts scaling with the clock.
+
+`src/api/lib/heartbeat-queue.ts`, pure and dependency-injected (never the `db` singleton, so tests
+drive the real SQL against in-memory libSQL):
+
+```sql
+UPDATE attempts
+   SET last_seen_at = max(coalesce(last_seen_at, 0), CASE id WHEN … THEN … END)
+ WHERE id IN (…)                                   -- chunked at 200 ids
+```
+
+Three things in that statement are load-bearing:
+
+1. **The `max(coalesce(…))` guard.** Other paths still write `last_seen_at` directly and must keep
+   doing so — autosave writes it alongside `answeredCount` (it needs the write anyway), and `/start`,
+   resume and pause stamp it. A pending heartbeat is by definition *older* than a write that happened
+   after it, so the flush may only move presence **forward, never backwards**. Without this, a flush
+   landing 3s after an autosave would drag `last_seen_at` back and make an active student look idle.
+2. **The `CASE`, not one statement per row.** 1000 students would otherwise be 1000 statements —
+   trading a write storm for a round-trip storm. Chunked at 200 ids (~600 bound parameters) to stay
+   under SQLite's cap.
+3. **Failure re-merges.** A chunk that throws goes **back into the map**, so a transient socket error
+   costs one tick of latency instead of a monitor that lies for the rest of the exam.
+
+### Two decisions that are not obvious
+
+**5s, not the 10s that was approved.** The staleness budget is what decides this. Worst case in the
+database = heartbeat interval (15s) + flush period (5s) = **20s**, or **25s** if one flush fails and
+lands on the next tick. The Live Monitor calls an attempt online within **40s**. At 5s both cases sit
+comfortably inside that window, so **the 40s threshold did not have to change** — no semantics were
+touched. At 10s the worst case is 25s (35s after a retry), which crowds 40s closely enough that
+healthy students would eventually be shown offline, and the fix would have been widening the monitor.
+Halving the period to avoid changing a threshold is the cheaper trade: it costs one extra write per
+5s, total.
+
+**The monitor overlays the pending map.** `buildMonitorSnapshot` reads `peekSeen(attemptId)` and takes
+the max against the row it read. Served from the same process, the dot now has **zero** staleness —
+strictly *more* accurate than before this change, not less. And it degrades gracefully: on split
+replicas the overlay is partial and the answer falls back to the database's ≤20s-stale value, still
+inside 40s.
+
+**The flusher starts OUTSIDE the `ROLE` gate** in `src/server.ts` — deliberately, unlike
+`startGradeQueue()` and `startAutoSubmitSweep()`. Heartbeats land on whichever process serves student
+traffic and the map lives *in that process*, so a `ROLE=web` replica that skipped the flusher would
+accumulate presence and never write it. This is not background work; it is the second half of an
+endpoint. Unref'd, plus a best-effort final flush on `SIGTERM`/`SIGINT` so a deploy does not drop a
+window.
+
+### Verified
+
+[measured] `bun run typecheck:api` clean · `bun test` **329 pass, 0 fail** (313 baseline + 16 new) ·
+`bun run build` green · pushed `85a12db..4707fb5` · production `invariants.checkedAt` advanced to
+**`2026-08-30T08:13:13.489Z`** with `ok: true`.
+
+The 16 tests target the two ways this could fail while still returning 200 to every client: the
+`CASE` writing one student's timestamp onto another student's attempt (every row asserted, not just
+one), and the monotonic guard (a row with a fresher direct write must be left alone while its
+neighbour moves forward). Plus the NULL branch, chunk boundaries, an id whose attempt row no longer
+exists, and both re-merge paths — including a heartbeat that arrives *during* a failed flush, which
+must still win.
+
+### What this does not do [unverified]
+
+No real exam has run under it. The falsifiable prediction: on the next exam the Turso **write** curve
+should drop by roughly the heartbeat share — with §33 also deferring grading out of the exam window,
+the exam-hour write rate should be dominated by autosaves and submits alone. If write volume during
+the next exam looks like Aug 27's, the attribution here was wrong and I will say so.
+
+It also does not touch the **read** side of polling, which §31 identified as the larger absolute
+number (~190,000 rows per student on Aug 27). That is the rest of P1: the `/api/reports` per-exam
+N+1, the `integrity_events` read cost (read cost only — the rows are kept forever, by decision), and
+the redundant attempt re-reads on `/events` and `/snapshot-url`.
