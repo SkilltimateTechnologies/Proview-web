@@ -20,6 +20,7 @@ import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
 import { isEligible, matchesCohort, loadRoster, loadRosters, ensureOptInOnlyLoaded, invalidateOptInOnlyCache, isOptInOnlyCode } from "./lib/roster";
 import { TtlCache } from "./lib/ttl-cache";
 import { heartbeats } from "./lib/heartbeat-queue";
+import { integrityRollup } from "./lib/integrity-rollup";
 import { EMPTY_ROLLUP, loadAttemptRollups, rollupAvg } from "./lib/report-rollup";
 import { TenantDirectory } from "./lib/tenant-directory";
 import { examEffStatus, isConcluded, isReportable, toMs, type StatusExam } from "./lib/exam-status";
@@ -358,52 +359,19 @@ async function buildMonitorSnapshot(tid: string) {
       const engaged = atts.filter((a) => a.status !== "not_started");
       // Proctoring evidence per attempt: violation count + newest snapshot key.
       //
-      // PERFORMANCE — this is what used to hang the Live Monitor.
-      // The old code SELECTed every integrity_events row for every engaged
-      // attempt and aggregated in JS. On "Elite Assessment – 1" that is 27,153
-      // rows (~1.7 MB of photo keys alone) pulled over the network EVERY 5s
-      // poll, doubled because two exams were live at once. A poll took longer
-      // than the poll interval, so requests piled up and the page froze.
+      // PERFORMANCE — this is what used to hang the Live Monitor, twice over.
+      // First it SELECTed every integrity_events row for every engaged attempt and
+      // aggregated in JS: 27,153 rows (~1.7 MB of photo keys) per 5s poll on "Elite
+      // Assessment - 1", doubled with two exams live, so a poll outlasted the poll
+      // interval and the page froze. That became two grouped statements, which was
+      // far better but still TOUCHED every event row of every engaged attempt on
+      // every build - a cost that grows with exam duration x watch time.
       //
-      // The database can do both aggregations itself and return ONE row per
-      // attempt (a few hundred, not tens of thousands). Filtering by exam_id via
-      // a join also removes the chunked 100-id IN lists entirely.
-      //
-      // Timed frames are evidence, NOT misconduct: they must never inflate the
-      // violation count, but they DO make the best live thumbnail — so they are
-      // excluded from the count while still feeding `lastKey`.
-      const nonViolationList = dsql.join([...NON_VIOLATION_TYPES].map((t) => dsql`${t}`), dsql`, `);
-      const countRows = await db.all<{ attemptId: string; violations: number }>(dsql`
-        SELECT ie.attempt_id AS attemptId, COUNT(*) AS violations
-        FROM integrity_events ie
-        JOIN attempts a ON a.id = ie.attempt_id
-        WHERE a.exam_id = ${ex.id}
-          AND a.status <> 'not_started'
-          AND ie.type NOT IN (${nonViolationList})
-        GROUP BY ie.attempt_id
-      `);
-      // Newest snapshot per attempt. ROW_NUMBER() picks one winner per attempt
-      // inside SQLite, so only ~N rows cross the wire instead of ~N x 100.
-      const photoRows = await db.all<{ attemptId: string; photoUrl: string | null }>(dsql`
-        SELECT attemptId, photoUrl FROM (
-          SELECT ie.attempt_id AS attemptId,
-                 ie.photo_url  AS photoUrl,
-                 ROW_NUMBER() OVER (PARTITION BY ie.attempt_id ORDER BY ie.at DESC, ie.rowid DESC) AS rn
-          FROM integrity_events ie
-          JOIN attempts a ON a.id = ie.attempt_id
-          WHERE a.exam_id = ${ex.id}
-            AND a.status <> 'not_started'
-            AND ie.photo_url IS NOT NULL
-            AND ie.photo_url <> ''
-        ) WHERE rn = 1
-      `);
-      const evAgg = new Map<string, { count: number; lastKey: string | null }>();
-      for (const r of countRows) evAgg.set(r.attemptId, { count: Number(r.violations) || 0, lastKey: null });
-      for (const r of photoRows) {
-        const cur = evAgg.get(r.attemptId) ?? { count: 0, lastKey: null };
-        cur.lastKey = r.photoUrl;
-        evAgg.set(r.attemptId, cur);
-      }
+      // Now the aggregate is carried forward and only rows inserted since the last
+      // build are read, off the `rowid` watermark. Evidence is monotonic, so that is
+      // exact; see lib/integrity-rollup.ts for why the watermark lives in the
+      // database rather than in a counter here, and what deletes do to it.
+      const evAgg = await integrityRollup.load(db, ex.id, NON_VIOLATION_TYPES, now);
       const enriched = await Promise.all(
         engaged.map(async (a) => {
           const stu = studentById.get(a.studentId);
@@ -441,7 +409,7 @@ async function buildMonitorSnapshot(tid: string) {
             score: a.status === "graded" ? a.score : null,
             graded: a.status === "graded",
             snapshot,
-            violations: agg?.count ?? 0,
+            violations: agg?.violations ?? 0,
           };
         }),
       );
@@ -1484,6 +1452,10 @@ const app = new Hono<{ Variables: Vars }>()
       await db.delete(schema.answers).where(eq(schema.answers.attemptId, a.id));
       await db.delete(schema.integrityEvents).where(eq(schema.integrityEvents.attemptId, a.id));
     }
+    // Deleting events can free the top rowid, and the monitor's evidence cache reads
+    // forward from a rowid watermark - a reused rowid would land below it. Force a
+    // full rebuild; see lib/integrity-rollup.ts.
+    integrityRollup.invalidateAll();
     await db.delete(schema.attempts).where(eq(schema.attempts.studentId, sid));
     await db.delete(schema.examRoster).where(eq(schema.examRoster.studentId, sid));
     await db.delete(schema.students).where(eq(schema.students.id, sid));
@@ -2516,6 +2488,10 @@ const app = new Hono<{ Variables: Vars }>()
             await db.delete(schema.answers).where(eq(schema.answers.attemptId, a.id));
             await db.delete(schema.integrityEvents).where(eq(schema.integrityEvents.attemptId, a.id));
           }
+          // Deleting events can free the top rowid, and the monitor's evidence cache reads
+          // forward from a rowid watermark - a reused rowid would land below it. Force a
+          // full rebuild; see lib/integrity-rollup.ts.
+          integrityRollup.invalidateAll();
           if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, r.studentId)));
           await db.delete(schema.examRoster).where(eq(schema.examRoster.id, r.id));
         }
@@ -2673,6 +2649,10 @@ const app = new Hono<{ Variables: Vars }>()
       await db.delete(schema.answers).where(eq(schema.answers.attemptId, a.id));
       await db.delete(schema.integrityEvents).where(eq(schema.integrityEvents.attemptId, a.id));
     }
+    // Deleting events can free the top rowid, and the monitor's evidence cache reads
+    // forward from a rowid watermark - a reused rowid would land below it. Force a
+    // full rebuild; see lib/integrity-rollup.ts.
+    integrityRollup.invalidateAll();
     if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
     await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
     // Only need a "remove" override if the student would otherwise be a cohort match.
@@ -3216,6 +3196,10 @@ const app = new Hono<{ Variables: Vars }>()
       await db.delete(schema.answers).where(eq(schema.answers.attemptId, a.id));
       await db.delete(schema.integrityEvents).where(eq(schema.integrityEvents.attemptId, a.id));
     }
+    // Deleting events can free the top rowid, and the monitor's evidence cache reads
+    // forward from a rowid watermark - a reused rowid would land below it. Force a
+    // full rebuild; see lib/integrity-rollup.ts.
+    integrityRollup.invalidateAll();
     if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
     // Record the remove override (clear any prior override first).
     await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
@@ -3239,6 +3223,10 @@ const app = new Hono<{ Variables: Vars }>()
         await db.delete(schema.answers).where(eq(schema.answers.attemptId, a.id));
         await db.delete(schema.integrityEvents).where(eq(schema.integrityEvents.attemptId, a.id));
       }
+      // Deleting events can free the top rowid, and the monitor's evidence cache reads
+      // forward from a rowid watermark - a reused rowid would land below it. Force a
+      // full rebuild; see lib/integrity-rollup.ts.
+      integrityRollup.invalidateAll();
       if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
       await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
       await db.insert(schema.examRoster).values({ id: id("rst"), examId: eid, studentId, mode: "remove", createdBy: p.userId ?? null });
@@ -3266,6 +3254,10 @@ const app = new Hono<{ Variables: Vars }>()
       await db.delete(schema.answers).where(eq(schema.answers.attemptId, a.id));
       await db.delete(schema.integrityEvents).where(eq(schema.integrityEvents.attemptId, a.id));
     }
+    // Deleting events can free the top rowid, and the monitor's evidence cache reads
+    // forward from a rowid watermark - a reused rowid would land below it. Force a
+    // full rebuild; see lib/integrity-rollup.ts.
+    integrityRollup.invalidateAll();
     if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
     // Guarantee roster eligibility: clear a stray "remove"; add an "add" override
     // only if the student isn't already a cohort match.
