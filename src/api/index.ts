@@ -20,6 +20,7 @@ import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
 import { isEligible, matchesCohort, loadRoster, loadRosters, ensureOptInOnlyLoaded, invalidateOptInOnlyCache, isOptInOnlyCode } from "./lib/roster";
 import { TtlCache } from "./lib/ttl-cache";
 import { heartbeats } from "./lib/heartbeat-queue";
+import { EMPTY_ROLLUP, loadAttemptRollups, rollupAvg } from "./lib/report-rollup";
 import { TenantDirectory } from "./lib/tenant-directory";
 import { examEffStatus, isConcluded, isReportable, toMs, type StatusExam } from "./lib/exam-status";
 
@@ -2963,27 +2964,28 @@ const app = new Hono<{ Variables: Vars }>()
     const reportRosters = await loadRosters(rows.map((e) => e.id));
     const assignedFor = (e: { id: string; classId: string | null; sectionIds: string[] | null }) =>
       allStudents.filter((stu) => isEligible(e, stu, reportRosters.get(e.id))).length;
-    const PASS_MARK = 40; // percentage
-    const withStats = await Promise.all(
-      rows.map(async (e) => {
-        const atts = await db.select().from(schema.attempts).where(eq(schema.attempts.examId, e.id));
-        const assigned = assignedFor(e);
-        // finished = submitted/graded; inProgress = actively taking it
-        const finished = atts.filter((a) => a.status === "submitted" || a.status === "graded").length;
-        const inProgress = atts.filter((a) => a.status === "in_progress").length;
-        // absent = assigned students who never finished nor are in progress, but ONLY
-        // once the exam deadline has passed (before that they may still show up).
-        const deadline = endMs(e);
-        const deadlineOver = e.status === "finished" || (deadline !== null && now >= deadline);
-        const absent = deadlineOver ? Math.max(0, assigned - finished - inProgress) : 0;
-        const graded = atts.filter((a) => a.score != null);
-        const passed = graded.filter((a) => (a.score ?? 0) >= PASS_MARK).length;
-        const failed = graded.filter((a) => (a.score ?? 0) < PASS_MARK).length;
-        const avg = graded.length ? Math.round((graded.reduce((s, a) => s + (a.score ?? 0), 0) / graded.length) * 10) / 10 : 0;
-        // "wrote" retained for backward compat (== finished).
-        return { ...e, status: effStatus(e), attempts: atts.length, assigned, finished, inProgress, absent, wrote: finished, graded: graded.length, passed, failed, avg };
-      }),
-    );
+    // Per-exam counts in ONE grouped aggregate, not one query per exam.
+    //
+    // This used to be `rows.map(async (e) => select().from(attempts).where(examId))`
+    // inside a Promise.all: a remote round trip per exam, each shipping every column
+    // of every attempt row, to end up with seven integers per card. At 11 exams and
+    // 2,520 stored attempts that meant transferring every attempt ever taken on every
+    // open of the reports page — and because it scales with exam HISTORY rather than
+    // with load, it got worse every week on its own. SQLite counts better than we do;
+    // see lib/report-rollup.ts for the definitions (which are subtle: passed/failed
+    // key off `score IS NOT NULL`, not status).
+    const rollups = await loadAttemptRollups(db, rows.map((e) => e.id));
+    const withStats = rows.map((e) => {
+      const r = rollups.get(e.id) ?? EMPTY_ROLLUP;
+      const assigned = assignedFor(e);
+      // absent = assigned students who never finished nor are in progress, but ONLY
+      // once the exam deadline has passed (before that they may still show up).
+      const deadline = endMs(e);
+      const deadlineOver = e.status === "finished" || (deadline !== null && now >= deadline);
+      const absent = deadlineOver ? Math.max(0, assigned - r.finished - r.inProgress) : 0;
+      // "wrote" retained for backward compat (== finished).
+      return { ...e, status: effStatus(e), attempts: r.attempts, assigned, finished: r.finished, inProgress: r.inProgress, absent, wrote: r.finished, graded: r.graded, passed: r.passed, failed: r.failed, avg: rollupAvg(r) };
+    });
     // Newest assessment date first (startAt if set, else createdAt).
     const dateVal = (e: (typeof withStats)[number]) => {
       const d = e.startAt ?? e.createdAt;
