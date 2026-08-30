@@ -957,3 +957,181 @@ analysis is wrong. [unverified until the chart is read]
   coding exam can exhaust the allowance for every other college [from code]. This one changes
   behaviour by design — a tenant over its cap gets blocked. The only safe shape is every tenant
   defaulting to inherit-global/unlimited, so nothing changes until a number is deliberately set.
+
+---
+
+## 33. Shipped: AI grading no longer starts at the bell (`2893cff`)
+
+**The ask, stated plainly.** Nobody complained about an exam. The request was capacity headroom:
+*"as students submit, grading starts, more load on db and overall system... maybe give a notice
+check after 2 hours for results, after exam closes we can grade."* So this section is not incident
+repair, and nothing below should be read as fixing a reported failure.
+
+**What was actually happening** [from code]. `finalizeAttempt` ended with two lines:
+
+    await recordGradeJob(aid, attempt.examId);   // delayMs = 0
+    queueAttemptGrading(aid, provider);           // an AI pass, right now
+
+Objective questions are graded inline at submit (`autoGrade`, pure CPU, no network) — cheap, and
+unchanged. But any paper containing a subjective or coding question started an **AI pass plus
+Judge0 calls from the web process while the rest of the cohort was still writing**, funnelled
+through the 12-slot semaphore, competing with live autosaves and heartbeats for the same database.
+
+To be precise, and correcting a claim made earlier in this document: AI grading was already off
+the request path — the student's submit did not wait for it. What was wrong was purely the
+*timing*. The work started at the worst possible moment and there was no reason for it to, because
+**the marks are not shown at submit anyway** — the student has always seen a "grading in progress"
+screen.
+
+**The change.** One pure function decides a release time, and the existing durable queue does the
+rest:
+
+    releaseAt = exam end + extraMin + holdMs + (hold still running) + GRADE_RELEASE_LAG_MS (5 min)
+    delayMs   = max(0, releaseAt - now)
+
+`gradeReleaseDelayMs` returns **0 — grade now, exactly today's behaviour** — for every case where
+waiting makes no sense: an exam set to `immediate`, an exam with no end time (an open practice
+paper, where "after close" never arrives), an unparseable date, a window that has already closed
+(a late or auto-submitted paper), or an exam row that could not be read. The lag is not
+decoration: the 60s auto-submit sweep needs its grace window to force-submit students who lost
+their connection through the cutoff, and grading them in the same batch as the on-time submitters
+keeps it to one batch instead of two.
+
+**Why this was a small change.** `recordGradeJob(attemptId, examId, delayMs = 0)` already threaded
+a delay into `enqueueGradeJob`, and the worker's claim query is already
+`status='pending' AND next_run_at <= now` backed by `grade_jobs_status_next_idx` (`57a658f`). No
+new table, no new timer, no new failure mode — only a number that used to always be zero.
+
+**The trap that would have silently undone it.** `sweepPendingGrading` re-enqueues submitted
+attempts every 10 minutes as a reconcile backstop, and it called `recordGradeJob` with no delay.
+Left alone it would have reset every deferred job to *due now* within ten minutes, and the whole
+change would have measured as doing nothing. It now applies the same release time, using one
+batched `inArray` read for the distinct exams involved.
+
+**Escape hatch.** `exams.grading_mode` — `NULL`/`after_close` defers, `immediate` grades at
+submit. Nullable by necessity: `ensureRequiredColumns` adds columns with `ALTER TABLE ADD COLUMN`,
+which cannot be `NOT NULL`, so every pre-existing exam reads back `NULL` — which is why `NULL`
+*must* mean defer. Registered in `REQUIRED_COLUMNS`, not in a migration, for the reason in §21:
+there is no migrate step in the deploy path, and Drizzle names every column in its SELECT list, so
+a missing column breaks **every** exams query.
+
+**Fail-soft, deliberately.** An unreadable exam row or an unavailable `grade_jobs` table both fall
+back to grading in-process immediately — worse for load, but a paper nobody ever grades is worse
+than a badly-timed one.
+
+**MCQ-only papers are untouched.** No pending AI work means the branch is never entered: straight
+to `graded`, instant results as before, and they do not even pay the extra exam read.
+
+**The student-side load bug this created, and the fix.** `exam-runner.tsx` polls
+`/student/exams/:id/status` after submit — 1.5s, then every 2.5s, up to 40 times — waiting for
+`status === 'graded'`. With grading held for an hour, **every submitted student would have polled
+the full 40 times and never seen it**: ~40 wasted status reads per student across the cohort,
+precisely the load this change exists to remove. The poll is now 60s × 15 when the submit response
+carries a future `gradeAt`. It is deliberately *not* switched off — the same poll detects an admin
+**RESET** and bounces the student back into their exam with saved answers intact, and that had to
+keep working. Copy changed from "your score will be updated soon" to evaluation beginning after
+the exam closes, with a result **within 2 hours**.
+
+**Does 2 hours hold?** [arithmetic] 300 papers × ~20 subjective answers = ~6,000 AI calls, at 12
+concurrent × ~5s each ≈ **40 minutes**. Headroom, and the promise is a ceiling rather than a
+target.
+
+**Verified** [measured]: 16 new tests in `src/api/lib/grade-release.test.ts` pin the arithmetic and
+every grade-now escape hatch (`bun test` 297 → **313 pass**), typecheck and `bun run build` green.
+On production after deploy, `invariants.checkedAt` advanced `05:49:42Z` → `06:30:11Z` and
+`GET /api/admin/invariants` reports `exams.grading_mode  type: text  present: true`, `ok: true`.
+
+**What is still unverified.** No real exam has run under this yet. The first one is the test, and
+the thing to watch is the Turso write/read curve during the exam window versus the hour after it:
+the shape should change from one broad hump into a quiet exam followed by a distinct batch. If the
+grading batch does not appear after the close, or attempts sit `submitted` past the release time,
+suspect the reconcile path first.
+
+---
+
+## 34. A student with no proctoring evidence, and the hole that hid him (`5ae12ba`)
+
+**The question.** *"Bonkuri Raju has no screenshots, why?"*
+
+**The student** [measured, `/api/reports/:examId/attempt/:attemptId`]: `stu_55bd530dee754fec`, roll
+`24K95A6602`, section CSM-A. Four attempts, all `graded`, all with **zero** snapshots:
+
+| Exam | snapshots | integrity events |
+|---|---|---|
+| Weekly Assessment – 2 (Aug 27) | 0 | 2 (`paste_in_answer`, `copy_in_answer`) |
+| Weekly Assessment – 1 (Aug 14) | 0 | 1 (`copy`) |
+| Python DSA Screening B3 (Jul 23) | 0 | 0 |
+| Grand Test – 1 B3 (Jul 8) | 0 | 0 |
+
+**He is the only one** [measured]. 61 attempts sampled from Weekly-2: 60 have frames (median 120,
+min 72, max 181). His own CSM-A classmates sat 105–177 frames each.
+
+**It was not the exam and not storage.** Proctoring is a **single global JSON blob** on the
+settings row (`schema.ts`, `ProctorConfig`) — there is no per-exam or per-student proctoring column
+[from code], so the 60 students who did get frames were running the identical config:
+`requireWebcam: true`, `webcamSnapshots: true`, `snapshotIntervalSec: 27` [measured,
+`GET /api/settings`]. And his uplink was fine: his `paste_in_answer`/`copy_in_answer` rows reached
+the server on the **same flush path** that carries snapshot keys.
+
+**The tell** [from code + measured]. He has **zero camera events of any kind** across four exams —
+no `camera_lost`, no `camera_blocked`, no `camera_obstructed`, no `camera_restored`, not even
+`preflight_snapshot`. That is decisive, because `captureFrame` returns luminance **metrics even
+when the upload fails**: a live-but-covered lens would still have produced `camera_obstructed`.
+Nothing at all means there was never a decodable webcam stream on his machine — `grabFrame` bailed
+at `captureFrame(webcamRef.current)` on every one of ~200 ticks per exam, for four exams over two
+months.
+
+**The real finding is not about him.** The platform recorded nothing and alerted nobody.
+`capturePeriodic` pushed its event **only `if (photoKey)`** [from code], so *"camera dead for the
+whole exam"* and *"camera fine"* were **byte-identical in the database**. `requireWebcam: true` did
+not stop him starting or finishing. He scored 95 with zero proctoring evidence, and the only reason
+anyone knows is that someone opened his review page and noticed an empty gallery.
+
+Two questions the data still cannot answer: **which device** he sat on, and whether he knew.
+
+### The fix
+
+**1. `snapshot_failed` — a dead camera now leaves a trail.** `grabFrame` returns *why* it produced
+nothing (`no_frame`, `capture_error`, `upload_failed`, vs the non-faults `snapshots_off`,
+`no_attempt`, `offline`), and `capturePeriodic` records the camera-side ones, throttled to **one row
+every 5 minutes** via the existing `minGapMs` idiom that `focus_loss` uses. ~18 rows across a
+90-minute exam instead of one per 27s tick.
+
+It is added to **`NON_VIOLATION_TYPES`**, and that is not a detail: a broken webcam is a device
+fault the student may not even be able to see. Left scoring, it would have marked a faulty laptop as
+misconduct and — at 18 rows an exam — swamped every real violation on the timeline. Same reasoning
+that demoted `focus_loss` in §9.
+
+**2. The roster shows who has no evidence.** `GET /reports/:examId` now returns `frames` and
+`snapshotFailures` per attempt, and the report table renders a red **"No camera"** badge for any
+real attempt with zero frames. The discovery that took two months and a lucky click now costs
+nobody a click.
+
+Two things it deliberately does *not* do:
+
+- **It is not an N+1.** A count per row is ~200 round trips on a full cohort. It is **one grouped
+  aggregate** over `integrity_events` (`attempt_id`, `type`), chunked at 200 ids only to stay under
+  SQLite's bound-variable cap, riding `integrity_attempt_type_idx`.
+- **It does not fire when snapshots are off.** With `webcamSnapshots: false` every attempt
+  legitimately has zero frames, so the response carries `snapshotsExpected` and the badge is gated
+  on it. The client defaults it to `true`, so an older bundle cannot hide a real failure.
+
+**3. `attempts.user_agent`.** Stamped once at `/start` from the request header, truncated to 300
+chars, **never overwritten** — the first device that opened the paper is the useful fact. Proctoring
+is a *client* capability, so when a webcam or fullscreen check silently never worked, this string is
+the only thing that can answer "what was it running on?". Diagnostic only: never used for scoring or
+eligibility.
+
+Declared in `schema.ts` **and** in `REQUIRED_COLUMNS` (`invariants.ts`), nullable — `ALTER TABLE ADD
+COLUMN` cannot add NOT NULL, and there is no migrate step in the deploy path. Same mechanism as
+`exams.grading_mode` in §33.
+
+**Verified** [measured]: `bun run typecheck:api` clean; `bun test` **313 pass, 0 fail** (the schema
+column broke 5 `grade-jobs` tests that build their own `attempts` DDL by hand — that DDL now mirrors
+the column, which is exactly the tripwire it exists to be); `bun run build` green.
+
+**What this does not fix** [unverified]. It cannot recover Bonkuri Raju's four exams — that evidence
+was never captured and no change can create it. And it is detection, not prevention: a student whose
+camera never works still starts, still submits, still scores. Blocking them outright is a policy
+decision, not an engineering one, and nobody has asked for it. What changes is that the next such
+student is visible on the roster the same day instead of two months later.
