@@ -507,3 +507,164 @@ sleep, storage and reload so there is no timer and no browser in the suite. `bun
   I cannot claim it as the proven root cause without the Railway metrics for that window.
 - **`/api/reports` still runs 16.6 statements.** Unchanged, still the biggest remaining admin win.
 - **Turso plan: still no evidence it is the problem.** Nothing here changes §11.
+
+---
+
+# Addendum 5 — the durable grading queue (2026-08-30)
+
+## 20. First, a correction to my own backlog
+
+An earlier summary of mine said "grading runs inline at the bell". **That is wrong.** [from code]
+
+`finalizeAttempt` grades the *objective* questions inline — `autoGrade`, pure CPU, no network, no
+AI — writes them in the batched upsert, flips the attempt, and only then calls
+`queueAttemptGrading` **fire-and-forget**. AI grading of subjective answers was already off the
+request path before this change. §3 of the original review said so correctly; my later summary did
+not. Nothing in this addendum makes submit faster, and it was never going to.
+
+What was actually broken is what happened to that background work *after* the request returned.
+
+## 21. What was wrong
+
+All four [from code], on the shipped `aa413bc`:
+
+1. **The queue lived entirely in one process's memory** — an `inFlight` Set, a `retryCounts` Map, a
+   12-slot semaphore and `setTimeout` backoff. A deploy mid-batch dropped the schedule. The 60 s
+   recovery sweep found the work again, but **`retryCounts` reset to 0 on every restart**, so an
+   answer the AI could never grade was retried forever, and billed forever.
+2. **It is what blocks replicas.** With 2–3 Railway replicas, every replica's sweep picks up the
+   same `submitted` attempts: the same paper graded 2–3×, 2–3× the AI bill, concurrent writes into
+   the same answer rows. This is the prerequisite for horizontal scaling, not a side quest.
+3. **The recovery sweep was an N+1 firing every 60 s straight through the submit burst.**
+   `attempts` has no index on `status`, so it was a full table scan plus one answers query per row
+   — ~300 queries a minute, competing with students who were still submitting.
+4. **A give-up was a `console.error`.** After 3 retries the ungraded answers were written `score: 0`
+   with a manual-review note and the attempt flipped `graded`. No admin could ever find those
+   students.
+
+## 22. What changed
+
+**A row per attempt.** New `grade_jobs` table (`attempt_id` unique, `status`, `tries`,
+`next_run_at`, `claimed_at`, `claimed_by`, `last_error`), plus
+`grade_jobs_status_next_idx (status, next_run_at)` so the claim query is not a queue scan.
+
+- **Created at boot by `invariants.ts`, not by a migration** — there is no migrate step in the
+  deploy path (`start` is `bun src/server.ts`) and `drizzle/` is a stale snapshot whose regeneration
+  emits table DROPs. Verified on the load server: `[invariants] created missing table grade_jobs`.
+  [measured]
+- **Its invariant failures are advisory** — a missing `grade_jobs` must not turn `/api/health` red
+  mid-exam, because the feature degrades instead of failing.
+- **New `src/api/lib/grade-jobs.ts`** — the persistence layer. Every function takes the database as
+  a **parameter**, never the app singleton, which is what lets the tests drive the identical code
+  against in-memory libSQL.
+- **`grade-queue.ts` rewired.** `gradeAttempt` split into `gradeAttemptOnce` (one pure pass, no
+  scheduling), `giveUpOnAttempt` (the terminal path) and the old in-memory chain, which survives as
+  the fallback. New `gradeWorkerTick` claims due jobs every 5 s; `startGradeQueue` probes the table,
+  adopts orphans and picks the mode.
+- **Retries now live in the row.** `tries` and `next_run_at` are persisted, so a deploy can no
+  longer wipe the counter — bug 1 closed.
+- **Claim exclusivity** rests on SQLite/Turso's **single-writer serialization**, not row locks and
+  not MVCC: two workers issuing the identical claim `UPDATE ... RETURNING` cannot interleave, and
+  `RETURNING` is what tells each worker which rows it actually won — bug 2 closed. A 5-minute lease
+  reclaims work orphaned by a worker killed mid-grade.
+- **The sweep is now a reconcile, not the scheduler.** Off the 60 s auto-submit tick, onto its own
+  10-minute timer, capped at 200 attempts, with **one grouped ungraded-count query** instead of one
+  per attempt, and ≤50 lost-flip repairs per pass — bug 3 closed.
+- **Terminal failures are queryable.** A `failed` row keeps `last_error` and the attempt id, so the
+  papers that need a human can be listed — bug 4 closed. The student-visible outcome is deliberately
+  **unchanged** (zero the ungraded answers, flip to `graded` so students stop polling); changing
+  that is a product decision, not mine to make quietly.
+- **`server.ts` gained `ROLE`.** Defaults to `all`, so today's single process still serves *and*
+  grades — nothing about the current deployment changes. Going to 2–3 replicas later is
+  `ROLE=web` on the web replicas and `ROLE=worker` on one background process: a config change, not
+  a code change. An unrecognised value falls back to `all`, because a typo in a Railway variable
+  must never silently stop grading.
+- **Grading fails soft.** If `grade_jobs` is unreachable, `jobsAvailable` goes false, it logs once,
+  and every path uses the in-memory schedule that shipped before this table. Degraded beats a
+  missing table stopping grading altogether.
+- **Submit cost: 7 → 8 statements.** One extra `INSERT ... ON CONFLICT` on the submit path. Paid
+  deliberately.
+
+The enqueue conflict rule is the one piece of logic worth reading twice: on conflict it resets
+`status` and `next_run_at` but sets `tries = CASE WHEN status = 'done' THEN 0 ELSE tries END`.
+Resetting unconditionally reopens the retry-forever hole; never resetting makes an attempt
+legitimately reopened and re-sat weeks later hit the cap on its first pass.
+
+## 23. Tests
+
+**288 pass, was 271** — 17 new in `src/api/lib/grade-jobs.test.ts`. `bun run build` green.
+`typecheck:web` still has its 57 pre-existing errors, none in the touched files. [measured]
+
+The new tests exist because every one of these failures is invisible in a smoke test — grading
+still "works", it just costs twice or stops silently:
+
+- two connections to one database racing the same claim → **disjoint sets, never the same job id**
+  (a real second connection, so a temp file rather than `:memory:`)
+- a live lease is not stealable; an expired one is reclaimed, and the steal does **not** consume a
+  retry
+- `done` and `failed` are terminal — not reclaimed a day later
+- backoff and `tries` survive a simulated restart, and the retry is **not** claimable before the
+  backoff elapses (this is the bug that cost money)
+- the third failure is terminal, never retried again, and leaves a `failed` row naming the attempt
+- enqueue is idempotent per attempt; `tries` is kept on a retry and reset only after a `done`
+- backfill adopts orphans, is idempotent, is bounded, and does not disturb an in-flight `tries`
+- `closeStaleGradeJobs` retires jobs whose attempt no longer needs grading and leaves terminal
+  failures findable
+
+## 24. Measured on a 300-student run
+
+Boot, on a database that had never seen the table: [measured]
+
+```
+[invariants] created missing table grade_jobs
+[grade-queue] adopted 9 pre-existing submitted attempt(s) into the durable queue
+[grade-queue] scheduling mode: durable
+[grade-queue] worker: claimed 9, graded 9, retry/failed 0
+```
+
+Those 9 were attempts left `submitted` by earlier runs — work the old in-memory queue had no row
+for and would only have found by chance on a sweep.
+
+Then 300 students, 60 s steady state, one invigilator on Live Monitor, 300 submits over 45 s
+(local file DB, no simulated latency): [measured]
+
+| endpoint | n | ok% | p50 | p95 | p99 | max |
+|---|---|---|---|---|---|---|
+| BUNDLE | 300 | 100% | 4 ms | 10 ms | 2541 ms | 2681 ms |
+| START | 300 | 96.3% | 5 ms | 12 ms | 22 ms | 27 ms |
+| **SUBMIT** | 300 | **100%** | **2 ms** | **4 ms** | **13 ms** | **23 ms** |
+| autosave | 875 | 100% | 2 ms | 6 ms | 15 ms | 70 ms |
+| heartbeat | 1174 | 100% | 4 ms | 7 ms | 18 ms | 100 ms |
+
+4,509 requests, 13,007 database queries, monitor build worst 6 ms, `degraded` never fired. **Submit
+did not regress** despite the extra statement.
+
+The 11 START failures are the reused load database, not a regression: `/start` returns **409
+"Already submitted"** for an attempt already `submitted` or `graded`, and this database carried 9
+such attempts plus graded ones from previous runs. [from code]
+
+The queue drained completely: **300 jobs `done`, 0 `pending`, 0 `failed`; 304 attempts `graded`, 0
+`submitted`; no attempt left without a score; no duplicate `(attempt_id, question_id)` answer
+rows; scores within 0–92.** [measured]
+
+## 25. The honest limits
+
+- **This does not make anything faster for a student.** Submit is one statement *more* expensive.
+  The wins are: retry state survives a deploy, an ungradeable answer stops costing money after 3
+  tries, a failed paper is findable, the 60 s N+1 through the submit burst is gone, and replicas
+  become possible.
+- **Claim exclusivity is proven against local libSQL, not against Turso over HTTP under a real
+  300-student burst.** [unverified] The argument rests on Turso serializing writers the way SQLite
+  does. The load run above **never exercised the worker's claim path under contention** — the
+  submit path's own fire-and-forget pass finished all 300 jobs first, which is the expected shape
+  on a paper with no subjective answers. The claim race is covered by the tests, not by that run.
+- **The load paper was 15 MCQs, so no AI grading and no Judge0 ran.** [from code] The queue was
+  exercised end to end; the expensive grading path it protects was not.
+- **`ROLE=worker` has not been run in production.** It defaults to today's behaviour on purpose;
+  the multi-replica configuration is written but unproven. [unverified]
+- **Terminal failures still zero the student's ungraded answers.** Unchanged by design, now merely
+  visible. If you would rather those attempts stay `submitted` and visibly incomplete, say so — it
+  is a one-line change and a product decision.
+- **Turso plan usage and Railway metrics for the incident window remain unread.** Free, five
+  minutes, and still the single item that could confirm or kill the throttling theory. It is not
+  something I can reach from here.

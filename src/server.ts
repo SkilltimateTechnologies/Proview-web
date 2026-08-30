@@ -2,7 +2,7 @@ import { readdir, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { brotliCompress, constants as zlibConstants, gzip } from "node:zlib";
 import app from "./api";
-import { sweepPendingGrading, startAutoSubmitSweep } from "./api/lib/grade-queue";
+import { startAutoSubmitSweep, startGradeQueue } from "./api/lib/grade-queue";
 import { ensureDatabaseInvariants, ensureRequiredColumns } from "./api/database/invariants";
 import {
 	CompressedAssets,
@@ -227,11 +227,28 @@ void (async () => {
 // a database we have already verified; never throws.
 await ensureDatabaseInvariants();
 
-// Recover any subjective answers left ungraded (e.g. restart mid-grading or a
-// prior AI rate-limit burst). Runs off the boot path, globally throttled.
-void sweepPendingGrading();
+// What this process is allowed to do in the background.
+//
+// Defaults to "all" so today's single-process deployment behaves exactly as it
+// did before the durable queue existed: this process serves requests AND grades.
+// The point of the flag is that going to 2-3 Railway replicas later is a config
+// change, not a code change — set ROLE=web on the replicas behind the load
+// balancer and ROLE=worker on one background process, and the same image stops
+// running three copies of every sweep. Unknown values fall back to "all": a typo
+// in a Railway variable must never silently stop grading.
+const role = (process.env.ROLE ?? "all").toLowerCase();
+const runsBackgroundWork = role !== "web";
+if (role !== "all") console.log(`[boot] ROLE=${role} (background work: ${runsBackgroundWork ? "on" : "off"})`);
 
-// Recurring server-side auto-submit: force-submit + grade any expired
-// `in_progress` attempts (student closed the browser / lost connection at the
-// cutoff) so they never stay stuck in-progress. Runs every 60s.
-startAutoSubmitSweep(60_000);
+if (runsBackgroundWork) {
+  // Bring up the durable grading queue: probe `grade_jobs`, adopt any attempts
+  // left `submitted` by a restart, then start the worker and the slow reconcile
+  // sweep. Falls back to the in-memory schedule if the table is unreachable, so
+  // grading degrades rather than stops. Not awaited — boot must not wait on it.
+  void startGradeQueue();
+
+  // Recurring server-side auto-submit: force-submit + grade any expired
+  // `in_progress` attempts (student closed the browser / lost connection at the
+  // cutoff) so they never stay stuck in-progress. Runs every 60s.
+  startAutoSubmitSweep(60_000);
+}

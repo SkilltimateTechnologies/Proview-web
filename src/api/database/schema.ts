@@ -293,6 +293,67 @@ export const integrityEvents = sqliteTable(
   ],
 );
 
+/**
+ * Durable work queue for background AI grading.
+ *
+ * WHY THIS TABLE EXISTS
+ * ---------------------
+ * Grading used to be scheduled entirely in memory: a `Set` of in-flight attempts,
+ * a `Map` of retry counts and `setTimeout` backoff. Three things went wrong with
+ * that:
+ *
+ *  1. A deploy mid-batch dropped the schedule. The 60s recovery sweep found the
+ *     work again, but `retryCounts` reset to 0 on every restart — so an answer the
+ *     AI can never grade was retried forever, and we paid the provider every time.
+ *  2. It cannot survive more than one process. The concurrency semaphore and the
+ *     in-flight set are per process, so with 2-3 replicas every replica's sweep
+ *     picks up the same `submitted` attempts: the same attempt graded 2-3x
+ *     concurrently, 2-3x the AI bill, concurrent writes to the same answer rows.
+ *     That is what blocks horizontal scaling.
+ *  3. Failure was invisible. After the retry cap the ungraded answers were written
+ *     `score: 0` with a note and the attempt flipped to `graded`; the only trace
+ *     was a `console.error` nobody reads.
+ *
+ * A row per attempt fixes all three: the schedule survives restarts, replicas
+ * claim work atomically instead of racing on it (see claimGradeJobs in
+ * lib/grade-jobs.ts), and a terminal failure is a queryable row.
+ *
+ * As with every other table here, `schema.ts` declaring it does NOT create it on
+ * production — there is no migrate step in the deploy path. database/invariants.ts
+ * asserts it at boot; keep REQUIRED_TABLES there in sync with this declaration.
+ */
+export const gradeJobs = sqliteTable(
+  "grade_jobs",
+  {
+    id: text("id").primaryKey(),
+    /** One job per attempt, enforced by `grade_jobs_attempt_uq` below. */
+    attemptId: text("attempt_id").notNull(),
+    examId: text("exam_id").notNull(),
+    /** pending | claimed | done | failed */
+    status: text("status").notNull().default("pending"),
+    /** Consecutive failed grading passes. Persisted, so a restart cannot reset it. */
+    tries: integer("tries").notNull().default(0),
+    /** Earliest time a worker may claim this job — this is the backoff. */
+    nextRunAt: integer("next_run_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
+    /** When the current claim was taken. Drives lease expiry for a crashed worker. */
+    claimedAt: integer("claimed_at", { mode: "timestamp_ms" }),
+    /** Which process holds the claim. Diagnostic only — the claim itself is atomic. */
+    claimedBy: text("claimed_by"),
+    /** Last provider/DB error, kept on terminal failures so an admin can see why. */
+    lastError: text("last_error"),
+    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
+    updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
+  },
+  (t) => [
+    // The upsert on submit targets this: a re-submit (reopen) must converge on the
+    // SAME job row instead of queueing the attempt twice.
+    uniqueIndex("grade_jobs_attempt_uq").on(t.attemptId),
+    // The claim query is `WHERE status = ? AND next_run_at <= ? ORDER BY next_run_at
+    // LIMIT n`. Without this index that is a full scan of the queue on every tick.
+    index("grade_jobs_status_next_idx").on(t.status, t.nextRunAt),
+  ],
+);
+
 /** Platform-global settings: API keys + usage limits (single row, id = "global"). */
 export const settings = sqliteTable("settings", {
   id: text("id").primaryKey().default("global"),

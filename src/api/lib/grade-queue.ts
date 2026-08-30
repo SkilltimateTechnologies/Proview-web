@@ -13,6 +13,18 @@ import { and, eq, inArray, notInArray, sql as dsql } from "drizzle-orm";
 import { db } from "../database";
 import * as schema from "../database/schema";
 import { gradeSubjective } from "./ai";
+import {
+  MAX_GRADE_TRIES,
+  backfillGradeJobs,
+  backoffMs,
+  claimGradeJobs,
+  closeStaleGradeJobs,
+  completeGradeJob,
+  completeGradeJobByAttempt,
+  countGradeJobs,
+  enqueueGradeJob,
+  failGradeJob,
+} from "./grade-jobs";
 import { autoGrade, effectiveEndMs, id } from "./util";
 import { maybeCheckExamAfterGrading } from "./watchdog";
 
@@ -26,9 +38,58 @@ let active = 0;
 const waiters: Array<() => void> = [];
 
 /** Bounded retries per attempt before we give up and flag for manual review. */
-const MAX_GRADE_RETRIES = 3;
-/** attemptId -> consecutive failed grading passes. In-memory: resets on deploy. */
+const MAX_GRADE_RETRIES = MAX_GRADE_TRIES;
+/**
+ * attemptId -> consecutive failed grading passes.
+ *
+ * FALLBACK ONLY. The durable queue (lib/grade-jobs.ts) keeps the counter in the
+ * `grade_jobs` row, which is the whole point: this Map resets to zero on every
+ * deploy, so before the queue existed an answer the AI could never grade was
+ * retried forever and billed forever. It survives here purely for the degraded
+ * path below, where at least a bounded in-process retry is better than none.
+ */
 const retryCounts = new Map<string, number>();
+
+/**
+ * Whether the durable `grade_jobs` queue is usable on the connected database.
+ *
+ * FAIL SOFT, DELIBERATELY. A missing or unreachable queue table must never stop
+ * papers being graded — that would be a worse bug than the one the queue fixes.
+ * The first failure flips this to false, logs once, and every path falls back to
+ * the in-memory schedule that shipped before this table existed.
+ */
+let jobsAvailable = false;
+let jobsWarned = false;
+
+export function gradeQueueMode(): "durable" | "in-memory" {
+  return jobsAvailable ? "durable" : "in-memory";
+}
+
+function markJobsUnavailable(e: unknown) {
+  jobsAvailable = false;
+  if (jobsWarned) return;
+  jobsWarned = true;
+  console.error(
+    "[grade-queue] durable grade_jobs queue unavailable — falling back to the " +
+      "in-memory schedule (retry state will not survive a restart):",
+    e instanceof Error ? e.message : String(e),
+  );
+}
+
+/**
+ * Persist "this attempt needs grading". One statement, fail-soft: on the submit
+ * path a queue write must never be the thing that fails a student's submit.
+ */
+async function recordGradeJob(attemptId: string, examId: string, delayMs = 0): Promise<boolean> {
+  if (!jobsAvailable) return false;
+  try {
+    await enqueueGradeJob(db, { attemptId, examId, delayMs });
+    return true;
+  } catch (e) {
+    markJobsUnavailable(e);
+    return false;
+  }
+}
 
 function acquire(): Promise<void> {
   return new Promise((resolve) => {
@@ -142,21 +203,63 @@ export function scoreFromAnswers(
   return { scorePct, earned, max, deduped: rows.length - unique.length };
 }
 
+/**
+ * Attempts being graded by THIS process right now.
+ *
+ * Still needed with the durable queue, for a different reason than before: the
+ * submit path starts grading immediately (so a normal submit is graded in seconds,
+ * not on the next worker tick) while the job row is also claimable. This set is
+ * what stops the same process from grading one attempt down two paths at once —
+ * cross-process exclusivity is the job table's atomic claim, not this.
+ */
 const inFlight = new Set<string>();
 
+function tryEnterInFlight(attemptId: string): boolean {
+  if (inFlight.has(attemptId)) return false;
+  inFlight.add(attemptId);
+  return true;
+}
+
 /**
- * Queue an attempt for background subjective grading. Fire-and-forget: safe to
- * call multiple times, de-duped per attempt while in flight.
+ * Start grading an attempt now, off the request path. Fire-and-forget and safe to
+ * call repeatedly — de-duped per attempt while in flight.
+ *
+ * With the durable queue available this runs ONE pass and then stops: retries,
+ * backoff and the eventual give-up belong to the job row, so scheduling them here
+ * too would double every retry and double the AI bill. Without the queue it falls
+ * back to the original in-memory retry chain.
  */
 export function queueAttemptGrading(attemptId: string, provider?: string | null) {
-  if (inFlight.has(attemptId)) return;
-  inFlight.add(attemptId);
-  gradeAttempt(attemptId, provider)
+  if (!tryEnterInFlight(attemptId)) return;
+  const pass = jobsAvailable
+    ? async () => {
+        const res = await gradeAttemptOnce(attemptId, provider);
+        // Nothing left to grade: close the job so the worker does not redo work
+        // that is already finished. Failure here is harmless — the worker would
+        // claim the job, find nothing pending and complete it itself.
+        if (res.done) await completeGradeJobByAttempt(db, attemptId).catch(() => {});
+      }
+    : () => gradeAttempt(attemptId, provider);
+  pass()
     .catch((e) => console.error(`[grade-queue] attempt ${attemptId} failed:`, e))
     .finally(() => inFlight.delete(attemptId));
 }
 
-export async function gradeAttempt(attemptId: string, providerArg?: string | null) {
+/**
+ * Grade one attempt's outstanding subjective/coding answers ONCE, then reconcile
+ * the attempt's status. The pure unit of work: no retry scheduling, no give-up.
+ *
+ * Both drivers call this — the durable worker (which owns retries through the job
+ * row) and the in-memory fallback below. Keeping the scheduling out of here is
+ * what makes the two paths agree on grading behaviour.
+ *
+ * `done: true` means the queue has nothing left to do for this attempt: either
+ * every answer is graded, or the attempt was reopened / no longer exists.
+ */
+export async function gradeAttemptOnce(
+  attemptId: string,
+  providerArg?: string | null,
+): Promise<{ done: boolean; ungraded: number }> {
   const provider = providerArg !== undefined ? providerArg : await getProvider();
   const answers = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, attemptId));
   const pending = answers.filter((a) => !a.autoGraded && a.score == null && hasContent(a.response));
@@ -196,7 +299,7 @@ export async function gradeAttempt(attemptId: string, providerArg?: string | nul
   // Recompute the total from the latest answer rows and flip to "graded" only
   // when nothing subjective is left ungraded.
   const finalAnswers = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, attemptId));
-  const stillUngraded = finalAnswers.some((a) => a.score == null && hasContent(a.response));
+  const stillUngraded = finalAnswers.filter((a) => a.score == null && hasContent(a.response)).length;
   const { scorePct, deduped } = scoreFromAnswers(finalAnswers);
   if (deduped > 0) {
     console.error(
@@ -206,11 +309,12 @@ export async function gradeAttempt(attemptId: string, providerArg?: string | nul
   }
 
   const [att] = await db.select().from(schema.attempts).where(eq(schema.attempts.id, attemptId)).limit(1);
-  // Never regress a re-opened / in-progress attempt.
-  if (!att || (att.status !== "submitted" && att.status !== "graded")) return;
+  // Never regress a re-opened / in-progress attempt. Nothing left for the queue
+  // to do about it either, so this counts as done.
+  if (!att || (att.status !== "submitted" && att.status !== "graded")) return { done: true, ungraded: 0 };
 
   if (!stillUngraded) {
-    // Fully graded — flip to graded and clear retry bookkeeping.
+    // Fully graded — flip to graded and clear the fallback retry bookkeeping.
     retryCounts.delete(attemptId);
     await db.update(schema.attempts).set({ status: "graded", score: scorePct }).where(eq(schema.attempts.id, attemptId));
     // If that was the exam's last outstanding attempt, the exam is finished:
@@ -218,35 +322,66 @@ export async function gradeAttempt(attemptId: string, providerArg?: string | nul
     // instead of waiting for the college to report a wrong mark. Fire-and-forget
     // and never awaited into the grading result — a check must not fail grading.
     void maybeCheckExamAfterGrading(att.examId);
-    return;
+    return { done: true, ungraded: 0 };
   }
 
-  // Some subjective answers are still ungraded (AI errored / rate-limited).
-  // Retry a bounded number of times with backoff instead of leaving the attempt
-  // stuck "submitted" forever — which makes every client poll /status
-  // indefinitely and the boot sweep re-queue it on every restart.
-  const tries = (retryCounts.get(attemptId) ?? 0) + 1;
-  if (tries < MAX_GRADE_RETRIES) {
-    retryCounts.set(attemptId, tries);
-    await db.update(schema.attempts).set({ score: scorePct }).where(eq(schema.attempts.id, attemptId));
-    const delay = Math.min(120_000, 20_000 * tries);
-    setTimeout(() => queueAttemptGrading(attemptId, provider), delay);
-    return;
-  }
+  // Some subjective answers are still ungraded (AI errored / rate-limited). Persist
+  // the partial score so the report is not stuck at the pre-grading number while
+  // retries run, and let the caller decide when to retry and when to give up.
+  await db.update(schema.attempts).set({ score: scorePct }).where(eq(schema.attempts.id, attemptId));
+  return { done: false, ungraded: stillUngraded };
+}
 
-  // Give up: mark the answers we could never grade as 0 (best-effort) with a
-  // note for manual review, then flip the attempt to a terminal "graded" state
-  // so clients stop polling and the boot sweep stops re-queueing it.
-  retryCounts.delete(attemptId);
+/**
+ * Terminal path: stop trying to grade an attempt.
+ *
+ * Student-visible behaviour is deliberately UNCHANGED from before the durable
+ * queue: answers we could never grade are written 0 with a manual-review note and
+ * the attempt flips to "graded", so clients stop polling and a student still gets
+ * a result. What is new is that the `grade_jobs` row survives as `failed` with the
+ * error on it, so these students are findable instead of living in a log line.
+ */
+export async function giveUpOnAttempt(attemptId: string, tries: number): Promise<void> {
+  const finalAnswers = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, attemptId));
+  const [att] = await db.select().from(schema.attempts).where(eq(schema.attempts.id, attemptId)).limit(1);
+  if (!att || (att.status !== "submitted" && att.status !== "graded")) return;
   const ungraded = finalAnswers.filter((a) => a.score == null && hasContent(a.response));
   for (const a of ungraded) {
     await db.update(schema.answers)
       .set({ score: 0, autoGraded: true, aiNotes: "Auto-grading failed after retries; needs manual review." })
       .where(eq(schema.answers.id, a.id));
   }
+  const { scorePct } = scoreFromAnswers(
+    finalAnswers.map((a) => (a.score == null && hasContent(a.response) ? { ...a, score: 0 } : a)),
+  );
   console.error(`[grade-queue] attempt ${attemptId}: gave up grading ${ungraded.length} answer(s) after ${tries} tries; marking graded (manual review needed).`);
   await db.update(schema.attempts).set({ status: "graded", score: scorePct }).where(eq(schema.attempts.id, attemptId));
   void maybeCheckExamAfterGrading(att.examId);
+}
+
+/**
+ * FALLBACK scheduler, used only when the durable queue is unavailable: grade,
+ * and on failure retry in-process with backoff up to the cap, then give up.
+ *
+ * This is the pre-queue behaviour, kept verbatim on purpose. Its weakness is the
+ * reason `grade_jobs` exists — `retryCounts` and the `setTimeout` both die with
+ * the process, so a deploy resets the counter and the retries start over.
+ */
+export async function gradeAttempt(attemptId: string, providerArg?: string | null) {
+  const provider = providerArg !== undefined ? providerArg : await getProvider();
+  const res = await gradeAttemptOnce(attemptId, provider);
+  if (res.done) {
+    retryCounts.delete(attemptId);
+    return;
+  }
+  const tries = (retryCounts.get(attemptId) ?? 0) + 1;
+  if (tries < MAX_GRADE_RETRIES) {
+    retryCounts.set(attemptId, tries);
+    setTimeout(() => queueAttemptGrading(attemptId, provider), backoffMs(tries));
+    return;
+  }
+  retryCounts.delete(attemptId);
+  await giveUpOnAttempt(attemptId, tries);
 }
 
 /**
@@ -386,7 +521,17 @@ export async function finalizeAttempt(
     submittedAt: new Date(),
   }).where(eq(schema.attempts.id, aid));
 
-  if (hasPending) queueAttemptGrading(aid, provider);
+  if (hasPending) {
+    // Persist the work FIRST, then start grading it immediately.
+    //
+    // The row is the durable half: if this process dies mid-grade, or a deploy
+    // lands two seconds later, another worker picks the attempt up with its retry
+    // count intact instead of the schedule evaporating. Costs submit exactly one
+    // extra statement (7 -> 8) and is fail-soft, so a queue problem can never turn
+    // into a failed submit for a student.
+    await recordGradeJob(aid, attempt.examId);
+    queueAttemptGrading(aid, provider);
+  }
   return { score: scorePct, status };
 }
 
@@ -445,18 +590,166 @@ export async function sweepAutoSubmit() {
   }
 }
 
-/** Start the recurring auto-submit sweep (runs immediately, then on an interval). */
+/**
+ * Start the recurring auto-submit sweep (runs immediately, then on an interval).
+ *
+ * This used to also run `sweepPendingGrading` on the same 60s tick. It no longer
+ * does: that sweep is a scan of `attempts` plus one answers query per submitted
+ * attempt, so during the submit burst it was firing 300+ queries a minute against
+ * the exact table students were still writing to. The durable queue makes the
+ * recovery sweep a reconcile rather than the scheduler, so it moved to its own,
+ * much slower timer (see startGradingReconcileSweep).
+ */
 export function startAutoSubmitSweep(intervalMs = 60_000) {
   if (autoSubmitTimer) return;
   const tick = () => {
     void sweepAutoSubmit();
-    // Also reconcile any attempts stuck at "submitted" (lost final flip, or
-    // still-ungraded answers) on the same cadence — not just at boot — so live
-    // batches self-heal as they finish instead of lingering until a restart.
-    void sweepPendingGrading();
   };
   tick();
   autoSubmitTimer = setInterval(tick, intervalMs);
+}
+
+// ---------------------------------------------------------------------------
+// Durable grading worker
+// ---------------------------------------------------------------------------
+
+/**
+ * Identifies this process in `grade_jobs.claimed_by`. Diagnostic only — the claim
+ * is made atomic by the UPDATE, not by this id.
+ */
+const WORKER_ID = `${process.env.RAILWAY_REPLICA_ID ?? process.env.HOSTNAME ?? "local"}:${process.pid}:${id("w")}`;
+
+/**
+ * Jobs claimed per tick. Matches MAX_CONCURRENT so a tick claims roughly what the
+ * AI concurrency limiter can actually work through, instead of holding leases on
+ * work it will not start for minutes.
+ */
+const WORKER_BATCH = Number(process.env.GRADE_WORKER_BATCH) || MAX_CONCURRENT;
+
+let gradeWorkerTimer: ReturnType<typeof setInterval> | null = null;
+let workerBusy = false;
+
+/**
+ * One pass of the durable worker: claim due jobs, grade them, record the outcome.
+ *
+ * Exported for the tests. Never throws — a worker that dies on an unexpected error
+ * stops grading for the whole deployment.
+ */
+export async function gradeWorkerTick(): Promise<{ claimed: number; done: number; failed: number }> {
+  const result = { claimed: 0, done: 0, failed: 0 };
+  // Never let two ticks overlap: a slow AI provider would otherwise stack ticks
+  // until every claim lease expires and the work is re-claimed underneath us.
+  if (workerBusy || !jobsAvailable) return result;
+  workerBusy = true;
+  try {
+    const jobs = await claimGradeJobs(db, { workerId: WORKER_ID, limit: WORKER_BATCH });
+    result.claimed = jobs.length;
+    if (!jobs.length) return result;
+    const provider = await getProvider();
+    await Promise.all(
+      jobs.map(async (job) => {
+        // The submit path may already be grading this attempt in this process.
+        // Hand the job back (unclaimed, tries untouched) instead of grading the
+        // same paper twice and paying for it twice.
+        if (!tryEnterInFlight(job.attemptId)) {
+          await enqueueGradeJob(db, { attemptId: job.attemptId, examId: job.examId, delayMs: 30_000 }).catch(() => {});
+          return;
+        }
+        try {
+          const res = await gradeAttemptOnce(job.attemptId, provider);
+          if (res.done) {
+            await completeGradeJob(db, job.id);
+            result.done++;
+            return;
+          }
+          const outcome = await failGradeJob(db, {
+            jobId: job.id,
+            tries: job.tries,
+            error: `${res.ungraded} answer(s) still ungraded after a full pass`,
+          });
+          result.failed++;
+          if (outcome.terminal) await giveUpOnAttempt(job.attemptId, outcome.tries);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          console.error(`[grade-queue] job ${job.id} (attempt ${job.attemptId}) failed:`, msg);
+          try {
+            const outcome = await failGradeJob(db, { jobId: job.id, tries: job.tries, error: msg });
+            result.failed++;
+            if (outcome.terminal) await giveUpOnAttempt(job.attemptId, outcome.tries);
+          } catch (e2) {
+            markJobsUnavailable(e2);
+          }
+        } finally {
+          inFlight.delete(job.attemptId);
+        }
+      }),
+    );
+    if (result.done || result.failed) {
+      console.log(`[grade-queue] worker: claimed ${result.claimed}, graded ${result.done}, retry/failed ${result.failed}`);
+    }
+    return result;
+  } catch (e) {
+    markJobsUnavailable(e);
+    return result;
+  } finally {
+    workerBusy = false;
+  }
+}
+
+/** Start the durable grading worker (runs immediately, then on an interval). */
+export function startGradeWorker(intervalMs = 5_000) {
+  if (gradeWorkerTimer) return;
+  const tick = () => void gradeWorkerTick();
+  tick();
+  gradeWorkerTimer = setInterval(tick, intervalMs);
+}
+
+let reconcileTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Start the slow reconcile sweep. 10 minutes, not 60 seconds: with the durable
+ * queue this is a safety net for work the queue never heard about (rows written
+ * before the table existed, or while it was unavailable), not the scheduler.
+ */
+export function startGradingReconcileSweep(intervalMs = 10 * 60_000) {
+  if (reconcileTimer) return;
+  const tick = () => void sweepPendingGrading();
+  tick();
+  reconcileTimer = setInterval(tick, intervalMs);
+}
+
+/**
+ * Bring the grading queue up: probe the table, adopt orphaned work, start the
+ * worker and the reconcile sweep.
+ *
+ * The probe is the fail-soft gate. If `grade_jobs` is not there (invariants could
+ * not create it, or we are pointed at an old database), `jobsAvailable` stays false
+ * and every path uses the in-memory schedule that shipped before this table —
+ * degraded, but grading still happens.
+ */
+export async function startGradeQueue(opts: { workerIntervalMs?: number; reconcileIntervalMs?: number } = {}) {
+  try {
+    await countGradeJobs(db);
+    jobsAvailable = true;
+  } catch (e) {
+    markJobsUnavailable(e);
+  }
+
+  if (jobsAvailable) {
+    try {
+      // Attempts left `submitted` before this table existed have no job row, so
+      // nothing would ever claim them. One bounded pass adopts them; the rest are
+      // picked up by the reconcile sweep.
+      const adopted = await backfillGradeJobs(db);
+      if (adopted) console.log(`[grade-queue] adopted ${adopted} pre-existing submitted attempt(s) into the durable queue`);
+    } catch (e) {
+      console.error("[grade-queue] backfill failed (continuing):", e instanceof Error ? e.message : String(e));
+    }
+    startGradeWorker(opts.workerIntervalMs ?? 5_000);
+  }
+
+  console.log(`[grade-queue] scheduling mode: ${gradeQueueMode()}`);
+  startGradingReconcileSweep(opts.reconcileIntervalMs ?? 10 * 60_000);
 }
 
 /**
@@ -470,34 +763,90 @@ export function startAutoSubmitSweep(intervalMs = 60_000) {
  *     they have no ungraded answers — so reconcile them straight to "graded"
  *     here, recomputing the score from the answer rows. Idempotent.
  */
+/** Attempts examined per reconcile pass. Bounded so this is fixed, cheap work. */
+const RECONCILE_ATTEMPT_LIMIT = Number(process.env.GRADE_RECONCILE_LIMIT) || 200;
+/** Lost-flip repairs per pass. Each one reads that attempt's answers, so cap it. */
+const RECONCILE_REPAIR_LIMIT = 50;
+
 export async function sweepPendingGrading() {
   try {
-    const subs = await db.select().from(schema.attempts).where(eq(schema.attempts.status, "submitted"));
-    if (!subs.length) return;
-    const provider = await getProvider();
+    // BOUNDED, and no longer one query per attempt.
+    //
+    // This used to be `select * from attempts where status = 'submitted'` — and
+    // `attempts` carries no index on `status`, so that is a full table scan — plus
+    // one `select * from answers where attempt_id = ?` for every row returned. At
+    // 300 just-submitted attempts that was a scan and ~300 queries every 60
+    // seconds, competing with students who were still submitting. Now: one capped
+    // read, then ONE grouped count for the whole batch.
+    const subs = await db
+      .select({ id: schema.attempts.id, examId: schema.attempts.examId })
+      .from(schema.attempts)
+      .where(eq(schema.attempts.status, "submitted"))
+      .limit(RECONCILE_ATTEMPT_LIMIT);
+    if (!subs.length) {
+      if (jobsAvailable) await closeStaleGradeJobs(db).catch(() => {});
+      return;
+    }
+
+    const ungradedByAttempt = new Map<string, number>();
+    const ids = subs.map((a) => a.id);
+    for (let i = 0; i < ids.length; i += 200) {
+      const chunk = ids.slice(i, i + 200);
+      // `trim(response) NOT IN ('', 'null', '""')` is the SQL approximation of
+      // hasContent(): the column is JSON text, so an empty answer is stored as one
+      // of those three spellings. It only has to be a PRE-FILTER — gradeAttemptOnce
+      // re-checks precisely in JS, and an attempt wrongly included here just gets
+      // reconciled to "graded", which is what it needed anyway.
+      const rows = await db.all<{ attempt_id: string; ungraded: number }>(
+        dsql`SELECT attempt_id,
+                    SUM(CASE WHEN score IS NULL AND response IS NOT NULL
+                             AND trim(response) NOT IN ('', 'null', '""') THEN 1 ELSE 0 END) AS ungraded
+               FROM answers
+              WHERE attempt_id IN (${dsql.join(chunk.map((c) => dsql`${c}`), dsql`, `)})
+              GROUP BY attempt_id`,
+      );
+      for (const r of rows) ungradedByAttempt.set(r.attempt_id, Number(r.ungraded ?? 0));
+    }
+
+    const provider = jobsAvailable ? null : await getProvider();
     let queued = 0;
     let reconciled = 0;
+    let skipped = 0;
     for (const a of subs) {
-      const ans = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, a.id));
-      if (ans.some((x) => x.score == null && hasContent(x.response))) {
-        // Still has ungraded content → (re)grade it.
-        queueAttemptGrading(a.id, provider);
+      if ((ungradedByAttempt.get(a.id) ?? 0) > 0) {
+        // Still has ungraded content. With the durable queue this is just "make
+        // sure a job row exists" — the worker owns the retry schedule. Without it,
+        // fall back to grading in-process as before.
+        if (jobsAvailable) await recordGradeJob(a.id, a.examId);
+        else queueAttemptGrading(a.id, provider);
         queued++;
-      } else {
-        // Nothing left to grade but the attempt is still "submitted" — the final
-        // flip was lost. Recompute the score and flip to "graded" directly.
-        const { scorePct, deduped } = scoreFromAnswers(ans);
-        if (deduped > 0) {
-          console.error(
-            `[grade-queue] INVARIANT VIOLATION: attempt ${a.id} has ${deduped} duplicate answer row(s) during reconcile; scored on the deduped set.`,
-          );
-        }
-        await db.update(schema.attempts).set({ status: "graded", score: scorePct }).where(eq(schema.attempts.id, a.id));
-        void maybeCheckExamAfterGrading(a.examId);
-        reconciled++;
+        continue;
       }
+      // Nothing left to grade but the attempt is still "submitted" — the final flip
+      // was lost. Recompute the score and flip to "graded" directly.
+      if (reconciled >= RECONCILE_REPAIR_LIMIT) {
+        skipped++;
+        continue;
+      }
+      const ans = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, a.id));
+      const { scorePct, deduped } = scoreFromAnswers(ans);
+      if (deduped > 0) {
+        console.error(
+          `[grade-queue] INVARIANT VIOLATION: attempt ${a.id} has ${deduped} duplicate answer row(s) during reconcile; scored on the deduped set.`,
+        );
+      }
+      await db.update(schema.attempts).set({ status: "graded", score: scorePct }).where(eq(schema.attempts.id, a.id));
+      if (jobsAvailable) await completeGradeJobByAttempt(db, a.id).catch(() => {});
+      void maybeCheckExamAfterGrading(a.examId);
+      reconciled++;
     }
-    if (queued || reconciled) console.log(`[grade-queue] recovery sweep: re-queued ${queued}, reconciled-to-graded ${reconciled}`);
+    if (jobsAvailable) await closeStaleGradeJobs(db).catch(() => {});
+    if (queued || reconciled || skipped) {
+      console.log(
+        `[grade-queue] recovery sweep: queued ${queued}, reconciled-to-graded ${reconciled}` +
+          (skipped ? `, deferred ${skipped} to the next pass` : ""),
+      );
+    }
   } catch (e) {
     console.error("[grade-queue] recovery sweep failed:", e);
   }

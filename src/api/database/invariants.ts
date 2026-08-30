@@ -42,6 +42,12 @@ type IndexSpec = {
   columns: string[];
   /** What breaks if this index is missing — used in the alert text. */
   guards: string;
+  /**
+   * `false` when the index guards a background feature rather than exam
+   * correctness: still asserted and still reported, but it must not flip
+   * `/api/health` red in the middle of an exam. Defaults to critical.
+   */
+  critical?: boolean;
 };
 
 /**
@@ -70,6 +76,18 @@ export const REQUIRED_UNIQUE_INDEXES: IndexSpec[] = [
     table: "students",
     columns: ["tenant_id", "upper(trim(roll_no))"],
     guards: "duplicate student records splitting one student's results across two rows",
+  },
+  {
+    name: "grade_jobs_attempt_uq",
+    table: "grade_jobs",
+    columns: ["attempt_id"],
+    guards:
+      "duplicate grading jobs for one attempt — two workers would grade the same paper " +
+      "at the same time, billing the AI provider twice and writing the same answer rows concurrently",
+    // Advisory: the queue is a background feature that falls back to the in-memory
+    // schedule when the table is unavailable, so a failure here must not turn
+    // /api/health red while an exam is running.
+    critical: false,
   },
 ];
 
@@ -100,6 +118,67 @@ export const REQUIRED_PERF_INDEXES: IndexSpec[] = [
     guards:
       "the every-10s event-flush dedupe re-reading an attempt's entire event history " +
       "instead of the recent window it can actually collide with",
+  },
+  {
+    name: "grade_jobs_status_next_idx",
+    table: "grade_jobs",
+    columns: ["status", "next_run_at"],
+    guards:
+      "the grading worker's claim query scanning the whole queue on every tick instead " +
+      "of the few jobs that are actually due",
+  },
+];
+
+type TableSpec = {
+  name: string;
+  /** Full `CREATE TABLE IF NOT EXISTS` statement. Must match schema.ts exactly. */
+  ddl: string;
+  /** Indexes to create with the table, as `CREATE ... IF NOT EXISTS` statements. */
+  indexes: string[];
+  /** What breaks if this table is missing — used in the alert text. */
+  guards: string;
+};
+
+/**
+ * Tables that `schema.ts` declares but that no migration creates.
+ *
+ * Same deploy gap as the indexes and columns above, one step worse: a brand-new
+ * table does not exist on production at all until something creates it, so the
+ * feature that depends on it is dead on arrival after a deploy. `db:push` is not
+ * part of `start`, so this is the only thing that creates it.
+ *
+ * Rules for anything added here:
+ *  - `CREATE TABLE IF NOT EXISTS` only. Never a DROP, never an ALTER of an
+ *    existing table — use REQUIRED_COLUMNS for additive columns.
+ *  - The DDL must mirror schema.ts column for column, including NOT NULL and
+ *    DEFAULT, or Drizzle's SELECT list will not match the real table.
+ *  - The feature using the table must degrade gracefully if creation fails, not
+ *    take the exam server with it.
+ */
+export const REQUIRED_TABLES: TableSpec[] = [
+  {
+    name: "grade_jobs",
+    ddl: `CREATE TABLE IF NOT EXISTS grade_jobs (
+            id TEXT PRIMARY KEY,
+            attempt_id TEXT NOT NULL,
+            exam_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            tries INTEGER NOT NULL DEFAULT 0,
+            next_run_at INTEGER NOT NULL,
+            claimed_at INTEGER,
+            claimed_by TEXT,
+            last_error TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+          )`,
+    indexes: [
+      `CREATE UNIQUE INDEX IF NOT EXISTS grade_jobs_attempt_uq ON grade_jobs (attempt_id)`,
+      `CREATE INDEX IF NOT EXISTS grade_jobs_status_next_idx ON grade_jobs (status, next_run_at)`,
+    ],
+    guards:
+      "the durable grading queue — without it AI grading falls back to the in-memory " +
+      "schedule, which loses its retry state on every deploy and cannot be run on more " +
+      "than one replica without double-grading (and double-billing) every attempt",
   },
 ];
 
@@ -150,7 +229,16 @@ export type IndexState = {
   columnsPresent: string[];
   /** Columns this boot had to add, as `table.column`. */
   columnsAdded: string[];
-  failed: { index: string; error: string; duplicateGroups?: number }[];
+  /** Tables already on the connected database. */
+  tablesPresent: string[];
+  /** Tables this boot had to create. */
+  tablesCreated: string[];
+  /**
+   * `advisory: true` means the failure degrades a background feature but cannot
+   * corrupt an exam, so it is reported without flipping `ok` (and therefore without
+   * turning /api/health red mid-exam). Everything else is a correctness failure.
+   */
+  failed: { index: string; error: string; duplicateGroups?: number; advisory?: boolean }[];
 };
 
 export const INDEX_STATE: IndexState = {
@@ -161,6 +249,8 @@ export const INDEX_STATE: IndexState = {
   perf: { present: [], created: [], failed: [] },
   columnsPresent: [],
   columnsAdded: [],
+  tablesPresent: [],
+  tablesCreated: [],
   failed: [],
 };
 
@@ -308,17 +398,64 @@ async function ensurePerformanceIndexes(): Promise<void> {
   INDEX_STATE.perf = { present, created, failed };
 }
 
-/** Count logical keys that already have more than one row. */
+/**
+ * Count logical keys that already have more than one row.
+ *
+ * Groups by ALL of `spec.columns`, whatever their number. This used to destructure
+ * exactly two (`const [a, b] = spec.columns`), which silently emitted
+ * `sql.raw(undefined)` for a single-column spec — so the first single-column
+ * unique index added to the list (grade_jobs_attempt_uq) would have crashed the
+ * pre-check instead of reporting duplicates.
+ */
 async function countDuplicateGroups(spec: IndexSpec): Promise<number> {
-  const [a, b] = spec.columns;
+  const cols = spec.columns.filter((c) => c && c.trim() !== "");
+  if (!cols.length) return 0;
   const rows = await db.all<{ c: number }>(
     sql`SELECT COUNT(*) AS c FROM (
           SELECT 1 FROM ${sql.raw(spec.table)}
-          GROUP BY ${sql.raw(a)}, ${sql.raw(b)}
+          GROUP BY ${sql.raw(cols.join(", "))}
           HAVING COUNT(*) > 1
         )`,
   );
   return Number(rows[0]?.c ?? 0);
+}
+
+/**
+ * Ensure every table `schema.ts` declares exists on the connected database.
+ *
+ * Runs FIRST in ensureDatabaseInvariants: a column check or an index creation on a
+ * table that does not exist can only fail. Idempotent (`IF NOT EXISTS`) and never
+ * throws — a table this creates belongs to a background feature that is required
+ * to degrade gracefully, so a failure here must not stop the exam server.
+ */
+export async function ensureRequiredTables(): Promise<{ tablesPresent: string[]; tablesCreated: string[]; failed: { index: string; error: string }[] }> {
+  const tablesPresent: string[] = [];
+  const tablesCreated: string[] = [];
+  const failed: { index: string; error: string }[] = [];
+
+  for (const spec of REQUIRED_TABLES) {
+    try {
+      const existed = await tableExists(spec.name);
+      await db.run(sql.raw(spec.ddl));
+      // Indexes are asserted even when the table already existed: an older
+      // deployment could have created the table before an index was added here.
+      for (const stmt of spec.indexes) await db.run(sql.raw(stmt));
+      if (existed) {
+        tablesPresent.push(spec.name);
+      } else {
+        console.warn(`[invariants] created missing table ${spec.name} — guards against ${spec.guards}`);
+        tablesCreated.push(spec.name);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[invariants] could not ensure table ${spec.name}:`, msg);
+      failed.push({ index: spec.name, error: msg });
+    }
+  }
+
+  INDEX_STATE.tablesPresent = tablesPresent;
+  INDEX_STATE.tablesCreated = tablesCreated;
+  return { tablesPresent, tablesCreated, failed };
 }
 
 /**
@@ -332,10 +469,18 @@ export async function ensureDatabaseInvariants(): Promise<IndexState> {
   INDEX_STATE.created = [];
   INDEX_STATE.columnsPresent = [];
   INDEX_STATE.columnsAdded = [];
+  INDEX_STATE.tablesPresent = [];
+  INDEX_STATE.tablesCreated = [];
   INDEX_STATE.failed = [];
   INDEX_STATE.perf = { present: [], created: [], failed: [] };
 
-  // Columns first: an index cannot be built on a column that is not there, and
+  // Tables first: a column check or an index creation on a table that does not
+  // exist can only fail. Advisory — every table here belongs to a background
+  // feature that degrades gracefully, so it must not flip `ok`.
+  const tables = await ensureRequiredTables();
+  INDEX_STATE.failed.push(...tables.failed.map((f) => ({ ...f, advisory: true })));
+
+  // Columns next: an index cannot be built on a column that is not there, and
   // this call is idempotent so it is safe even though server.ts already ran it
   // before listening (a restored/swapped database would be caught here).
   const cols = await ensureRequiredColumns();
