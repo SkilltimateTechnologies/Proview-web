@@ -231,6 +231,12 @@ export const attempts = sqliteTable(
   (t) => [
     index("attempts_exam_idx").on(t.examId),
     index("attempts_student_idx").on(t.studentId),
+    // The background sweeps filter by status alone (`in_progress` for auto-submit,
+    // `submitted` for the grading reconcile). Without this index those are full
+    // scans of every attempt ever taken, on a timer, forever — the cost grows with
+    // history rather than with load. At ~58k stored attempts a single 60s scan
+    // consumes an entire 2.5B-row monthly Turso allowance on its own.
+    index("attempts_status_idx").on(t.status),
     // One attempt per student per exam, enforced by the DB. Without this, two
     // concurrent /start calls both SELECT nothing and both INSERT, which is how a
     // single student ended up with dozens of rows in the Live Monitor. /start now

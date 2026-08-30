@@ -127,6 +127,16 @@ export const REQUIRED_PERF_INDEXES: IndexSpec[] = [
       "the grading worker's claim query scanning the whole queue on every tick instead " +
       "of the few jobs that are actually due",
   },
+  {
+    name: "attempts_status_idx",
+    table: "attempts",
+    columns: ["status"],
+    guards:
+      "the background sweeps full-scanning every attempt ever taken, once a minute, " +
+      "forever — auto-submit filters status='in_progress' and the grading reconcile " +
+      "filters status='submitted', so the cost grew with exam history rather than with " +
+      "load (at ~58k stored attempts one 60s scan alone consumes a 2.5B-row monthly plan)",
+  },
 ];
 
 type TableSpec = {
