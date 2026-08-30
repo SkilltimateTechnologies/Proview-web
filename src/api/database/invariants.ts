@@ -226,6 +226,15 @@ export const REQUIRED_COLUMNS: ColumnSpec[] = [
       "student answer review re-ordering options for attempts sat before per-student " +
       "option shuffling existed (NULL = original authored order, render as-is)",
   },
+  {
+    table: "exams",
+    column: "grading_mode",
+    type: "text",
+    guards:
+      "the per-exam grading release policy (NULL = defer AI/coding grading until the " +
+      "exam window closes, 'immediate' = grade at submit). Without the column every " +
+      "exams query fails, since Drizzle names it in the SELECT list",
+  },
 ];
 
 export type IndexState = {

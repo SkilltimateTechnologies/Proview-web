@@ -2048,9 +2048,13 @@ const app = new Hono<{ Variables: Vars }>()
     // Persist + grade through the shared path. Objective graded inline; subjective
     // + coding deferred to the background queue. The same path is reused by the
     // server-side auto-submit sweep for abandoned attempts.
-    const { score } = await finalizeAttempt(attempt, respArr, provider);
+    const { score, status, gradeAt } = await finalizeAttempt(attempt, respArr, provider);
 
-    return c.json({ ok: true, attemptId: aid, score }, 200);
+    // `gradeAt` is when the deferred grading batch becomes due (null = nothing to
+    // wait for, i.e. graded already or grading now). The client uses it to decide
+    // whether to keep polling for a score: with grading held until after the exam
+    // closes, a fast poll would burn 40 reads per student and never see "graded".
+    return c.json({ ok: true, attemptId: aid, score, status, gradeAt }, 200);
   })
 
   // Review a finished attempt: per-question response, score, correct answer + AI notes.

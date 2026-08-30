@@ -150,6 +150,16 @@ export const exams = sqliteTable(
     holdMs: integer("hold_ms").notNull().default(0),
     // Extra minutes granted by admin for the whole exam.
     extraMin: integer("extra_min").notNull().default(0),
+    // When AI/coding grading is allowed to run.
+    //   NULL / "after_close" -> deferred until the exam window has closed (default)
+    //   "immediate"          -> graded at submit, the pre-2026-08-30 behaviour
+    // Deferring is a load decision: 300 students hitting the bell used to fire 300
+    // AI grading passes plus Judge0 calls from the web process while other students
+    // were still writing to the same database. Objective questions are unaffected —
+    // they are graded inline at submit (pure CPU) and still return instantly.
+    // Nullable on purpose: REQUIRED_COLUMNS adds this to live databases with
+    // ALTER TABLE ADD COLUMN, which cannot add a NOT NULL column.
+    gradingMode: text("grading_mode").$type<"after_close" | "immediate">(),
     createdBy: text("created_by"),
     createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
   },

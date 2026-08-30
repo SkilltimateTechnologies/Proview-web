@@ -397,11 +397,68 @@ export async function gradeAttempt(attemptId: string, providerArg?: string | nul
  * questions score 0) — the point is to move an abandoned attempt out of
  * `in_progress` and into grading, not to fabricate answers.
  */
+/**
+ * How long after an exam closes the deferred grading batch becomes due.
+ *
+ * Not zero: the auto-submit sweep needs its grace window to force-submit the
+ * students who lost their connection through the cutoff, and grading them in the
+ * same breath as the on-time submitters keeps one batch instead of two.
+ */
+export const GRADE_RELEASE_LAG_MS = Number(process.env.GRADE_RELEASE_LAG_MS) || 5 * 60_000;
+
+export type GradeReleaseExam = {
+  endAt: Date | number | string | null;
+  extraMin?: number | null;
+  holdMs?: number | null;
+  heldAt?: Date | number | string | null;
+  gradingMode?: string | null;
+};
+
+/**
+ * How long to hold an attempt's AI/coding grading before the worker may claim it.
+ *
+ * WHY THIS EXISTS. Grading used to start the instant a student pressed submit, so
+ * a 300-student bell fired 300 AI passes and Judge0 calls out of the web process
+ * while everyone else was still writing to the same database. Nothing about that
+ * was necessary: the marks are not shown at submit anyway.
+ *
+ * Returns 0 — i.e. grade now, today's behaviour — when there is nothing to wait
+ * for: an exam explicitly set to `immediate`, an exam with no end time (an open
+ * practice paper, where "after close" would never arrive), an unparseable date, or
+ * a window that has already closed. A submit after the bell therefore grades
+ * straight away, which is what the auto-submit sweep and any late finalize want.
+ *
+ * NOTE on exam-level time bounds. `effectiveEndMs` deliberately folds in
+ * per-attempt `pausedMs`, which is unbounded, so an exam-level deadline is NOT
+ * safe for deciding whether to force-submit someone. It is safe here: the only
+ * consequence of a release time that lands early is that an already-submitted
+ * paper gets graded a little sooner.
+ */
+export function gradeReleaseDelayMs(
+  exam: GradeReleaseExam | null | undefined,
+  now: number = Date.now(),
+): number {
+  if (!exam) return 0;
+  if (exam.gradingMode === "immediate") return 0;
+  if (!exam.endAt) return 0;
+  const endMs = new Date(exam.endAt).getTime();
+  if (!Number.isFinite(endMs)) return 0;
+  let releaseAt = endMs + (exam.extraMin ?? 0) * 60_000 + (exam.holdMs ?? 0) + GRADE_RELEASE_LAG_MS;
+  // An exam held right now has not finished counting its hold, so the window
+  // cannot close before the hold is lifted.
+  if (exam.heldAt) {
+    const heldMs = new Date(exam.heldAt).getTime();
+    if (Number.isFinite(heldMs)) releaseAt += Math.max(0, now - heldMs);
+  }
+  return Math.max(0, releaseAt - now);
+}
+
 export async function finalizeAttempt(
   attempt: typeof schema.attempts.$inferSelect,
   respArr: { questionId: string; response: unknown }[],
   provider: string | null,
-): Promise<{ score: number; status: "submitted" | "graded" }> {
+  examRow?: typeof schema.exams.$inferSelect | null,
+): Promise<{ score: number; status: "submitted" | "graded"; gradeAt: number | null }> {
   const aid = attempt.id;
   const eqs = await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, attempt.examId)).orderBy(schema.examQuestions.order);
   const qids = eqs.map((q) => q.questionId);
@@ -521,18 +578,38 @@ export async function finalizeAttempt(
     submittedAt: new Date(),
   }).where(eq(schema.attempts.id, aid));
 
+  let gradeAt: number | null = null;
   if (hasPending) {
-    // Persist the work FIRST, then start grading it immediately.
+    // Persist the work FIRST, then schedule the grading.
     //
     // The row is the durable half: if this process dies mid-grade, or a deploy
     // lands two seconds later, another worker picks the attempt up with its retry
-    // count intact instead of the schedule evaporating. Costs submit exactly one
-    // extra statement (7 -> 8) and is fail-soft, so a queue problem can never turn
-    // into a failed submit for a student.
-    await recordGradeJob(aid, attempt.examId);
-    queueAttemptGrading(aid, provider);
+    // count intact instead of the schedule evaporating. Fail-soft, so a queue
+    // problem can never turn into a failed submit for a student.
+    //
+    // Only papers that actually have AI/coding work reach this branch, so the exam
+    // read below costs an MCQ-only submit nothing at all.
+    let exam = examRow ?? null;
+    if (!exam) {
+      try {
+        const [e] = await db.select().from(schema.exams).where(eq(schema.exams.id, attempt.examId)).limit(1);
+        exam = e ?? null;
+      } catch {
+        // Unreadable exam row -> treat as "no reason to wait" and grade now, which
+        // is the behaviour that shipped before deferral existed.
+        exam = null;
+      }
+    }
+    const now = Date.now();
+    const delayMs = gradeReleaseDelayMs(exam, now);
+    gradeAt = delayMs > 0 ? now + delayMs : null;
+    const queued = await recordGradeJob(aid, attempt.examId, delayMs);
+    // Grade in-process only when there is nothing to wait for, or when the durable
+    // queue is unavailable. In the second case grading now is worse for load but
+    // strictly better than a paper nobody ever grades.
+    if (!queued || delayMs === 0) queueAttemptGrading(aid, provider);
   }
-  return { score: scorePct, status };
+  return { score: scorePct, status, gradeAt };
 }
 
 // Grace window after an attempt's effective deadline before the server
@@ -577,7 +654,8 @@ export async function sweepAutoSubmit() {
         const synced = ans
           .filter((x) => hasContent(x.response))
           .map((x) => ({ questionId: x.questionId, response: x.response }));
-        await finalizeAttempt(a, synced, provider);
+        // `exam` is already in hand here, so this finalize pays no exam read.
+        await finalizeAttempt(a, synced, provider, exam);
         await db.update(schema.attempts).set({ disconnected: true }).where(eq(schema.attempts.id, a.id));
         done++;
       } catch (e) {
@@ -808,7 +886,17 @@ export async function sweepPendingGrading() {
       for (const r of rows) ungradedByAttempt.set(r.attempt_id, Number(r.ungraded ?? 0));
     }
 
+    // Deferred grading: the reconcile has to honour the SAME release time as the
+    // submit path. Re-enqueuing with delay 0 would quietly undo the deferral and
+    // start grading in the middle of a live exam, on the 10-minute tick.
+    const reconcileExamIds = [...new Set(subs.map((a) => a.examId))];
+    const reconcileExams = reconcileExamIds.length
+      ? await db.select().from(schema.exams).where(inArray(schema.exams.id, reconcileExamIds))
+      : [];
+    const reconcileExamById = new Map(reconcileExams.map((e) => [e.id, e]));
+
     const provider = jobsAvailable ? null : await getProvider();
+    const reconcileNow = Date.now();
     let queued = 0;
     let reconciled = 0;
     let skipped = 0;
@@ -817,8 +905,9 @@ export async function sweepPendingGrading() {
         // Still has ungraded content. With the durable queue this is just "make
         // sure a job row exists" — the worker owns the retry schedule. Without it,
         // fall back to grading in-process as before.
-        if (jobsAvailable) await recordGradeJob(a.id, a.examId);
-        else queueAttemptGrading(a.id, provider);
+        if (jobsAvailable) {
+          await recordGradeJob(a.id, a.examId, gradeReleaseDelayMs(reconcileExamById.get(a.examId), reconcileNow));
+        } else queueAttemptGrading(a.id, provider);
         queued++;
         continue;
       }

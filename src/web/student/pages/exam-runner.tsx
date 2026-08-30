@@ -95,7 +95,7 @@ export function ExamRunner() {
   const [cur, setCur] = useState(0);
   const [now, setNow] = useState(Date.now());
   const [submitting, setSubmitting] = useState(false);
-  const [result, setResult] = useState<{ answered: number; skipped: number; events: number; attemptId: string; score: number | null } | null>(null);
+  const [result, setResult] = useState<{ answered: number; skipped: number; events: number; attemptId: string; score: number | null; gradeAt: number | null } | null>(null);
   // Grading poll: after submit, AI grades subjective/coding in the background.
   // We poll the attempt status until it flips to "graded", then reveal the real
   // final score (the score returned inline at submit is objective-only/partial).
@@ -929,8 +929,19 @@ export function ExamRunner() {
     if (phase !== "done" || !result || !examId || gradeDone) return;
     let stop = false;
     let polls = 0;
-    // Backstop so idle post-submit clients never poll forever (~16 min ceiling).
-    const MAX_POLLS = 40;
+    // DEFERRED GRADING. When the server holds AI grading until after the exam
+    // closes it returns `gradeAt`. Fast-polling for a score that provably cannot
+    // arrive for another hour is pure waste — 40 status reads per student, times
+    // the whole cohort, exactly the load this deferral exists to remove. So when
+    // grading is deferred we slow the poll right down. It is NOT switched off:
+    // the same poll is what detects an admin RESET and bounces the student back
+    // into the exam, and that has to keep working while they sit on this screen.
+    const deferred = !!result.gradeAt && result.gradeAt > Date.now();
+    const FIRST_DELAY_MS = deferred ? 60_000 : 1500;
+    const INTERVAL_MS = deferred ? 60_000 : 2500;
+    // Backstop so idle post-submit clients never poll forever: ~16 min at the
+    // fast cadence, ~15 min of reset-detection at the slow one.
+    const MAX_POLLS = deferred ? 15 : 40;
     const poll = async () => {
       try {
         const st = await api.status(examId, optionOrderRef.current);
@@ -972,9 +983,9 @@ export function ExamRunner() {
           return;
         }
       } catch { /* ignore, retry */ }
-      if (!stop) timer = window.setTimeout(poll, 2500);
+      if (!stop && ++polls < MAX_POLLS) timer = window.setTimeout(poll, INTERVAL_MS);
     };
-    let timer = window.setTimeout(poll, 1500);
+    let timer = window.setTimeout(poll, FIRST_DELAY_MS);
     return () => { stop = true; window.clearTimeout(timer); };
   }, [phase, result, examId, gradeDone]);
 
@@ -1202,7 +1213,7 @@ export function ExamRunner() {
       setPhase("validating");
       const res = await api.submit(s.attemptId, payload);
       if (examId) clearProgress(examId);
-      setResult({ answered, skipped, events: s.integrityEvents.length, attemptId: s.attemptId, score: res.score ?? null });
+      setResult({ answered, skipped, events: s.integrityEvents.length, attemptId: s.attemptId, score: res.score ?? null, gradeAt: res.gradeAt ?? null });
       setSubmitting(false);
       setPhase("done");
     } catch (e) {
@@ -1481,7 +1492,14 @@ export function ExamRunner() {
         <div className="card" style={{ padding: 40, maxWidth: 460, width: "100%", textAlign: "center" }}>
           <div style={{ width: 62, height: 62, borderRadius: 999, background: "#e7f5ee", color: "var(--color-success)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 20px" }}><Icon name="check" size={32} /></div>
           <h1 style={{ fontFamily: "var(--font-serif)", fontSize: 26, marginBottom: 12 }}>Thank you for taking the exam</h1>
-          <p style={{ color: "var(--color-ink2)", marginBottom: 28, lineHeight: 1.6, fontSize: 15 }}>Your answers were submitted successfully. Your score will be updated soon.</p>
+          <p style={{ color: "var(--color-ink2)", marginBottom: 28, lineHeight: 1.6, fontSize: 15 }}>
+            {result.gradeAt && result.gradeAt > Date.now()
+              // Deferred grading: the paper is safely stored, but marking only
+              // starts after the exam closes for everyone, so promise a window
+              // instead of "soon" — students otherwise sit here refreshing.
+              ? "Your answers were submitted successfully. Evaluation begins after the exam closes for all students — please check back for your result within 2 hours."
+              : "Your answers were submitted successfully. Your score will be updated soon."}
+          </p>
 
           <button
             className="btn btn-primary"
