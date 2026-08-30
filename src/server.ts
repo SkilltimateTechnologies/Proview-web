@@ -3,6 +3,8 @@ import { promisify } from "node:util";
 import { brotliCompress, constants as zlibConstants, gzip } from "node:zlib";
 import app from "./api";
 import { startAutoSubmitSweep, startGradeQueue } from "./api/lib/grade-queue";
+import { heartbeats } from "./api/lib/heartbeat-queue";
+import { db } from "./api/database";
 import { ensureDatabaseInvariants, ensureRequiredColumns } from "./api/database/invariants";
 import {
 	CompressedAssets,
@@ -251,4 +253,19 @@ if (runsBackgroundWork) {
   // `in_progress` attempts (student closed the browser / lost connection at the
   // cutoff) so they never stay stuck in-progress. Runs every 60s.
   startAutoSubmitSweep(60_000);
+}
+
+// The heartbeat flusher is deliberately OUTSIDE the ROLE gate above. Heartbeats
+// arrive on whichever process serves student traffic, and the coalescing map they
+// land in lives in that process — so a ROLE=web replica that skipped this would
+// accumulate presence and never write it. It is not background work; it is the
+// second half of an endpoint. Unref'd, so it never holds the process open.
+heartbeats.start(db);
+
+// Best effort on the way out: a deploy or a Railway restart otherwise drops up to
+// one flush window of presence. Nothing waits on this beyond the signal handler.
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, () => {
+    void heartbeats.stop(db).finally(() => process.exit(0));
+  });
 }

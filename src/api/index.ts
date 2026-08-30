@@ -19,6 +19,7 @@ import { OPTION_ORDER_TOKEN, optionTranslator, tokenIsCurrent } from "./lib/opti
 import { judge0Queue, resolveJudge0Config } from "./lib/judge0-queue";
 import { isEligible, matchesCohort, loadRoster, loadRosters, ensureOptInOnlyLoaded, invalidateOptInOnlyCache, isOptInOnlyCode } from "./lib/roster";
 import { TtlCache } from "./lib/ttl-cache";
+import { heartbeats } from "./lib/heartbeat-queue";
 import { TenantDirectory } from "./lib/tenant-directory";
 import { examEffStatus, isConcluded, isReportable, toMs, type StatusExam } from "./lib/exam-status";
 
@@ -407,7 +408,16 @@ async function buildMonitorSnapshot(tid: string) {
           const stu = studentById.get(a.studentId);
           const status = a.status === "in_progress" ? "in_progress" : "finished";
           // Online = a heartbeat within the last 40s (heartbeat interval is ~15s).
-          const online = a.status === "in_progress" && !!a.lastSeenAt && now - new Date(a.lastSeenAt).getTime() < 40_000;
+          // Heartbeats are coalesced and written every 5s, so the freshest ping for
+          // this attempt may not be in the row we just read — overlay whatever is
+          // still pending in this process, which makes the dot MORE accurate than
+          // the database (zero staleness) rather than less.
+          const pendingSeen = heartbeats.peekSeen(a.id);
+          const lastSeenMs = Math.max(
+            a.lastSeenAt ? new Date(a.lastSeenAt).getTime() : 0,
+            pendingSeen ?? 0,
+          );
+          const online = a.status === "in_progress" && lastSeenMs > 0 && now - lastSeenMs < 40_000;
           // Latest violation snapshot, as a short-lived presigned URL.
           const agg = evAgg.get(a.id);
           let snapshot: string | null = null;
@@ -424,7 +434,7 @@ async function buildMonitorSnapshot(tid: string) {
             section: sectionOf(stu?.classId ?? null),
             status,
             online,
-            lastSeenAt: a.lastSeenAt,
+            lastSeenAt: lastSeenMs > 0 ? new Date(lastSeenMs) : a.lastSeenAt,
             startedAt: a.startedAt,
             submittedAt: a.submittedAt,
             score: a.status === "graded" ? a.score : null,
@@ -1872,12 +1882,17 @@ const app = new Hono<{ Variables: Vars }>()
   //
   // This is the highest-volume endpoint during an exam (1000 students / 15s ≈ 67
   // requests a second) and it used to cost three remote round trips each time:
-  // read the exam, read the attempt, write lastSeenAt. Now it costs ONE — the exam
-  // row comes from a 3s coalesced cache (every student is reading the same row),
-  // and the write returns the attempt it just stamped instead of us reading it
-  // first. UPDATE ... RETURNING matches at most one row because
-  // `attempts_exam_student_uq` makes (exam_id, student_id) unique, and that index
-  // is asserted on every boot and reported by /api/health.
+  // read the exam, read the attempt, write lastSeenAt. It now costs ONE, and that
+  // one is a READ — the exam row comes from a 3s coalesced cache (every student is
+  // reading the same row), the attempt read below doubles as the row that
+  // effectiveEndMs needs, and lastSeenAt is handed to the coalescing queue instead
+  // of being written here. The queue folds all 67/s into one batched UPDATE every
+  // 5s (see lib/heartbeat-queue.ts for the staleness budget); presence is the one
+  // thing cheap enough to lose a few seconds of, and writes are both the scarce
+  // quota (25M/month vs 2.5B reads) and the serialized resource on Turso.
+  // The attempt select matches at most one row because `attempts_exam_student_uq`
+  // makes (exam_id, student_id) unique, and that index is asserted on every boot
+  // and reported by /api/health.
   .post("/student/heartbeat/:examId", async (c) => {
     const sid = await verifyStudentToken(c.req.header("x-student-token"));
     if (!sid) return c.json({ message: "Unauthorized" }, 401);
@@ -1885,12 +1900,19 @@ const app = new Hono<{ Variables: Vars }>()
     const exam = await getExamForPolling(eid);
     if (!exam) return c.json({ message: "Not found" }, 404);
     const now = Date.now();
+    // Narrow on purpose: only what effectiveEndMs and the queue need. Coding
+    // attempts carry no wide columns here, but there is no reason to ship any.
     const [attempt] = await db
-      .update(schema.attempts)
-      .set({ lastSeenAt: new Date(now) })
+      .select({
+        id: schema.attempts.id,
+        startedAt: schema.attempts.startedAt,
+        pausedMs: schema.attempts.pausedMs,
+      })
+      .from(schema.attempts)
       .where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, sid)))
-      .returning();
+      .limit(1);
     if (!attempt) return c.json({ message: "No attempt" }, 404);
+    heartbeats.markSeen(attempt.id, now);
     const endAtMs = effectiveEndMs(exam, attempt, now);
     return c.json({ held: !!exam.heldAt, endAt: new Date(endAtMs), serverNow: new Date(now) }, 200);
   })
