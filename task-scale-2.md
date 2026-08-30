@@ -1252,3 +1252,261 @@ It also does not touch the **read** side of polling, which §31 identified as th
 number (~190,000 rows per student on Aug 27). That is the rest of P1: the `/api/reports` per-exam
 N+1, the `integrity_events` read cost (read cost only — the rows are kept forever, by decision), and
 the redundant attempt re-reads on `/events` and `/snapshot-url`.
+
+---
+
+## 36. Reports list: every attempt row of every exam, on every page open (`e9ac941`)
+
+### The shape of it [from code]
+
+`GET /reports` renders one card per conducted exam — attempts, finished, in progress, graded, passed,
+failed, average. It produced those seven integers like this (`src/api/index.ts` L2941):
+
+```ts
+const withStats = await Promise.all(rows.map(async (e) => {
+  const atts = await db.select().from(schema.attempts).where(eq(schema.attempts.examId, e.id));
+  … count in JS …
+}));
+```
+
+A remote round trip per exam, each one selecting **every column of every attempt row** of that exam.
+At 11 conducted exams and 2,520 stored attempts, opening the reports page transfers **every attempt
+ever taken on the platform** across the network so that JavaScript can count them.
+
+Two things make this worse than it first looks:
+
+1. **It scales with exam HISTORY, not with load.** Nothing about it improves when the system is quiet.
+   Every exam ever conducted adds a round trip and its attempts add rows, forever. This is the same
+   family of bug as §32's missing `attempts_status_idx`: cost that grows on the calendar rather than
+   on traffic, which is exactly the kind that never shows up in a load test.
+2. **An admin page people refresh.** Reports is where TPOs sit after an exam. It is not a once-a-day
+   cron; it is the tab someone reloads while waiting for results.
+
+### The fix
+
+One grouped aggregate, riding `attempts_exam_idx`, chunked at 200 exam ids:
+
+```sql
+SELECT exam_id,
+       count(*),
+       sum(CASE WHEN status IN ('submitted','graded') THEN 1 ELSE 0 END),   -- finished
+       sum(CASE WHEN status = 'in_progress'           THEN 1 ELSE 0 END),   -- inProgress
+       sum(CASE WHEN score IS NOT NULL                THEN 1 ELSE 0 END),  -- graded
+       sum(CASE WHEN score >= 40                      THEN 1 ELSE 0 END),  -- passed
+       sum(CASE WHEN score IS NOT NULL AND score < 40 THEN 1 ELSE 0 END),  -- failed
+       sum(CASE WHEN score IS NOT NULL THEN score ELSE 0 END)              -- scoreSum
+  FROM attempts WHERE exam_id IN (…) GROUP BY exam_id
+```
+
+`src/api/lib/report-rollup.ts` owns it, dependency-injected (never the `db` singleton), so tests drive
+the real SQL against in-memory libSQL. The route's remaining work is now synchronous.
+
+**`absent` deliberately stayed in the route.** It is `assigned - finished - inProgress`, gated on the
+deadline having passed — it needs the roster and the exam window, not the attempt table, and folding
+it into this module would have coupled two unrelated things.
+
+### The definitions are the risky part
+
+The counters are not what you would guess from the status column, and the difference is not cosmetic:
+
+- **`graded`, `passed` and `failed` key off `score IS NOT NULL`, not off status.** A terminally-failed
+  grading run leaves an attempt at status `graded` with a **null score** (§20's soft-fail rule keeps
+  today's student-visible outcome). Counting those as failures would silently move the pass rate.
+- `passed + failed == graded` **exactly**, because `NULL >= 40` is NULL in SQL and falls to the ELSE
+  branch — the same reason `passed` needs no null test and `failed` does.
+- `avg` is the mean over **graded only**, one decimal, and **`0` when none** — never `NaN` from a 0/0.
+- `finished` = `submitted` OR `graded`. `wrote` is still returned, equal to `finished`, for compat.
+
+### Why the old JavaScript is still in the repo
+
+`rollupFromAttempts` — the original per-exam counting, preserved verbatim — is kept as a **test
+oracle** and is not on the request path.
+
+That is the whole verification strategy, because the failure mode here is silent and unfalsifiable by
+eye: a card reading *190 attempts, 41% pass, average 62* is completely believable whether or not the
+SQL is right, and nobody reconciles a dashboard against the database by hand. So the 9 tests in
+`report-rollup.test.ts` assert the SQL and the oracle agree, exam by exam, over production-shaped
+data: mixed statuses, ungraded attempts, scores exactly **on** the pass mark, a `graded` row with a
+null score, exam isolation, duplicate ids, chunk boundaries, and an `EXPLAIN QUERY PLAN` check that
+the aggregate rides `attempts_exam_idx` rather than scanning `attempts`.
+
+### Verified [measured]
+
+`bun run typecheck:api` clean · `bun test` **338 pass, 0 fail across 18 files** (329 baseline + 9 new)
+· `bun run build` green · pushed `4707fb5..e9ac941` · production `invariants.checkedAt` advanced to
+**`2026-08-30T08:24:15.699Z`** with `ok: true`.
+
+Measured on production against the live 11-exam / 2,520-attempt tenant, by diffing the `db.queries`
+counter on `/api/health` across 5 sequential calls (idle background noise measured separately at
+~0.2 statements/s and subtracted):
+
+| | statements per `/api/reports` call |
+|---|---|
+| before | **16.6** |
+| after | **~6.4** |
+
+**The prediction was ~4, so it was wrong** — I said the count would fall to about four and it landed
+near six and a half. The 11 per-exam attempt queries are gone as expected; what I under-counted was
+the fixed remainder the route pays regardless: the session/auth lookups, the tenant read, the
+`exams` select and the `exam_roster` `inArray`. That fixed part is now the whole cost.
+
+The number that matters more than the ratio: **statements per call no longer grows with the number of
+exams.** Before, conducting an exam permanently added a round trip to every future page open. Now one
+statement covers up to 200 exams, and the rows leaving the database went from every attempt ever
+taken (2,520 rows × 18 columns) to **one row per exam card**.
+
+Wall-clock from this sandbox was ~660ms per call, of which ~479ms is network round trip to Railway —
+so only the relative server cost is meaningful, and a single-digit statement change is below the
+noise floor of a timing measured from here. The statement count is the honest metric; the latency
+number is not.
+
+### Still open in P1
+
+Next: the **`integrity_events` read cost** (read cost only — the rows are kept forever, by decision),
+then the **redundant attempt re-reads on `/events` and `/snapshot-url`**, both of which re-`select()`
+the entire attempt row purely to authorize the caller. Then P2: per-tenant quotas, every tenant
+defaulting to inherit-global so nothing changes until a number is deliberately set.
+
+## 37. The Live Monitor re-read every proctoring event ever recorded, every 3 seconds (`5011f3a`)
+
+### The shape of it [from code]
+
+The Live Monitor shows, per student, a violation count and the newest webcam thumbnail.
+`buildMonitorSnapshot` (`src/api/index.ts` L288) produced both with two grouped statements per live
+exam:
+
+```sql
+SELECT attempt_id, COUNT(*) … JOIN attempts … WHERE exam_id = ? AND type NOT IN (…) GROUP BY attempt_id
+SELECT … ROW_NUMBER() OVER (PARTITION BY attempt_id ORDER BY at DESC, rowid DESC) … WHERE photo_url IS NOT NULL
+```
+
+Those are already the *fixed* version — an earlier pass in this program replaced code that shipped
+every row to JavaScript, and the comment above them still says so. Grouping was the right fix for the
+freeze. It did nothing about the volume: both statements still **touch every `integrity_events` row
+of every engaged attempt, on every build**.
+
+Three facts multiply together:
+
+1. A webcam snapshot lands roughly **every 27s per student**, and the rows are kept forever by
+   decision. One conducted exam therefore holds tens of thousands of events — "Elite Assessment – 1"
+   holds **27,153**.
+2. The monitor rebuilds at most every **3s** (`MONITOR_CACHE_MS = 3000`, L490) for as long as any
+   admin has the page open.
+3. So the cost grows with **exam duration × watch time**. This is the worst available shape: the
+   longer someone watches, the more each look costs, and the second half of every exam is more
+   expensive per poll than the first. Nothing about it is visible in a short load test.
+
+The photo query was the worse of the two. `photo_url IS NOT NULL` matches no index, so SQLite reads
+full rows — each carrying a ~60-byte object key — and then sorts them.
+
+[arithmetic] At ~54k rows visited per build (two passes over ~27k rows) and 20 builds a minute, one
+watched exam costs roughly **65M rows/hour**. A 90-minute watched exam is about **4% of the entire
+2.5B monthly read allowance** from the Live Monitor alone, for a page showing a few hundred numbers.
+
+### The fix: read each event row once, ever
+
+Evidence is **monotonic** — a violation never un-happens, a snapshot never un-arrives. So the
+aggregate can be carried forward and each build needs only the rows that appeared since the last one.
+`integrity_events` is a rowid table and rowids are assigned increasing, so `rowid` is a natural
+insert watermark:
+
+```
+build 1:  full aggregate, rowid <= W    → cursor = W
+build 2:  only rowid in (W, W']         → cursor = W'
+```
+
+At 200 students flushing every 10s, a 3s tail is **~60 rows instead of ~27,000**. `src/api/lib/integrity-rollup.ts`
+owns it, dependency-injected like `report-rollup.ts`, so tests drive the real SQL against in-memory libSQL.
+
+### The four decisions that make it correct rather than merely fast
+
+**1. The watermark lives in the database, not in an in-process counter.** Integrity events are written
+by the student POST path, which may be a *different process* from the one serving the monitor. Reading
+the tail out of the DB keeps the aggregate **exact across processes** — anything any process inserted
+is in the tail. A counter fed by the writer would silently under-report during a split deploy, and
+under-reporting violations is the one error direction that matters here.
+
+This is deliberately **different from §35's heartbeat overlay**, which does accept single-process
+degradation. That is defensible because a stale heartbeat only affects a dot; a missed violation
+affects an accusation.
+
+**2. `max(rowid)` is pinned BEFORE aggregating**, and both the full and tail queries are bounded by
+`rowid <= watermark`. A row inserted while those statements run is *above* the watermark, so it is
+picked up by the next tail read — never dropped, never counted twice.
+
+**3. The cursor advances to the global `max(rowid)`, not to this exam's maximum.** If it tracked only
+this exam's rows, a second live exam's writes would sit permanently above the cursor and the tail
+would grow without bound — precisely when the monitor is under the most load. There is a test that
+writes 500 rows for another exam and asserts the cursor still lands on the global max.
+
+**4. Deletes are the one direction a watermark cannot follow.** SQLite reuses rowids below the maximum
+once the top row is deleted, so a reused rowid could land *under* the cursor and never be read. Two
+mitigations, belt and braces:
+
+- All **six** admin paths that delete integrity events call `integrityRollup.invalidateAll()` —
+  student delete, roster removal (×2), mark-absent, bulk remove, reset.
+- `FULL_REBUILD_MS = 10min` forces a from-scratch rebuild regardless, so any drift is bounded and
+  self-healing even if a seventh delete path is added later and someone forgets the call.
+
+Semantics are unchanged: the `atMs >= lastAtMs` tie-break reproduces the old
+`ORDER BY at DESC, rowid DESC` exactly (later insert wins ties), and non-violation types — timed
+frames, `snapshot_failed`, `focus_loss`, `camera_restored` — still **feed the thumbnail without
+counting as misconduct**. §34's rule that a device fault must never score a student survives intact.
+
+### Verification
+
+The failure mode is silent: a monitor row reading *"7 violations"* is equally believable whether the
+carried aggregate is right or has been double-counting since the exam started. By the end of a
+90-minute exam a double count would read as 400 violations, which is obvious — but a count that
+double-counted only occasionally would not be. So 11 tests fold every row in JS with `applyEvents`
+as an **oracle** and demand the SQL agree: a full build vs. the fold, evidence-only types excluded,
+exam isolation and `not_started` exclusion, **20 consecutive polls with no new rows changing nothing**,
+10 flush/poll ticks each matching the oracle, a late-arriving event with an older `at` not replacing a
+newer thumbnail, an attempt starting mid-exam, the cursor skipping another exam's 500 rows, delete
+drift **documented as not healed until invalidation** and then healed by `invalidateAll()`, the
+automatic rebuild at `FULL_REBUILD_MS`, and idle-exam pruning.
+
+One test assertion was wrong when first written and the code was right: an attempt whose only event is
+a photo-less `snapshot_failed` keeps `lastAtMs: 0`, because `lastAtMs` tracks the newest *thumbnail*,
+not the newest event. The oracle comparison in the same test passed, which is what caught it.
+
+**Shipped [measured]:** `bun run typecheck:api` clean · `bun test` **349 pass, 0 fail across 19 files**
+(338 baseline + 11 new) · `bun run build` green · pushed `e9ac941..5011f3a` · production
+`invariants.checkedAt` advanced `2026-08-30T08:24:15.699Z` → **`2026-08-30T16:54:26.065Z`**, `ok: true`.
+
+### Measured locally, on a realistic exam [measured]
+
+Both paths run against the same seeded in-memory database — **200 engaged attempts, 41,000
+`integrity_events`**, one snapshot per student per 27s over 90 minutes plus real violations — with the
+old statements copied verbatim out of `e9ac941`:
+
+| per monitor build | median | rows the DB visits |
+|---|---|---|
+| old full aggregate | **63.8ms** | ~83,200 (count pass + photo pass) |
+| new incremental tail | **2.3ms** | **~60** |
+
+**28× faster, and ~1,400× fewer rows visited.** Exactness held: the carried aggregate matched a
+from-scratch build across all 200 attempts with **0 mismatches**.
+
+**The caveat, stated plainly:** this is in-memory SQLite in the sandbox with no network. It measures
+CPU and row-visiting only. It is *not* a production latency claim. The real-world gap should be wider
+rather than narrower, because Turso bills **rows read** and adds a network round trip per statement —
+but that is a prediction, not a measurement.
+
+### The falsifiable prediction [unverified]
+
+**No live exam has exercised this yet.** All 11 exams on production are `finished`, so the rollup was
+not invoked once during deploy verification; a live exam with an admin watching is the only real test.
+
+The prediction: monitor-driven `integrity_events` reads become **nearly flat in exam duration**.
+Concretely, on the next watched exam the Turso read curve should no longer ramp upward through the
+exam window the way it does today — a poll in the last five minutes should cost the same as a poll in
+the first five. If the curve still climbs with the clock, the attribution is wrong and I will say so,
+the same way §36's ~4-statements prediction was wrong and got corrected in place.
+
+### Still open in P1
+
+Next: the **redundant attempt re-reads on `/events` and `/snapshot-url`** (~L2010 and ~L2026), both of
+which re-`select()` the entire attempt row purely to authorize the caller — on the student write path,
+which is the scarce one. Then P2: per-tenant quotas, every tenant defaulting to inherit-global so
+nothing changes until a number is deliberately set.
