@@ -77,6 +77,7 @@ const DDL = [
      disconnected INTEGER NOT NULL DEFAULT 0,
      section_snapshot TEXT,
      option_order TEXT,
+     user_agent TEXT,
      submitted_at INTEGER,
      created_at INTEGER NOT NULL
    )`,

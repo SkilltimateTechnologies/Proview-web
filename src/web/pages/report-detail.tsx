@@ -11,7 +11,17 @@ import { Loader, Pill, Drawer, usePagination, Pager } from "../components/ui";
 import { safeName, fmtFileDate, type Brand } from "../lib/pdf/theme";
 import type { StudentAnswer } from "../lib/pdf/student-report";
 
-type Row = { attemptId: string; studentId: string; name: string; rollNo: string; email: string | null; section: string; score: number | null; status: string; submittedAt: string | number | null; absent?: boolean; disconnected?: boolean; answeredCount?: number };
+type Row = { attemptId: string; studentId: string; name: string; rollNo: string; email: string | null; section: string; score: number | null; status: string; submittedAt: string | number | null; absent?: boolean; disconnected?: boolean; answeredCount?: number; frames?: number; snapshotFailures?: number };
+
+/** Did this attempt produce ANY webcam evidence?
+ *
+ *  A student sat four exams whose camera never delivered a decodable frame. He
+ *  started, submitted and scored 95 with zero snapshots, and nothing anywhere said
+ *  so — the empty gallery on his review page was the only sign, found by accident
+ *  two months later. This badge is that discovery moved onto the roster, where it
+ *  costs nobody a click. Only ever shown for a real attempt, and only when webcam
+ *  snapshots are actually switched on. */
+const noCameraEvidence = (r: Row, expected: boolean) => expected && !r.absent && (r.frames ?? 0) === 0;
 
 function saveBlob(blob: Blob, filename: string) {
   const a = document.createElement("a");
@@ -97,7 +107,10 @@ export default function ReportDetail() {
     );
   }
 
-  const { exam, results, totalQuestions } = q.data as { exam: { title: string; status: string }; results: Row[]; totalQuestions?: number };
+  const { exam, results, totalQuestions, snapshotsExpected: snapExpected } = q.data as { exam: { title: string; status: string }; results: Row[]; totalQuestions?: number; snapshotsExpected?: boolean };
+  // Default TRUE: an older API build that does not send the field still has webcam
+  // snapshots on, so a missing flag must not hide a camera failure.
+  const snapshotsExpected = snapExpected !== false;
   // Metrics + roster follow the active section filter (or the whole exam when "all").
   const scoped = sectionFilter === "all" ? results : results.filter((r) => r.section === sectionFilter);
   const topper = scoped.find((r) => !r.absent && r.score != null) ?? scoped[0];
@@ -409,6 +422,19 @@ export default function ReportDetail() {
                 {r.disconnected && (
                   <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded" style={{ color: "#b7791f", background: "rgba(183,121,31,.12)", fontFamily: "var(--font-mono)" }} title="Lost connection before submitting — only synced answers were graded">
                     Disconnected · {r.answeredCount ?? 0}/{totalQuestions ?? "—"}
+                  </span>
+                )}
+                {noCameraEvidence(r, snapshotsExpected) && (
+                  <span
+                    className="shrink-0 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded"
+                    style={{ color: "#c0453b", background: "rgba(192,69,59,.12)", fontFamily: "var(--font-mono)" }}
+                    title={
+                      (r.snapshotFailures ?? 0) > 0
+                        ? `No webcam frames captured. The client reported ${r.snapshotFailures} capture failure${(r.snapshotFailures ?? 0) === 1 ? "" : "s"} — the camera was not delivering frames on this device.`
+                        : "No webcam frames captured for this attempt — the camera produced no evidence. Check the student's device before treating this paper as proctored."
+                    }
+                  >
+                    No camera
                   </span>
                 )}
               </div>

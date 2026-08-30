@@ -82,6 +82,17 @@ function loadCachedBundle(examId: string): Bundle | null {
   } catch { return null; }
 }
 
+/** Why a timed capture produced no uploadable frame. `no_frame`/`capture_error`
+ *  mean the camera is not delivering pixels to the page; `upload_failed` means it
+ *  is, but the evidence never reached storage. `snapshots_off`/`no_attempt` are not
+ *  faults at all, and `offline` is the network — none of those get recorded. */
+type FrameFailure = "no_attempt" | "snapshots_off" | "no_frame" | "offline" | "upload_failed" | "capture_error";
+type GrabResult = { key: string | null; metrics: FrameMetrics | null; failure: FrameFailure | null };
+/** The subset worth a row on the integrity timeline: evidence was expected and did
+ *  not arrive. Excludes `offline` — the periodic loop already skips while offline,
+ *  and a dropped uplink is not a camera fault. */
+const CAMERA_FAILURES = new Set<FrameFailure>(["no_frame", "capture_error", "upload_failed"]);
+
 export function ExamRunner() {
   const { examId } = useParams();
   const [, navigate] = useLocation();
@@ -282,16 +293,21 @@ export function ExamRunner() {
   // Capture a frame AND its luminance metrics in one pass (same canvas, decoded
   // once), then upload it. Metrics come back even when the upload fails, so
   // blocked-lens detection keeps working on a flaky uplink.
-  const grabFrame = useCallback(async (): Promise<{ key: string | null; metrics: FrameMetrics | null }> => {
+  const grabFrame = useCallback(async (): Promise<GrabResult> => {
     const s = sessionRef.current;
-    if (!s?.attemptId) return { key: null, metrics: null };
-    if (!proctoringRef.current.webcamSnapshots) return { key: null, metrics: null };
+    if (!s?.attemptId) return { key: null, metrics: null, failure: "no_attempt" };
+    if (!proctoringRef.current.webcamSnapshots) return { key: null, metrics: null, failure: "snapshots_off" };
     try {
       const { blob, metrics } = await captureFrame(webcamRef.current);
-      if (!blob || !navigator.onLine) return { key: null, metrics };
-      return { key: await uploadFrame(s.attemptId, blob), metrics };
+      // A live-but-covered lens still produces a blob (and metrics) — the obstruction
+      // detector depends on that. No blob at all means the video element never
+      // decoded a frame: the camera is not actually delivering pixels to this page.
+      if (!blob) return { key: null, metrics, failure: "no_frame" };
+      if (!navigator.onLine) return { key: null, metrics, failure: "offline" };
+      const key = await uploadFrame(s.attemptId, blob);
+      return { key, metrics, failure: key ? null : "upload_failed" };
     } catch {
-      return { key: null, metrics: null };
+      return { key: null, metrics: null, failure: "capture_error" };
     }
   }, [uploadFrame]);
 
@@ -341,10 +357,24 @@ export function ExamRunner() {
     if (submittedRef.current) return;
     const s = sessionRef.current;
     if (!s?.attemptId) return;
-    const { key: photoKey, metrics } = await grabFrame();
+    const { key: photoKey, metrics, failure } = await grabFrame();
     if (photoKey) {
       pendingEventsRef.current.push({ type: "periodic_snapshot", detail: "Timed webcam frame", at: Date.now(), photoKey });
       flushEventsRef.current();
+    } else if (failure && CAMERA_FAILURES.has(failure)) {
+      // WHY THIS EXISTS. This branch used to be absent: when no frame came back we
+      // pushed nothing, so "camera dead for the whole exam" and "camera perfectly
+      // fine" were byte-identical in the database. One student sat four exams over
+      // two months with a webcam that never decoded a single frame, and the platform
+      // recorded nothing and alerted nobody — the empty gallery on his review page
+      // was the only evidence, and only because someone happened to open it.
+      //
+      // Throttled to one row every 5 minutes (the `focus_loss` idiom), so a dead
+      // camera costs ~18 rows across a 90-minute exam instead of one per 27s tick.
+      // Non-scoring by design: it is a device fault, not misconduct — the server
+      // keeps `snapshot_failed` in NON_VIOLATION_TYPES so a student with a broken
+      // webcam is never marked a cheat for it.
+      recordEventRef.current("snapshot_failed", `No webcam frame captured (${failure})`, { minGapMs: 300_000 });
     }
     // NOTE: the blocked-lens detector is deliberately NOT fed from here any more.
     // It is owned by the 10s analysis loop below, and two producers pushing into

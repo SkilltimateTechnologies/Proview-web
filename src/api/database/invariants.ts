@@ -227,6 +227,15 @@ export const REQUIRED_COLUMNS: ColumnSpec[] = [
       "option shuffling existed (NULL = original authored order, render as-is)",
   },
   {
+    table: "attempts",
+    column: "user_agent",
+    type: "text",
+    guards:
+      "the diagnostic record of which browser/device an attempt was sat on (NULL = " +
+      "unknown, an attempt that predates the column). Without it every attempts " +
+      "query fails, since Drizzle names it in the SELECT list",
+  },
+  {
     table: "exams",
     column: "grading_mode",
     type: "text",

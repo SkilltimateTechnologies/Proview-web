@@ -235,6 +235,13 @@ export const attempts = sqliteTable(
     // authored order. NULL on every attempt sat before shuffling existed, which is
     // exactly what makes those reviews render unchanged.
     optionOrder: text("option_order"),
+    // The browser/OS user-agent string the client reported at /start, truncated.
+    // Recorded because proctoring is a CLIENT capability: when a webcam, fullscreen
+    // or screen-count check silently never worked, the only question a reviewer can
+    // ask afterwards is "what was this sat on?" — and until this column existed the
+    // database had no answer. Diagnostic only, never used for scoring or eligibility.
+    // NULL on every attempt sat before this column existed.
+    userAgent: text("user_agent"),
     submittedAt: integer("submitted_at", { mode: "timestamp_ms" }),
     createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
   },

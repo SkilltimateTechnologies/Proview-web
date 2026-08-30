@@ -192,7 +192,14 @@ const isFrameEvent = (t: string) => (FRAME_EVENT_TYPES as readonly string[]).inc
 // the foreground. Counting it produced ~15 phantom violations an hour for students who
 // did nothing wrong, so it stays on the timeline as context but no longer scores.
 // Real tab/app switching is still caught by `tab_switch` (visibilitychange).
-const NON_VIOLATION_TYPES = new Set<string>([...FRAME_EVENT_TYPES, "camera_restored", "camera_block_dismissed", "focus_loss"]);
+// `snapshot_failed` is the client reporting that a timed capture produced no frame —
+// a dead/absent webcam, a permission the browser never really granted, or an upload
+// that never landed. It exists so a camera that never worked leaves a trail instead of
+// silence (before it, "camera dead all exam" and "camera fine" were byte-identical in
+// this table). It must NEVER score: it is a device fault the student may not even be
+// able to see, and counting it would mark a broken laptop as cheating — roughly 18 rows
+// per 90-minute exam at its 5-minute throttle, which would swamp every real violation.
+const NON_VIOLATION_TYPES = new Set<string>([...FRAME_EVENT_TYPES, "camera_restored", "camera_block_dismissed", "focus_loss", "snapshot_failed"]);
 
 type RawIntegrityEvent = { type?: unknown; detail?: unknown; at?: unknown; photoKey?: unknown; photoUrl?: unknown };
 
@@ -1686,6 +1693,11 @@ const app = new Hono<{ Variables: Vars }>()
     // byte-for-byte as before.
     const startBody = await c.req.json().catch(() => ({} as Record<string, unknown>));
     const startScheme = tokenIsCurrent(startBody?.optionOrder) ? OPTION_ORDER_TOKEN : null;
+    // Which device/browser is this paper being sat on? Proctoring is a CLIENT
+    // capability, so when a webcam or fullscreen check silently never worked, this
+    // string is the only thing that can answer "what was it running on?". Stamped
+    // once, diagnostic only, and truncated because a UA is attacker-controlled text.
+    const startUA = (c.req.header("user-agent") ?? "").trim().slice(0, 300) || null;
 
     // Always resolve to the OLDEST attempt for this (exam, student) pair. A stable
     // deterministic pick means /start /status /heartbeat /resume all agree on the
@@ -1714,7 +1726,7 @@ const app = new Hono<{ Variables: Vars }>()
       // the conflict and re-read the winning row, so all callers converge on one attempt.
       try {
         [attempt] = await db.insert(schema.attempts)
-          .values({ id: id("att"), examId: eid, studentId: sid, status: "in_progress", startedAt, sectionSnapshot, optionOrder: startScheme })
+          .values({ id: id("att"), examId: eid, studentId: sid, status: "in_progress", startedAt, sectionSnapshot, optionOrder: startScheme, userAgent: startUA })
           .returning();
       } catch {
         [attempt] = await db.select().from(schema.attempts)
@@ -1736,10 +1748,16 @@ const app = new Hono<{ Variables: Vars }>()
     // renders in the order the student saw. Only ever written when the client reports
     // the current scheme, and never overwritten with null.
     const stampScheme = startScheme !== null && attempt.optionOrder !== startScheme;
-    await db.update(schema.attempts)
-      .set(stampScheme ? { lastSeenAt: new Date(now), optionOrder: startScheme } : { lastSeenAt: new Date(now) })
-      .where(eq(schema.attempts.id, attempt.id));
+    // Same one-write rule for the user-agent: only ever filled in when the row has
+    // none (an attempt created by an older build, or the /start that lost the race),
+    // never overwritten — the FIRST device that opened the paper is the useful fact.
+    const stampUA = startUA !== null && !attempt.userAgent;
+    const startSet: Record<string, unknown> = { lastSeenAt: new Date(now) };
+    if (stampScheme) startSet.optionOrder = startScheme;
+    if (stampUA) startSet.userAgent = startUA;
+    await db.update(schema.attempts).set(startSet).where(eq(schema.attempts.id, attempt.id));
     if (stampScheme) attempt = { ...attempt, optionOrder: startScheme };
+    if (stampUA) attempt = { ...attempt, userAgent: startUA };
     // Return the server-saved answers so a resume/reopen on a FRESH browser
     // (cleared cache, different machine, SEB kiosk that wipes local storage)
     // restores the student's prior work instead of showing a blank exam. The
@@ -2976,8 +2994,39 @@ const app = new Hono<{ Variables: Vars }>()
     };
     const sectionOfAttempt = (a: { studentId: string; sectionSnapshot?: string | null }) =>
       a.sectionSnapshot && a.sectionSnapshot.trim() ? a.sectionSnapshot : sectionOf(a.studentId);
+    // How many webcam frames does each attempt actually have?
+    //
+    // WHY IT IS ON THE ROSTER. A student sat four exams whose camera never produced a
+    // single frame. Nothing failed loudly: he started, submitted, scored 95, and the
+    // only trace was an empty gallery on a review page nobody had a reason to open.
+    // Surfacing the count here means "no proctoring evidence" is visible without
+    // opening anyone, which is the difference between finding this in two months and
+    // finding it the same day.
+    //
+    // ONE STATEMENT, NOT N+1. A naive count per row is ~200 round trips on a full
+    // cohort. This is a single grouped aggregate over `integrity_events` restricted to
+    // the frame types, chunked only to stay under SQLite's bound-variable cap, and it
+    // rides `integrity_attempt_type_idx` (attempt_id, type).
+    const frameCounts = new Map<string, number>();
+    const failCounts = new Map<string, number>();
+    const attIds = atts.map((a) => a.id);
+    for (let i = 0; i < attIds.length; i += 200) {
+      const slice = attIds.slice(i, i + 200);
+      const agg = await db
+        .select({ attemptId: schema.integrityEvents.attemptId, type: schema.integrityEvents.type, n: dsql<number>`count(*)` })
+        .from(schema.integrityEvents)
+        .where(and(
+          inArray(schema.integrityEvents.attemptId, slice),
+          inArray(schema.integrityEvents.type, [...FRAME_EVENT_TYPES, "snapshot_failed"]),
+        ))
+        .groupBy(schema.integrityEvents.attemptId, schema.integrityEvents.type);
+      for (const row of agg) {
+        const target = row.type === "snapshot_failed" ? failCounts : frameCounts;
+        target.set(row.attemptId, (target.get(row.attemptId) ?? 0) + Number(row.n ?? 0));
+      }
+    }
     const attemptRows = atts
-      .map((a) => ({ attemptId: a.id, studentId: a.studentId, name: smap.get(a.studentId)?.name ?? "—", rollNo: smap.get(a.studentId)?.rollNo ?? "", email: smap.get(a.studentId)?.email ?? null, section: sectionOfAttempt(a), score: a.score, status: a.status, submittedAt: a.submittedAt, absent: false, disconnected: !!a.disconnected, answeredCount: a.answeredCount ?? 0 }))
+      .map((a) => ({ attemptId: a.id, studentId: a.studentId, name: smap.get(a.studentId)?.name ?? "—", rollNo: smap.get(a.studentId)?.rollNo ?? "", email: smap.get(a.studentId)?.email ?? null, section: sectionOfAttempt(a), score: a.score, status: a.status, submittedAt: a.submittedAt, absent: false, disconnected: !!a.disconnected, answeredCount: a.answeredCount ?? 0, frames: frameCounts.get(a.id) ?? 0, snapshotFailures: failCounts.get(a.id) ?? 0 }))
       .sort((x, y) => (y.score ?? -1) - (x.score ?? -1));
     // Assigned-but-absent students: enrolled in the exam's cohort yet no attempt row.
     // Only surface them once the exam window has closed (before that they may still
@@ -2996,11 +3045,17 @@ const app = new Hono<{ Variables: Vars }>()
             if (attemptedIds.has(stu.id)) return false;
             return isEligible(ex, stu, exRoster);
           })
-          .map((stu) => ({ attemptId: `absent-${stu.id}`, studentId: stu.id, name: stu.name ?? "—", rollNo: stu.rollNo ?? "", email: stu.email ?? null, section: sectionOf(stu.id), score: null, status: "absent", submittedAt: null, absent: true, disconnected: false, answeredCount: 0 }))
+          .map((stu) => ({ attemptId: `absent-${stu.id}`, studentId: stu.id, name: stu.name ?? "—", rollNo: stu.rollNo ?? "", email: stu.email ?? null, section: sectionOf(stu.id), score: null, status: "absent", submittedAt: null, absent: true, disconnected: false, answeredCount: 0, frames: 0, snapshotFailures: 0 }))
           .sort((x, y) => x.rollNo.localeCompare(y.rollNo));
     // Attempts (scored, sorted high→low) first, absentees last.
     const rows = [...attemptRows, ...absentRows];
-    return c.json({ exam: ex, results: rows, totalQuestions }, 200);
+    // Whether snapshots are expected AT ALL right now. Proctoring is one global config
+    // blob, so this is the only honest gate available: with webcam snapshots switched
+    // off every attempt legitimately has zero frames, and the roster must not then
+    // light up every student as a camera failure.
+    const gsReport = await getGlobalSettings();
+    const snapshotsExpected = { ...schema.DEFAULT_PROCTORING, ...(gsReport.proctoring ?? {}) }.webcamSnapshots !== false;
+    return c.json({ exam: ex, results: rows, totalQuestions, snapshotsExpected }, 200);
   })
   .get("/reports/:examId/attempt/:attemptId", requireAuth, requirePermission("reports"), async (c) => {
     const p = c.get("profile")!;
