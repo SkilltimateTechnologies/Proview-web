@@ -668,3 +668,292 @@ rows; scores within 0–92.** [measured]
 - **Turso plan usage and Railway metrics for the incident window remain unread.** Free, five
   minutes, and still the single item that could confirm or kill the throttling theory. It is not
   something I can reach from here.
+
+## 26. A regression I shipped, and the fix
+
+Commit `57a658f` broke `GET /api/admin/invariants` in production. Recording it here because a
+write-up that hides a self-inflicted 500 is worth less than one that admits it.
+
+**Cause.** The duplicate-row audit assumed every unique index it checks spans exactly two columns:
+
+    const [a, b] = spec.columns;   // ... GROUP BY a, b
+
+I generalised that to N columns in `src/api/database/invariants.ts` when I added the new
+single-column spec `grade_jobs_attempt_uq(attempt_id)` — and missed a **second, independent copy of
+the same two lines** in the route handler in `src/api/index.ts` (~L561). On the new spec `b` came
+back `undefined`, `dsql.raw(undefined)` threw, and the endpoint returned 500. [from code]
+
+**Blast radius.** Admin-only and read-only. Nothing on the exam, submit, autosave or grading path
+touches that endpoint, and `/api/health` runs its own code path and stayed `ok` throughout the
+deploy. [measured] No student was affected, and no data was written or lost.
+
+**Fix** (`7a45063`): the route now uses `GROUP BY spec.columns.join(", ")`, the same shape as
+`invariants.ts`. Proven at SQL level against the load database before pushing — the old shape
+**throws** on `grade_jobs_attempt_uq` and works on the three two-column specs; the new shape
+returns 0 duplicate groups for all four. [measured]
+
+**Verified on production after deploy** [measured]:
+
+    HTTP 200
+    present: answers_attempt_question_uq, attempts_exam_student_uq,
+             students_tenant_roll_uq, grade_jobs_attempt_uq
+    perf:    integrity_attempt_type_idx, integrity_attempt_at_idx,
+             grade_jobs_status_next_idx
+    tablesPresent: grade_jobs
+    duplicateGroups: 0 on all four unique indexes
+    ok: true
+
+That response is also the first outside-the-process confirmation that production really did create
+`grade_jobs` and both its indexes at boot, rather than falling back to the in-memory path.
+
+**The lesson, stated plainly:** when you generalise a shared assumption, grep for every copy of it
+before you commit. Two files held the same two lines; the tests covered the library and not the
+route, so `bun test` stayed green at 288 while production returned 500.
+
+
+# Addendum 6 — what the Turso dashboard actually says (2026-08-30)
+
+Two charts arrived: "Read/Write Operations by date" and "Rows Written, last 30 days". This is the
+data point that was missing from every section above, and it changes two conclusions.
+
+## 27. The throttling theory is dead
+
+**Plan limits, read off Turso's pricing page today** [measured]:
+
+| | Free | Developer $4.99 | Scaler $24.92 |
+|---|---|---|---|
+| Monthly rows read | 500 M | **2.5 B** + $1/B | 100 B |
+| Monthly rows written | 10 M | **25 M** + $1/M | 100 M |
+| Storage | 5 GB | 9 GB | 24 GB |
+
+**What the charts show** [measured, read off the graphs, so ±10%]:
+
+| | rows read | rows written |
+|---|---|---|
+| A day with no exam | ~5–6 M | ~0 |
+| Aug 14 (peak) | ~56 M | ~800,000 |
+| Aug 27 | ~43 M | ~355,000 |
+
+Month to date: roughly **250 M rows read** and **1.2 M rows written** [arithmetic]. That is **10 % of
+the read allowance and 5 % of the write allowance** on Developer. Even on the Free tier it would be
+half the reads and a tenth of the writes.
+
+Turso's documented behaviour when a monthly quota *is* exhausted is that **queries fail**, and on a
+paid plan they are billed as overage rather than blocked. Neither happened: the write curve on
+Aug 27 has no plateau and no cliff, it rises and falls in a clean bell.
+
+**So Turso did not throttle the exam, and was not close to doing so.** The explanation for "not able
+to submit" and "blank pages" remains the one in §9 and §10 — a client that retried zero times, an
+admin console shipped inside every student's download, and 21 database round trips per submit. Those
+are fixed. Nothing in this data suggests the plan needs changing.
+
+## 28. Both spikes are exam days, and the incident was bigger than 300 students
+
+Exam windows pulled from production `/api/reports` [measured], all times UTC:
+
+| window | attempts | assigned | exam |
+|---|---|---|---|
+| Aug 14 14:30–15:30 | 186 | 598 | Weekly Assessment – 1 |
+| Aug 14 14:30–15:30 | **268** | 525 | Elite Assessment – 1 |
+| Aug 27 14:30–16:00 | 195 | 1,122 | Weekly Assessment – 2 |
+
+The two read spikes land on exactly these two dates and nothing else in the month moved. But note
+the first row: **two exams ran in the same hour on Aug 14**, so the process was serving **454
+concurrent students**, not 268.
+
+> **This probably corrects the capacity number in §6.** The working assumption all along was "it
+> broke just below 300". If the incident was Aug 14 — the taller spike, and the only day with
+> overlapping exams — then Proview was actually carrying **~454 concurrent students** when it
+> started failing, and a single 300-student exam was never the breaking point. [unverified — needs
+> the user to confirm which exam the students complained about.]
+
+Separately, and worth a straight answer before the next exam: Weekly Assessment – 2 shows
+**1,122 assigned, 195 attempts, 927 absent**, and Weekly Assessment – 1 shows 598 assigned against
+186 attempts. If those rosters were "assign to everyone, only one section was expected to write",
+the numbers are meaningless and fine. If those students *were* expected to write, then the failure
+was an order of magnitude larger than reported and the reports have been quietly recording it as
+absence. [unverified]
+
+## 29. The real finding: two-thirds of the bill is spent while nothing is happening
+
+The idle baseline is **~5–6 M rows read every single day**, including days with zero writes, zero
+exams and (on weekends) essentially zero users. Over a month that is **~165 M of the ~250 M total —
+about two-thirds of everything consumed** [arithmetic].
+
+That flat, identical-every-day shape is the signature of a fixed-interval timer, not of people. And
+the code says exactly which one [from code]:
+
+- `attempts` carries indexes on `exam_id`, `student_id` and `(exam_id, student_id)` — and **no index
+  on `status`**.
+- `sweepAutoSubmit()` runs **every 60 s** and issues
+  `SELECT * FROM attempts WHERE status = 'in_progress'`. With no index that is a **full scan of all
+  2,520 attempt rows**, 1,440 times a day.
+- Until this morning `sweepPendingGrading()` ran on the same 60 s tick with
+  `WHERE status = 'submitted'` — a **second** full scan.
+
+Two scans × 2,520 rows × 1,440 ticks = **7.3 M rows read per day from timers alone** [arithmetic],
+against a measured baseline of 5–6 M. Same magnitude, same shape. The timers are the baseline.
+
+**One of the two is already gone.** `57a658f` moved the grading sweep onto a 10-minute timer
+(1,440 → 144 scans/day), which should remove ~3.5 M rows read/day, i.e. **~105 M rows/month**. The
+baseline on the dashboard should visibly step down from ~5.5 M to roughly ~2 M/day starting today.
+**That is a falsifiable prediction — check the chart tomorrow.** [unverified until then]
+
+**The other one is a bomb, because its cost grows with history rather than with load.**
+`sweepAutoSubmit` scans every attempt ever taken, once a minute, forever:
+
+| attempts in history | rows read/day by that one timer | per month | vs 2.5 B Developer quota |
+|---|---|---|---|
+| 2,520 (today) | 3.6 M | 109 M | 4 % |
+| **57,870** | 1.7 B | **2.5 B** | **100 %** |
+| 1,000,000 (20 colleges, ~1 yr) | 1.44 B | 43 B | 1,700 % |
+
+**At roughly 58,000 stored attempts, that single background query consumes the entire monthly plan
+on its own** [arithmetic] — for a query that returns zero rows more than 99 % of the time. At twenty
+colleges running weekly assessments, 58,000 attempts is about eight months away.
+
+**The fix is small:**
+
+1. `index("attempts_status_idx").on(t.status)` in `schema.ts`, plus an entry in
+   `REQUIRED_PERF_INDEXES` so production creates it at boot — the same mechanism that just created
+   `grade_jobs`. An indexed seek on `'in_progress'` reads ~0 rows instead of 2,520, and stays flat
+   as history grows.
+2. Guard the sweep: it can only matter when some exam is past its deadline. `exams` is 11 rows and
+   indexed by tenant; read that first and skip the attempts query entirely when nothing is in
+   window.
+3. The same index also serves `sweepPendingGrading` (`grade-queue.ts:784`) and `backfillGradeJobs`
+   (`grade-jobs.ts:251`), both of which filter `attempts.status`.
+
+## 30. The number that decides per-college pricing
+
+Subtracting baseline from each spike [arithmetic]:
+
+| | reads above baseline | attempts | rows read per student |
+|---|---|---|---|
+| Aug 14 | ~50 M | 454 | **~110,000** |
+| Aug 27 | ~37.5 M | 195 | **~190,000** |
+
+Aug 27 had **fewer than half** the students of Aug 14 and cost nearly as much. The two things that
+were larger on Aug 27 were the **duration** (90 min vs 60) and the **assigned roster** (1,122 vs
+598/525) — not the number of people actually writing. That is the fingerprint of polling work that
+scales with the roster and the clock instead of with real activity: Live Monitor rebuilds and
+student polls re-reading whole collections.
+
+Both changes aimed at that (`e423f25` tenant-directory cache, `b3a1e40` submit 21 → 7 round trips)
+shipped on **Aug 29 — after both exams**. So the next exam is the first one that will show their
+effect, and the per-student read cost is the metric to compare.
+
+Why it matters for pricing: at 190,000 rows read per student, a 300-student exam costs ~57 M rows
+read, so Developer's 2.5 B supports **~44 exams a month**. Twenty colleges running one weekly
+assessment each is ~80 exam-days a month — **over the plan**, on reads, before any growth in exam
+length or roster size. Getting this number down is the same work as making the platform cheaper per
+college, and it is worth doing before the twentieth college, not after.
+
+## 31. Turso 0.7.0 — interesting, not actionable for Proview
+
+The 0.7.0 release is the **standalone Turso Database** (the Rust rewrite of SQLite), not the hosted
+Turso Cloud API that Proview talks to over HTTP through `@libsql/client`. Highlights: MVCC
+concurrent writes substantially faster, no blocking I/O in the core, cooperative CPU yielding so one
+busy statement cannot starve other connections, fallible allocation instead of aborting on OOM,
+experimental passive checkpoints, window functions, PostgreSQL-style sequences, and a
+SQLite-compatible .NET provider. They have **dropped the beta warning** but are explicit that this
+is **not 1.0** and that independent backups are still recommended.
+
+**Why it changes nothing for Proview today:** every number above says the constraint is **reads**,
+not write concurrency. Writes are 5 % of quota, and the 300-student load run measured submit at
+p95 4 ms. `BEGIN CONCURRENT` and MVCC solve single-writer contention, which is a real ceiling for
+Proview eventually (§ backlog) but is demonstrably not what hurt on Aug 14 or Aug 27. Migrating the
+engine now would be replacing a component that is not the bottleneck, on a database holding exam
+records, against software its own authors decline to call 1.0.
+
+**Revisit when** Turso Cloud exposes concurrent writes on the managed path — the release notes say
+the engine is being integrated into Cloud and that concurrent writes can now sync to Cloud. At that
+point it arrives as a Cloud feature rather than a migration, which is the version worth taking.
+
+**One thing worth acting on from that page:** they recommend keeping independent backups. Developer
+includes 10-day point-in-time restore, which covers accidental damage but not account-level loss.
+For a system of record for exam results, an independent periodic export is cheap insurance — and
+right now there isn't one. [from code]
+
+## 32. P0 shipped: `attempts_status_idx`
+
+Commit `081f855`, deployed and verified on production 2026-08-30 05:49 UTC.
+
+**What changed.** One line in `schema.ts` and one spec in `REQUIRED_PERF_INDEXES`:
+
+    index("attempts_status_idx").on(t.status)
+
+Both are needed, and for different reasons. `schema.ts` is the declaration any future
+`db:push` or fresh environment reads. `REQUIRED_PERF_INDEXES` is what actually creates it in
+production, because there is no migrate step in the deploy path (`start` is just
+`bun src/server.ts`) and `drizzle/` is a stale snapshot whose regeneration emits table DROPs.
+Same mechanism that created `grade_jobs` at boot in `57a658f`.
+
+**Why this was P0 and not housekeeping.** Restating §29's number because it is the whole
+argument: `sweepAutoSubmit` scans every attempt ever taken, once a minute, forever. The cost
+grows with **history**, not with load, so it gets worse on quiet months too.
+
+| attempts stored | rows read/month by that one timer | vs 2.5 B Developer quota |
+|---|---|---|
+| 2,520 (today) | 109 M | 4 % |
+| **57,870** | **2.5 B** | **100 %** |
+| 1,000,000 | 43 B | 1,700 % |
+
+[arithmetic] At ~58,000 stored attempts a single background query consumes the entire monthly
+allowance, for a query that returns zero rows more than 99 % of the time. Twenty colleges on
+weekly assessments reach that in roughly eight months. An index seek stays flat as history grows;
+a scan does not.
+
+**What was verified, and how.**
+
+Local, `EXPLAIN QUERY PLAN` against a seeded database [measured]:
+
+    BEFORE  status='in_progress'  -> SCAN attempts
+    BEFORE  status='submitted'    -> SCAN attempts
+    AFTER   status='in_progress'  -> SEARCH attempts USING INDEX attempts_status_idx (status=?)
+    AFTER   status='submitted'    -> SEARCH attempts USING INDEX attempts_status_idx (status=?)
+    NOT INDEXED vs indexed: identical row sets
+
+New `src/api/database/perf-indexes.test.ts`, 9 tests, pins both halves — that the spec stays in
+`REQUIRED_PERF_INDEXES` on `attempts(status)`, and that the planner actually *uses* it for both
+sweep filters. A declared index the planner refuses is worth nothing, so the plan assertion is
+the one that matters. `bun test` 288 → **297 pass**, typecheck and `bun run build` green.
+[measured]
+
+Production, `GET /api/admin/invariants` after the deploy [measured]:
+
+    attempts_status_idx  table: attempts  columns: [status]  present: true
+    ok: true
+
+`invariants.checkedAt` advanced `04:46:19Z` → `05:49:42Z`, which is what confirms the running
+process re-ran the check rather than the response being cached.
+
+**Nothing else changed.** No query text, no response shape, no behaviour. `CREATE INDEX IF NOT
+EXISTS` on a non-unique index cannot fail on existing data the way a unique one can, so there
+was no duplicate pre-check to pass and no failure mode at boot beyond "index absent, still
+works, just slow".
+
+**What was deliberately left out.** §29's own point 2 proposed guarding the sweep — read `exams`
+first and skip the attempts query when nothing is in window. Dropped, and the reasoning is worth
+keeping: with the index the query is an index seek returning ~0 rows, so the guard saves
+nothing measurable, and `effectiveEndMs` (`src/api/lib/util.ts:52`) folds in per-attempt
+`pausedMs`, which is unbounded. No exam-level time bound is provably safe — a paused attempt can
+outlive any window derived from the exam row. That is correctness risk traded for zero gain, on
+the auto-submit path, where the failure mode is a student's paper never being submitted.
+
+**The prediction to check on the dashboard.** Two changes now act on the idle baseline: the
+grading sweep moving to a 10-minute tick (`57a658f`, yesterday) and this index (today). The
+~5–6 M rows read/day baseline should fall to a small fraction of that — the timers were the
+baseline, and neither now scans. The read chart from Aug 31 onward either shows that or this
+analysis is wrong. [unverified until the chart is read]
+
+**Still open, both waiting on a decision rather than on work:**
+
+- **P1** — heartbeat coalescing, the `/api/reports` N+1, and `integrity_events` retention. The
+  retention part *deletes proctoring evidence*, so the window is a policy call: how long must a
+  malpractice finding stay disputable? 27,153 rows came from one exam and nothing deletes them.
+- **P2** — per-tenant quotas. `settings` is a single row `id = "global"` holding `judge0Limit`,
+  `judge0Used`, `aiLimit`, `aiUsed`; `tenants` has no limit columns at all, so one college's
+  coding exam can exhaust the allowance for every other college [from code]. This one changes
+  behaviour by design — a tenant over its cap gets blocked. The only safe shape is every tenant
+  defaulting to inherit-global/unlimited, so nothing changes until a number is deliberately set.
