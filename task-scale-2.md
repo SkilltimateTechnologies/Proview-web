@@ -1510,3 +1510,139 @@ Next: the **redundant attempt re-reads on `/events` and `/snapshot-url`** (~L201
 which re-`select()` the entire attempt row purely to authorize the caller — on the student write path,
 which is the scarce one. Then P2: per-tenant quotas, every tenant defaulting to inherit-global so
 nothing changes until a number is deliberately set.
+
+---
+
+## 38. Two proctoring routes re-read the whole attempt row to answer a boolean (`ea98c5e`)
+
+### The shape of it [from code]
+
+`POST /student/attempts/:attemptId/events` and `POST /student/attempts/:attemptId/snapshot-url`
+(`src/api/index.ts`, ~L1991 and ~L2008) both opened with the same six lines:
+
+```ts
+const [attempt] = await db.select().from(schema.attempts)
+  .where(and(eq(schema.attempts.id, aid), eq(schema.attempts.studentId, sid))).limit(1);
+if (!attempt) return c.json({ message: "Not found" }, 404);
+```
+
+…and then never touched `attempt` again. I checked both bodies line by line: `/events` passes only
+`aid` to `persistIntegrityEvents`, which runs its own queries; `/snapshot-url` only builds
+`INTEGRITY_PREFIX(aid)` for the object key. Neither reads a single column off the row.
+
+Two things make that more than a style complaint:
+
+1. **There is no projection.** A bare `select()` returns every column, which on `attempts` includes
+   `section_snapshot` and `option_order` — `text` columns holding the student's entire paper layout,
+   the questions and the shuffled option order. The largest payload in the schema, fetched to decide
+   one boolean.
+2. **It is on the student write path**, the one path that must stay responsive while an exam is
+   running and the one whose budget is genuinely scarce (25M writes/month against 2.5B reads). Every
+   captured webcam frame costs **both** routes: one call to get the presigned URL, one to attach the
+   event.
+
+[arithmetic] A frame lands roughly every 27s per student, so at 1000 students that is
+~**74 authorization-only SELECTs per second**. Across a 90-minute exam, ~**400,000** SELECTs whose
+entire job is to re-derive a fact that never changes. After the fix, one lookup per attempt per
+5-minute window ≈ **18,000** for the same exam — about **22× fewer**.
+
+### The fix: cache the owner, because the mapping is immutable
+
+`src/api/lib/attempt-owner.ts` holds `attemptId → studentId` in memory with a 5-minute TTL, and both
+routes collapse to one line:
+
+```ts
+if (!(await attemptOwners.authorize(db, aid, sid))) return c.json({ message: "Not found" }, 404);
+```
+
+The justification is narrow and worth stating precisely, because caching an **authorization** decision
+is normally a bad idea. I grepped every write path: `attempts.studentId` is written once at creation
+and **never updated** — no route, no sweep, no admin path reassigns an existing attempt to a different
+student. So this particular mapping cannot go stale the way permissions usually do. That is the whole
+basis for the cache, and it is why attempt *status*, which changes constantly, is deliberately **not**
+cached here even though it sits in the same row.
+
+### Three decisions that make it safe rather than merely fast
+
+**1. The cache stores the OWNER, not a yes/no per caller.** A request from the wrong student is
+answered `false` out of the same cached entry instead of falling through to the database. If it cached
+per-(attempt, student) outcomes, a client sending a wrong id — a bug, or a probe — would miss the cache
+on every request and get a free round trip out of the server for each one. Tested: 50 wrong-student
+calls cost **0** queries.
+
+**2. Misses are NOT cached.** A request for an attempt that does not exist pays its SELECT and 404s
+every time, exactly as before. Caching negatives would mean an attempt created a second after a failed
+poll stays locked out for the rest of the TTL — a real student blocked from an exam. A repeated query
+on a path only a broken or deleted client takes is the cheaper mistake by a wide margin. There is a
+test that polls an unknown attempt, creates it, and asserts the very next call is admitted.
+
+**3. Deletes are the one direction the cache cannot see** — the same asymmetry as §37, for the same
+reason. A stale entry would keep authorizing a deleted attempt's former owner, and `/events` would
+then insert `integrity_events` rows pointing at an attempt that no longer exists. Those rows are
+invisible to every read path (both the monitor and the reports join `attempts`), but they are junk in
+a table that is kept forever by decision. Bounded twice over:
+
+- all **six** admin paths that delete attempts now call `attemptOwners.invalidateAll()`, immediately
+  after the `integrityRollup.invalidateAll()` §37 added — so in practice the window is zero;
+- the TTL expires entries anyway, so even a seventh delete path added later and wired up by nobody
+  self-heals within five minutes.
+
+`MAX_ENTRIES = 20_000` plus expiry pruning keeps a long-running process bounded.
+
+### Verification
+
+The failure mode here is the ugliest kind: a cache that authorizes the wrong student would be
+invisible in every log and every chart. So the 12 tests in `attempt-owner.test.ts` assert the security
+property first and the performance property second, using a `counted(db)` Proxy that increments on
+every `select` so query counts are facts rather than inferences.
+
+Security: the owner is allowed; **every other student is refused**; an empty `studentId` is refused; an
+empty `attemptId` never reaches the database; a wrong-student refusal costs no query; an unknown
+attempt is refused, is not remembered, and is admitted the instant it is created.
+
+Cost: 400 polls of one attempt = **1** SELECT. 200 attempts polled 5 rounds each = **200** SELECTs,
+not 1,000. A re-read happens at exactly `OWNER_TTL_MS`.
+
+Correctness under deletes: one test deletes an attempt and **documents the drift as unhealed**, then
+proves `invalidateAll()` heals it; a second proves the TTL alone heals it with no invalidation call at
+all. Plus per-attempt `invalidate()`, expiry pruning, and a finite `MAX_ENTRIES`.
+
+**Shipped [measured]:** 12/12 new tests pass · `bun test` **361 pass, 0 fail across 20 files**
+(349 + 12) · `bun run typecheck:api` clean · `bun run build` green · pushed `5011f3a..ea98c5e` ·
+production `invariants.checkedAt` advanced `2026-08-30T16:54:26.065Z` →
+**`2026-08-30T17:28:28.424Z`**, `ok: true`, stable across three polls.
+
+Code counts, to make the wiring checkable rather than trusted:
+
+```
+rg -c "attemptOwners.authorize"       src/api/index.ts   → 2   (both routes)
+rg -c "attemptOwners.invalidateAll"   src/api/index.ts   → 6   (all delete paths)
+rg -c "integrityRollup.invalidateAll" src/api/index.ts   → 6   (same six, §37)
+```
+
+### The falsifiable prediction [unverified]
+
+**No live exam has exercised this either** — all 11 production exams are `finished`, so neither route
+ran once during deploy verification. The 400,000-SELECT figure above is arithmetic from the capture
+interval, not a measurement.
+
+The prediction: on the next live exam, statements on the student proctoring path drop by roughly the
+frame rate — per captured snapshot, the steady-state statement count falls from about **4 to about 2**.
+The Turso read curve during the exam window should fall materially even though nothing else about the
+student path changed.
+
+I am flagging that shape of prediction specifically because I got it wrong once already: in §36 I
+predicted ~4 statements per `/api/reports` call and production measured ~6.4. If the next exam's read
+curve does not drop, the attribution here is wrong too, and I will say so in place rather than quietly
+moving on.
+
+### Still open
+
+**P1 is now clear.** Next is **P2: per-tenant quotas** — a per-tenant ceiling on concurrent attempts
+and stored evidence, with **every tenant defaulting to inherit-global/unlimited**, so nothing about
+today's behaviour changes until a number is deliberately set for a specific tenant.
+
+Still unanswered, raised three times now: **Proview has no independent backup.** The Turso Developer
+plan gives 10-day point-in-time recovery, which covers a bad deploy and does not cover a deleted
+database or an accidental roster reconcile. It is the one remaining item on this list that is not a
+performance problem.
