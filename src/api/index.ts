@@ -558,12 +558,17 @@ const app = new Hono<{ Variables: Vars }>()
   .get("/admin/invariants", requireAuth, requireSuperAdmin, async (c) => {
     const indexes = await Promise.all(
       REQUIRED_UNIQUE_INDEXES.map(async (spec) => {
-        const [a, b] = spec.columns;
+        // GROUP BY every column in the spec, not the first two. This used to be
+        // `const [a, b] = spec.columns`, which assumed every unique index was a
+        // two-column one; a single-column spec (grade_jobs_attempt_uq) made `b`
+        // undefined, and `dsql.raw(undefined)` throws — 500ing this whole audit
+        // endpoint. Same fix as countDuplicateGroups in invariants.ts.
+        const groupBy = spec.columns.join(", ");
         const present = (await db.all<{ name: string }>(
           dsql`SELECT name FROM sqlite_master WHERE type='index' AND name=${spec.name}`,
         )).length > 0;
         const dupes = Number((await db.all<{ c: number }>(
-          dsql`SELECT COUNT(*) AS c FROM (SELECT 1 FROM ${dsql.raw(spec.table)} GROUP BY ${dsql.raw(a)}, ${dsql.raw(b)} HAVING COUNT(*) > 1)`,
+          dsql`SELECT COUNT(*) AS c FROM (SELECT 1 FROM ${dsql.raw(spec.table)} GROUP BY ${dsql.raw(groupBy)} HAVING COUNT(*) > 1)`,
         ))[0]?.c ?? 0);
         return { index: spec.name, table: spec.table, columns: spec.columns, present, duplicateGroups: dupes, guards: spec.guards };
       }),
