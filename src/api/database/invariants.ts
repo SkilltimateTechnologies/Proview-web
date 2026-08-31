@@ -236,6 +236,42 @@ export const REQUIRED_COLUMNS: ColumnSpec[] = [
       "query fails, since Drizzle names it in the SELECT list",
   },
   {
+    table: "tenants",
+    column: "max_concurrent_attempts",
+    type: "integer",
+    guards:
+      "the per-tenant ceiling on simultaneously in-progress attempts (NULL = inherit " +
+      "the platform-global default, which is itself NULL = unlimited). Without the " +
+      "column every tenants query fails, since Drizzle names it in the SELECT list",
+  },
+  {
+    table: "tenants",
+    column: "max_evidence_per_attempt",
+    type: "integer",
+    guards:
+      "the per-tenant ceiling on stored non-violation proctoring rows per attempt " +
+      "(NULL = inherit global = unlimited). Without the column every tenants query " +
+      "fails, since Drizzle names it in the SELECT list",
+  },
+  {
+    table: "settings",
+    column: "max_concurrent_attempts",
+    type: "integer",
+    guards:
+      "the platform-global default concurrent-attempt ceiling every tenant inherits " +
+      "(NULL = unlimited, the shipped default). Without the column the global " +
+      "settings read fails, which every exam page depends on",
+  },
+  {
+    table: "settings",
+    column: "max_evidence_per_attempt",
+    type: "integer",
+    guards:
+      "the platform-global default stored-evidence ceiling per attempt (NULL = " +
+      "unlimited, the shipped default). Without the column the global settings read " +
+      "fails, which every exam page depends on",
+  },
+  {
     table: "exams",
     column: "grading_mode",
     type: "text",

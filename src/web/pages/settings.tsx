@@ -32,6 +32,10 @@ type S = {
   aiLimit: number;
   aiUsed: number;
   proctoring: ProctorConfig;
+  // Platform-wide default capacity ceilings; a college can override either one.
+  // null = unlimited, which is the shipped default. See api/lib/tenant-quota.ts.
+  maxConcurrentAttempts: number | null;
+  maxEvidencePerAttempt: number | null;
 };
 
 function Toggle({ label, sub, checked, onChange }: { label: string; sub?: string; checked: boolean; onChange: (v: boolean) => void }) {
@@ -182,6 +186,40 @@ export default function Settings() {
             {save.isPending ? "Saving…" : "Save proctoring rules"}
           </button>
         </div>
+      </div>
+
+      <div className="card p-5 mb-5">
+        <div className="font-semibold mb-1">Capacity limits</div>
+        <p className="text-xs text-[var(--color-ink2)] mb-3">
+          Default ceilings applied to every college that has not set its own. Blank means unlimited, which is how
+          Proview ships. These bound load only: a limit never interrupts a student who is already writing, and it
+          never discards a proctoring violation.
+        </p>
+        <div className="grid sm:grid-cols-2 gap-4">
+          <Field label="Max students writing at once (per college)">
+            <input
+              className="input"
+              type="number"
+              min={0}
+              value={form.maxConcurrentAttempts ?? ""}
+              onChange={(e) => setForm((f) => ({ ...f, maxConcurrentAttempts: e.target.value === "" ? null : Number(e.target.value) }))}
+              placeholder="Unlimited"
+            />
+          </Field>
+          <Field label="Max camera frames kept per attempt">
+            <input
+              className="input"
+              type="number"
+              min={0}
+              value={form.maxEvidencePerAttempt ?? ""}
+              onChange={(e) => setForm((f) => ({ ...f, maxEvidencePerAttempt: e.target.value === "" ? null : Number(e.target.value) }))}
+              placeholder="Unlimited"
+            />
+          </Field>
+        </div>
+        <button className="btn btn-primary mt-4" disabled={save.isPending} onClick={() => save.mutate()}>
+          {save.isPending ? "Saving…" : "Save capacity limits"}
+        </button>
       </div>
 
       <div className="card p-5 space-y-4">

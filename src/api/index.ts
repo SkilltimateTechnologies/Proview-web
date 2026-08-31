@@ -22,6 +22,7 @@ import { TtlCache } from "./lib/ttl-cache";
 import { heartbeats } from "./lib/heartbeat-queue";
 import { integrityRollup } from "./lib/integrity-rollup";
 import { attemptOwners } from "./lib/attempt-owner";
+import { attemptTenants, concurrencyGate, evidenceMeter, resolveLimit, tenantQuotas } from "./lib/tenant-quota";
 import { EMPTY_ROLLUP, loadAttemptRollups, rollupAvg } from "./lib/report-rollup";
 import { TenantDirectory } from "./lib/tenant-directory";
 import { examEffStatus, isConcluded, isReportable, toMs, type StatusExam } from "./lib/exam-status";
@@ -203,7 +204,10 @@ const isFrameEvent = (t: string) => (FRAME_EVENT_TYPES as readonly string[]).inc
 // this table). It must NEVER score: it is a device fault the student may not even be
 // able to see, and counting it would mark a broken laptop as cheating — roughly 18 rows
 // per 90-minute exam at its 5-minute throttle, which would swamp every real violation.
-const NON_VIOLATION_TYPES = new Set<string>([...FRAME_EVENT_TYPES, "camera_restored", "camera_block_dismissed", "focus_loss", "snapshot_failed"]);
+// "evidence_capped" is the single marker written when a tenant's stored-evidence
+// ceiling stops further frames (lib/tenant-quota.ts). It is a platform decision,
+// not student behaviour, so like snapshot_failed it must never score.
+const NON_VIOLATION_TYPES = new Set<string>([...FRAME_EVENT_TYPES, "camera_restored", "camera_block_dismissed", "focus_loss", "snapshot_failed", "evidence_capped"]);
 
 type RawIntegrityEvent = { type?: unknown; detail?: unknown; at?: unknown; photoKey?: unknown; photoUrl?: unknown };
 
@@ -246,11 +250,56 @@ async function persistIntegrityEvents(attemptId: string, raw: unknown): Promise<
     rows.push({ id: id("iev"), attemptId, type, detail: detailRaw || null, photoUrl, at: new Date(at) });
   }
   if (rows.length === 0) return 0;
-  // Chunked insert — SQLite/libSQL caps bound variables per statement.
-  for (let i = 0; i < rows.length; i += 50) {
-    await db.insert(schema.integrityEvents).values(rows.slice(i, i + 50));
+
+  // ---- Per-tenant stored-evidence ceiling (lib/tenant-quota.ts) ----
+  // Bounds the one table that is kept forever by decision. VIOLATIONS ARE NEVER
+  // TRIMMED — only periodic frames and device-fault rows are, and a single
+  // `evidence_capped` marker records why they stop, so the silence §34 was
+  // written to eliminate does not come back through the quota door.
+  //
+  // The whole block is skipped, at zero query cost, unless a ceiling is actually
+  // configured: the settings row is already cached in-process, and the
+  // "any tenant override at all?" question is one cached count a minute.
+  let toInsert = rows;
+  const gsQuota = await getGlobalSettings();
+  const capPossible =
+    resolveLimit(gsQuota.maxEvidencePerAttempt, null) !== null || (await tenantQuotas.overridesExist(db));
+  if (capPossible) {
+    const capTenant = await attemptTenants.load(db, attemptId);
+    const cap = capTenant ? (await tenantQuotas.load(db, capTenant, gsQuota)).maxEvidencePerAttempt : null;
+    if (cap !== null) {
+      const room = await evidenceMeter.room(db, attemptId, cap, NON_VIOLATION_TYPES);
+      const kept: typeof rows = [];
+      let evidenceKept = 0;
+      let dropped = 0;
+      for (const r of rows) {
+        if (!NON_VIOLATION_TYPES.has(r.type)) {
+          kept.push(r); // misconduct: stored regardless of any ceiling
+          continue;
+        }
+        if (evidenceKept < room) {
+          kept.push(r);
+          evidenceKept += 1;
+          continue;
+        }
+        dropped += 1;
+      }
+      // One marker per attempt per process. It is itself an evidence type, so a
+      // later reseed counts it and the ceiling engages one row earlier — a
+      // one-row drift, deliberately not worth a second counter.
+      if (dropped > 0 && evidenceMeter.noticeOnce(attemptId)) {
+        kept.push({ id: id("iev"), attemptId, type: "evidence_capped", detail: `stored-evidence ceiling ${cap} reached`, photoUrl: null, at: new Date() });
+      }
+      evidenceMeter.add(attemptId, evidenceKept);
+      toInsert = kept;
+    }
   }
-  return rows.length;
+  if (toInsert.length === 0) return 0;
+  // Chunked insert — SQLite/libSQL caps bound variables per statement.
+  for (let i = 0; i < toInsert.length; i += 50) {
+    await db.insert(schema.integrityEvents).values(toInsert.slice(i, i + 50));
+  }
+  return toInsert.length;
 }
 
 /**
@@ -929,7 +978,21 @@ const app = new Hono<{ Variables: Vars }>()
   .patch("/tenants/:id", requireAuth, requireSuperAdmin, async (c) => {
     const tid = c.req.param("id");
     const b = await c.req.json();
+    // Quota overrides are normalised instead of passed through raw: a cleared
+    // field or a 0 means "inherit the global default", never "ceiling of zero",
+    // which would refuse every student in this college. To stop a tenant
+    // deliberately there is already `enabled = false`.
+    for (const k of ["maxConcurrentAttempts", "maxEvidencePerAttempt"] as const) {
+      if (b[k] === undefined) continue;
+      const n = Math.floor(Number(b[k]));
+      b[k] = b[k] === null || b[k] === "" || !Number.isFinite(n) || n <= 0 ? null : n;
+    }
     const [t] = await db.update(schema.tenants).set(b).where(eq(schema.tenants.id, tid)).returning();
+    // Apply the new ceiling immediately rather than at the next cache expiry, and
+    // latch "an override exists" so it is honoured even with no global default.
+    tenantQuotas.invalidate(tid);
+    concurrencyGate.invalidate(tid);
+    if (t?.maxConcurrentAttempts != null || t?.maxEvidencePerAttempt != null) tenantQuotas.markTenantOverridesExist();
     return c.json({ tenant: t }, 200);
   })
 
@@ -1460,6 +1523,9 @@ const app = new Hono<{ Variables: Vars }>()
     // The attempts themselves are gone, so the owner cache must not keep
     // authorizing their former owners; see lib/attempt-owner.ts.
     attemptOwners.invalidateAll();
+    // Evidence rows are going with them, so the stored-evidence counters must
+    // be dropped too or a re-sit starts life already at its ceiling.
+    evidenceMeter.invalidateAll();
     await db.delete(schema.attempts).where(eq(schema.attempts.studentId, sid));
     await db.delete(schema.examRoster).where(eq(schema.examRoster.studentId, sid));
     await db.delete(schema.students).where(eq(schema.students.id, sid));
@@ -1696,6 +1762,35 @@ const app = new Hono<{ Variables: Vars }>()
       return c.json({ message: "Already submitted" }, 409);
     }
     const now = Date.now();
+
+    // ---- Per-tenant concurrency ceiling (lib/tenant-quota.ts) ----
+    // Checked ONLY where a new live sitter is admitted: an attempt about to be
+    // created, or a not_started roster row about to go in_progress. An attempt
+    // that is already in_progress falls straight through, so a reload, a resume
+    // or a flaky network retry can never be refused by a quota — ejecting a
+    // student from a paper they are halfway through would be worse than the
+    // overload the ceiling exists to prevent.
+    // Costs nothing until somebody sets a number: the resolved limit is null by
+    // default and the count is never taken.
+    const admitsNewSitter = !attempt || attempt.status === "not_started";
+    if (admitsNewSitter) {
+      const quota = await tenantQuotas.load(db, exam.tenantId, await getGlobalSettings());
+      if (quota.maxConcurrentAttempts !== null) {
+        const gate = await concurrencyGate.check(db, exam.tenantId, quota.maxConcurrentAttempts);
+        if (!gate.allowed) {
+          return c.json(
+            {
+              message: "Your college has reached its limit of simultaneous exam attempts. Please wait a moment and press Start again.",
+              code: "tenant_concurrency_quota",
+              live: gate.live,
+              limit: gate.limit,
+            },
+            429,
+          );
+        }
+      }
+    }
+
     if (!attempt) {
       const startedAt = new Date(now);
       // Freeze the student's section onto the attempt. Reports read this snapshot, so
@@ -1729,6 +1824,9 @@ const app = new Hono<{ Variables: Vars }>()
     } else if (attempt.status === "not_started") {
       [attempt] = await db.update(schema.attempts).set({ status: "in_progress", startedAt: new Date(now), optionOrder: startScheme }).where(eq(schema.attempts.id, attempt.id)).returning();
     }
+    // Count this sitter against the cached live total, so a start burst inside one
+    // cache window is gated on admissions rather than on a stale count.
+    if (admitsNewSitter) concurrencyGate.note(exam.tenantId);
     // Mark the student as seen (drives Live Monitor online/offline). Also record the
     // display scheme if it is not on the attempt yet — an attempt created by an older
     // build, or by a /start that raced this one, still needs the stamp so its review
@@ -2503,6 +2601,9 @@ const app = new Hono<{ Variables: Vars }>()
           // The attempts themselves are gone, so the owner cache must not keep
           // authorizing their former owners; see lib/attempt-owner.ts.
           attemptOwners.invalidateAll();
+          // Evidence rows are going with them, so the stored-evidence counters must
+          // be dropped too or a re-sit starts life already at its ceiling.
+          evidenceMeter.invalidateAll();
           if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, r.studentId)));
           await db.delete(schema.examRoster).where(eq(schema.examRoster.id, r.id));
         }
@@ -2667,6 +2768,9 @@ const app = new Hono<{ Variables: Vars }>()
     // The attempts themselves are gone, so the owner cache must not keep
     // authorizing their former owners; see lib/attempt-owner.ts.
     attemptOwners.invalidateAll();
+    // Evidence rows are going with them, so the stored-evidence counters must
+    // be dropped too or a re-sit starts life already at its ceiling.
+    evidenceMeter.invalidateAll();
     if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
     await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
     // Only need a "remove" override if the student would otherwise be a cohort match.
@@ -3217,6 +3321,9 @@ const app = new Hono<{ Variables: Vars }>()
     // The attempts themselves are gone, so the owner cache must not keep
     // authorizing their former owners; see lib/attempt-owner.ts.
     attemptOwners.invalidateAll();
+    // Evidence rows are going with them, so the stored-evidence counters must
+    // be dropped too or a re-sit starts life already at its ceiling.
+    evidenceMeter.invalidateAll();
     if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
     // Record the remove override (clear any prior override first).
     await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
@@ -3247,6 +3354,9 @@ const app = new Hono<{ Variables: Vars }>()
       // The attempts themselves are gone, so the owner cache must not keep
       // authorizing their former owners; see lib/attempt-owner.ts.
       attemptOwners.invalidateAll();
+      // Evidence rows are going with them, so the stored-evidence counters must
+      // be dropped too or a re-sit starts life already at its ceiling.
+      evidenceMeter.invalidateAll();
       if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
       await db.delete(schema.examRoster).where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.studentId, studentId)));
       await db.insert(schema.examRoster).values({ id: id("rst"), examId: eid, studentId, mode: "remove", createdBy: p.userId ?? null });
@@ -3281,6 +3391,9 @@ const app = new Hono<{ Variables: Vars }>()
     // The attempts themselves are gone, so the owner cache must not keep
     // authorizing their former owners; see lib/attempt-owner.ts.
     attemptOwners.invalidateAll();
+    // Evidence rows are going with them, so the stored-evidence counters must
+    // be dropped too or a re-sit starts life already at its ceiling.
+    evidenceMeter.invalidateAll();
     if (atts.length) await db.delete(schema.attempts).where(and(eq(schema.attempts.examId, eid), eq(schema.attempts.studentId, studentId)));
     // Guarantee roster eligibility: clear a stray "remove"; add an "add" override
     // only if the student isn't already a cohort match.
@@ -3330,6 +3443,15 @@ const app = new Hono<{ Variables: Vars }>()
     const b = await c.req.json();
     const patch: Record<string, unknown> = { updatedAt: new Date() };
     for (const k of ["aiProvider", "judge0Limit", "aiLimit"]) if (b[k] !== undefined) patch[k] = b[k];
+    // Platform-global quota defaults (lib/tenant-quota.ts). A cleared field, a
+    // null, a 0 or junk all store NULL = unlimited: a ceiling of zero would
+    // refuse every student on the platform, and the likeliest source of a 0 is an
+    // empty input box rather than intent.
+    for (const k of ["maxConcurrentAttempts", "maxEvidencePerAttempt"]) {
+      if (b[k] === undefined) continue;
+      const n = Math.floor(Number(b[k]));
+      patch[k] = b[k] === null || b[k] === "" || !Number.isFinite(n) || n <= 0 ? null : n;
+    }
     // only overwrite keys if a non-masked value is provided
     for (const k of ["judge0Key", "claudeKey", "geminiKey", "openaiKey"]) {
       if (b[k] !== undefined && b[k] !== null && !String(b[k]).includes("••")) patch[k] = b[k];
@@ -3341,6 +3463,8 @@ const app = new Hono<{ Variables: Vars }>()
     await getGlobalSettings(); // ensure row exists
     const [s] = await db.update(schema.settings).set(patch).where(eq(schema.settings.id, GLOBAL_SETTINGS)).returning();
     invalidateGlobalSettings();
+    // A changed default must apply now, not after the quota cache TTL.
+    tenantQuotas.invalidateAll();
     return c.json({ ok: true, aiProvider: s.aiProvider }, 200);
   })
 

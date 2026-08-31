@@ -13,8 +13,18 @@ type Tenant = {
   logoUrl: string | null;
   primaryColor: string;
   enabled: boolean;
+  // Capacity ceilings. null = inherit the platform default (which itself
+  // defaults to unlimited). See api/lib/tenant-quota.ts.
+  maxConcurrentAttempts: number | null;
+  maxEvidencePerAttempt: number | null;
   userCount: number;
 };
+
+/** "" and 0 mean "inherit", never "ceiling of zero" — the API normalises the same way. */
+function quotaValue(v: string): number | null {
+  const n = Math.floor(Number(v));
+  return v.trim() === "" || !Number.isFinite(n) || n <= 0 ? null : n;
+}
 
 export default function Tenants() {
   const qc = useQueryClient();
@@ -72,18 +82,33 @@ function TenantForm({ tenant, onClose }: { tenant?: Tenant; onClose: () => void 
   const [name, setName] = useState(tenant?.name ?? "");
   const [shortName, setShortName] = useState(tenant?.shortName ?? "");
   const [primaryColor, setPrimaryColor] = useState(tenant?.primaryColor ?? "#1e3a5f");
+  const [maxLive, setMaxLive] = useState(tenant?.maxConcurrentAttempts ? String(tenant.maxConcurrentAttempts) : "");
+  const [maxEvidence, setMaxEvidence] = useState(tenant?.maxEvidencePerAttempt ? String(tenant.maxEvidencePerAttempt) : "");
 
   useEffect(() => {
     if (tenant) {
       setName(tenant.name);
       setShortName(tenant.shortName);
       setPrimaryColor(tenant.primaryColor);
+      setMaxLive(tenant.maxConcurrentAttempts ? String(tenant.maxConcurrentAttempts) : "");
+      setMaxEvidence(tenant.maxEvidencePerAttempt ? String(tenant.maxEvidencePerAttempt) : "");
     }
   }, [tenant]);
 
   const save = useMutation({
     mutationFn: async () => {
-      if (editing) return api.tenants[":id"].$patch({ param: { id: tenant!.id }, json: { name, shortName, primaryColor, logoUrl: null } });
+      if (editing)
+        return api.tenants[":id"].$patch({
+          param: { id: tenant!.id },
+          json: {
+            name,
+            shortName,
+            primaryColor,
+            logoUrl: null,
+            maxConcurrentAttempts: quotaValue(maxLive),
+            maxEvidencePerAttempt: quotaValue(maxEvidence),
+          },
+        });
       return api.tenants.$post({ json: { name, shortName, primaryColor, logoUrl: null } });
     },
     onSuccess: () => {
@@ -107,6 +132,25 @@ function TenantForm({ tenant, onClose }: { tenant?: Tenant; onClose: () => void 
         <div className="mono-label mb-2">Primary color</div>
         <ColorPicker value={primaryColor} onChange={setPrimaryColor} />
       </div>
+
+      {editing && (
+        <div className="mt-5 border-t border-[var(--color-line)] pt-4">
+          <div className="font-semibold text-sm mb-1">Capacity limits</div>
+          <p className="text-xs text-[var(--color-ink2)] mb-3">
+            Leave blank to inherit the platform default. These are load ceilings, not exam rules — a limit never
+            interrupts a student already writing, and it never discards a proctoring violation. To stop a college
+            entirely, suspend it instead.
+          </p>
+          <div className="grid sm:grid-cols-2 gap-4">
+            <Field label="Max students writing at once">
+              <input className="input" type="number" min={0} value={maxLive} onChange={(e) => setMaxLive(e.target.value)} placeholder="Unlimited" />
+            </Field>
+            <Field label="Max camera frames kept per attempt">
+              <input className="input" type="number" min={0} value={maxEvidence} onChange={(e) => setMaxEvidence(e.target.value)} placeholder="Unlimited" />
+            </Field>
+          </div>
+        </div>
+      )}
       <button className="btn btn-primary mt-4" disabled={save.isPending || !name} onClick={() => save.mutate()}>
         {save.isPending ? "Saving…" : editing ? "Save changes" : "Create college"}
       </button>

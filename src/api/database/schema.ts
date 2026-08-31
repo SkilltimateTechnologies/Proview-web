@@ -13,6 +13,15 @@ export const tenants = sqliteTable("tenants", {
   logoUrl: text("logo_url"),
   primaryColor: text("primary_color").notNull().default("#1e3a5f"),
   enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+  // ---- Capacity quotas (see lib/tenant-quota.ts) ----
+  // NULL = inherit the platform-global default in `settings`; if that is NULL too,
+  // unlimited. 0 and negatives are read as "not set", never as "block everything":
+  // an accidental 0 must not cancel a whole college's exam, and `enabled = false`
+  // already exists for deliberately stopping a tenant.
+  // Nullable on purpose: REQUIRED_COLUMNS adds these to live databases with
+  // ALTER TABLE ADD COLUMN, which cannot add a NOT NULL column.
+  maxConcurrentAttempts: integer("max_concurrent_attempts"),
+  maxEvidencePerAttempt: integer("max_evidence_per_attempt"),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
 });
 
@@ -391,6 +400,12 @@ export const settings = sqliteTable("settings", {
   aiUsed: integer("ai_used").notNull().default(0),
   // Global proctoring rules enforced by the desktop student client. See ProctorConfig.
   proctoring: text("proctoring", { mode: "json" }).$type<ProctorConfig>(),
+  // ---- Platform-wide default capacity quotas (see lib/tenant-quota.ts) ----
+  // The value a tenant inherits when it has no override of its own. NULL =
+  // unlimited, which is the shipped default: until somebody types a number here
+  // the quota system issues no queries and changes no decisions.
+  maxConcurrentAttempts: integer("max_concurrent_attempts"),
+  maxEvidencePerAttempt: integer("max_evidence_per_attempt"),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull().$defaultFn(now),
 });
 
