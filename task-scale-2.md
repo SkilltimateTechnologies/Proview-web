@@ -1646,3 +1646,200 @@ Still unanswered, raised three times now: **Proview has no independent backup.**
 plan gives 10-day point-in-time recovery, which covers a bad deploy and does not cover a deleted
 database or an accidental roster reconcile. It is the one remaining item on this list that is not a
 performance problem.
+
+---
+
+## 39. Nothing in this program had an upper bound: per-tenant capacity quotas (`441e222`)
+
+### The gap this closes [from code]
+
+Every section from §32 onward made the same work cheaper. §32 indexed the status scan, §33 moved
+grading off the bell, §35 coalesced heartbeats, §36 collapsed the reports N+1, §37 stopped re-reading
+every proctoring event, §38 stopped re-reading the attempt row to answer a boolean. All of it is
+efficiency, and none of it is a **bound**.
+
+Cheaper is not bounded. A single tenant scheduling a 5,000-student exam at 10am, or a client bug that
+captures a webcam frame every 200ms instead of every 27s, still consumes the whole shared database
+budget — and every other college's exam degrades with it, at a moment when nobody can pause and debug.
+Efficiency changes the slope; a quota changes the ceiling.
+
+Two numbers, because these are the two quantities that scale with **a tenant's** behaviour rather than
+with the platform's:
+
+| ceiling | bounds |
+|---|---|
+| `maxConcurrentAttempts` | attempts one tenant may have `in_progress` at once → the live read/write load |
+| `maxEvidencePerAttempt` | non-violation proctoring rows stored per attempt → the table kept forever |
+
+### The default is "nothing changes", and that shaped the whole design
+
+Per the instruction this work was approved under: every tenant defaults to inherit-global, and the
+global default is unlimited. Until somebody deliberately types a number, this module changes **zero
+decisions**.
+
+Resolution order is `tenant value → platform default → unlimited (null)`.
+
+**0, negatives, NaN and junk all mean "not set" — never "block everything."** This is the single most
+dangerous input in the module, so it is worth being explicit about the asymmetry. A cleared number
+field posts `0` or `""`; a JSON `null` becomes `0` somewhere in a form round trip. If 0 were read as a
+ceiling, the first cleared field would refuse **every student in a college** the moment their exam
+opened. The cost of reading 0 as unlimited is a quota that silently does nothing; the cost of reading
+it as a ceiling is a cancelled exam. There is already a deliberate, obvious way to stop a tenant:
+`tenants.enabled = false`. So `resolveLimit(0, 500) === 500` — zero falls through to the next level,
+and `resolveLimit(0, 0) === null`.
+
+**The honest cost when nothing is configured.** Per request: **zero queries** — the callers skip every
+check when the resolved limit is `null`, and the resolver never reads a tenant row when there is
+neither a global default nor any override on record. But it is not literally free: there is one cached
+`count(*)` over the `tenants` table (one row per college) **per minute per process** — the "has anyone
+set an override?" question. An in-process flag would cost nothing and would silently ignore any quota
+set by another replica or set before a restart. That trade was made deliberately in favour of the
+query, and it is written into the module header. On error that check resolves to `true`: do the extra
+tenant read rather than ignore a configured ceiling.
+
+### What the ceilings deliberately do not do
+
+- **The concurrency gate never touches a student who is already writing.** It is checked in exactly one
+  place — where a *new* live sitter is admitted (`POST /student/attempts/:examId/start`, either
+  creating the attempt or transitioning `not_started → in_progress`). Resume, reload, autosave,
+  heartbeat and submit are never gated. A quota that could eject a student from a paper they are
+  halfway through would be worse than the overload it prevents. Refusal is a `429` with
+  `code: "tenant_concurrency_quota"` and the live/limit numbers, not a generic error.
+- **The evidence cap never drops a violation.** Only non-violation rows are trimmed — `periodic_snapshot`,
+  `snapshot_failed`, `focus_loss`, `camera_restored`. Violation rows are inserted unconditionally
+  regardless of the ceiling. Evidence volume is a load problem; misconduct is a record; §34's rule that
+  a device fault must never score a student is the same principle pointed the other way.
+- **It is a forward cap on new rows, never a deletion.** `integrity_events` is still kept forever, per
+  the standing decision. Nothing in this section removes a row that exists.
+- **The record says why the frames stop.** One `evidence_capped` marker is written per attempt per
+  process, and it is registered in `NON_VIOLATION_TYPES` so it can never score a student — a platform
+  decision is not student behaviour. Without the marker, a capped attempt would look exactly like a
+  broken camera, which is the silence §34 was written to eliminate.
+
+### The approximations, stated plainly rather than discovered later
+
+1. **The concurrency gate is per-process.** The count is cached for 5s and each admission increments it
+   locally, so the gate is *exact on the way up* inside a window (the increments are the admissions)
+   and only approximate on the way down (submits inside the window are not seen until the count is
+   re-read). It can briefly under-admit, never over-admit. Two API replicas each hold their own count,
+   so the effective ceiling is per process for one TTL window — up to 2× for 5s. Acceptable for a
+   capacity ceiling whose job is to stop a runaway order-of-magnitude; **not** acceptable for anything
+   that must be exact, which is why nothing about correctness or eligibility is decided here.
+2. **Evidence counts are carried in memory.** One indexed `COUNT` seeds an attempt, then the count is
+   maintained as rows are inserted — evidence only grows, so a carried count is exact for the attempt's
+   lifetime (the same monotonicity argument as §37's rollup). Deletes push the carried count too
+   **high**, which engages the cap early and stores *less* than allowed: the harmless direction. The six
+   admin delete paths clear it anyway, so a re-sit does not begin life at its ceiling.
+3. **A one-row drift.** `evidence_capped` is itself counted as an evidence type, so after a restart the
+   reseeded count includes the marker and the ceiling engages one row early. One row per attempt,
+   deliberately not worth a second counter.
+
+### Where it is wired [from code]
+
+```
+rg -c "attemptOwners.authorize"       src/api/index.ts   → 2   (§38, unchanged)
+rg -c "integrityRollup.invalidateAll" src/api/index.ts   → 6   (§37)
+rg -c "attemptOwners.invalidateAll"   src/api/index.ts   → 6   (§38)
+rg -c "evidenceMeter.invalidateAll"   src/api/index.ts   → 6   (this section — same six delete paths)
+```
+
+`PATCH /settings` and `PATCH /tenants/:id` both normalise the two fields before writing (so a cleared
+field stores `NULL`, not `0`) and then invalidate the caches, so an admin's change applies on the next
+request instead of at the next TTL expiry. `PATCH /tenants/:id` also latches "an override exists", so a
+per-college ceiling is honoured even when no platform default is set.
+
+### The console [decision, not an omission]
+
+Both fields are exposed, because an API-only quota is a quota nobody can set without `curl`:
+
+- **Settings → Capacity limits** (super-admin): the two platform defaults. Blank = unlimited.
+- **Colleges → edit form → Capacity limits**: the per-college override. Blank = inherit the platform
+  default. The fields appear only when editing an existing college — `POST /tenants` does not accept
+  them, so a new college always starts out inheriting, and you set its ceiling afterwards.
+
+Both blocks say in plain words that these bound load only: a limit never interrupts a student who is
+already writing, and never discards a proctoring violation. The tenant form points at "suspend"
+for the deliberate-stop case, so nobody reaches for a ceiling of 0 to do it.
+
+### Schema, the usual way [from code]
+
+Four nullable columns — `max_concurrent_attempts` and `max_evidence_per_attempt` on both `tenants` and
+`settings` — declared in `schema.ts` and added at boot by `src/api/database/invariants.ts`
+(`ALTER TABLE ADD COLUMN`, which is exactly why all four are nullable). Four matching `REQUIRED_COLUMNS`
+entries, so `/api/admin/invariants` reports them and a half-migrated database is visible rather than
+mysterious.
+
+### Tests [measured]
+
+39 new tests in `src/api/lib/tenant-quota.test.ts`, run against in-memory libSQL with the real SQL, and
+they pin the things that would actually hurt:
+
+- an unconfigured platform is unlimited **and the tenant row is never read** (one query: the overrides
+  count); 200 loads inside the TTL cost 1 query
+- `0`, `-5`, `NaN`, `"abc"`, `Infinity` and `0.4` all resolve to "not set"; a `0` stored on a tenant row
+  inherits the global 700 rather than blocking
+- a start burst of admissions inside one 5s window is gated on the increments, not on a stale count —
+  8 live + ceiling 10 admits exactly two more, on **1** database query
+- the gate counts only *this* tenant's `in_progress` attempts (another college's 40 and this college's
+  `submitted`/`not_started` rows are all ignored)
+- 25 `tab_switch` + 15 `copy_paste` rows do **not** consume the evidence ceiling
+- the `evidence_capped` marker fires exactly once, and never for an attempt that was never capped
+- `attemptId → tenantId`: 400 lookups = 1 query, misses are not cached
+
+### Shipped [measured]
+
+- 39/39 new tests pass · `bun test` **400 pass, 0 fail across 21 files** (361 + 39) · `bun run typecheck`
+  (web + api) clean · `bun run build` green.
+- Pushed `ea98c5e..441e222`. Production `invariants.checkedAt` advanced
+  `2026-08-30T17:28:28.424Z` → **`2026-08-31T05:37:09.399Z`**, `invariants.ok: true`.
+- `/api/admin/invariants` reports **`ok: true`** with all four new columns `present: true` —
+  `tenants.max_concurrent_attempts`, `tenants.max_evidence_per_attempt`,
+  `settings.max_concurrent_attempts`, `settings.max_evidence_per_attempt`. The boot-time
+  `ALTER TABLE ADD COLUMN` path did what it was supposed to; no migration step was involved.
+- **The platform is confirmed unconfigured**, which is the shipped state: `GET /api/settings` returns
+  `maxConcurrentAttempts: null, maxEvidencePerAttempt: null`, and the single tenant
+  (`ten_bf5f745ef6ac4df4`, TKR College of Engineering & Technology) returns `null` for both. No ceiling
+  is in force anywhere. Nothing about today's behaviour changed, by design.
+- **Statement counts did not move.** `/api/health` `db.queries` across six sequential calls over ~10s:
+  `79 → 80 → 80 → 81 → 81 → 83`, i.e. **4 statements across 6 requests**, ~0.4/s — the same order as
+  the ~0.2/s idle drift measured in earlier sections, with no per-request step. Caveat stated plainly:
+  this is idle traffic, and `/api/health` is not itself a quota path, so it bounds the background cost
+  and does **not** yet prove the student paths are free. The ~479ms of any timing from this sandbox is
+  network round trip and is not quoted here for that reason.
+
+### The falsifiable prediction [unverified]
+
+This one is deliberately awkward to claim credit for, because a correct quota system on an
+unconfigured platform is **indistinguishable from not shipping it**. So the prediction is a null
+result, and it is the one that matters:
+
+With no number set anywhere, a statement-count diff must show **no added per-request statements**
+versus before this deploy, and no more than one extra `count(*)` per minute per process. The idle half
+of that is now measured above and holds. The half still open is the one that matters on an exam day:
+on the next live exam, the per-student statement count on `/start`, autosave, heartbeat, `/events` and
+`/snapshot-url` must be **identical** to §38's post-fix numbers, because every quota check short-circuits
+on a `null` limit. If the next exam's statement count per student is higher than §38 predicted, this
+section added cost to the path it was supposed to protect, and I will say so here rather than moving
+on.
+
+The second prediction, for whenever a number *is* set: refusals arrive as `429`
+`tenant_concurrency_quota` at the ceiling and **never** as a failure for a student already writing —
+no autosave, heartbeat, resume or submit can ever be refused by a quota, because the gate is not on
+those paths at all. If any student ever reports being locked out of a paper mid-exam after a ceiling
+is set, that is this section's bug and I will own it in place, the way §36's wrong prediction is
+corrected in place.
+
+### Still open
+
+The quota ceilings are shipped but **unset**, which is the whole point — they are a seatbelt, not a
+change of behaviour. Setting an actual number is a decision about what one college is allowed to
+consume, and that is your call, not mine. A reasonable starting point when you want one: concurrent
+attempts at roughly 2× the largest roster you actually run (today's largest was 1,122), and evidence
+per attempt at roughly 2× a full exam's frame count (a 90-minute exam at one frame per 27s is ~200
+frames, so ~400) — high enough that no legitimate exam ever touches them, low enough to stop a
+runaway.
+
+Still unanswered, raised four times now: **Proview has no independent backup.** The Turso Developer
+plan gives 10-day point-in-time recovery, which covers a bad deploy and does not cover a deleted
+database or an accidental roster reconcile. It remains the only item on this list that is not a
+performance problem.
