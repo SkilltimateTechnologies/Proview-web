@@ -1843,3 +1843,159 @@ Still unanswered, raised four times now: **Proview has no independent backup.** 
 plan gives 10-day point-in-time recovery, which covers a bad deploy and does not cover a deleted
 database or an accidental roster reconcile. It remains the only item on this list that is not a
 performance problem.
+
+---
+
+## 40. Setting the two numbers, and the first time the gate actually ran
+
+§39 shipped two ceilings and deliberately left both unset, which meant the code was inert: every
+quota check short-circuited on a `null` limit and never took a count. You approved the two starting
+numbers I proposed. They are now set in production, which changes the honest description of this
+system from "a seatbelt that costs nothing" to "a seatbelt that costs a little". This section records
+what is set, what it now costs, and the first evidence that the gate does what §39 claimed — because
+until this section, the concurrency gate had **never once executed** against a real request.
+
+### What is set now [measured]
+
+```
+PATCH /api/settings  {"maxConcurrentAttempts":2250,"maxEvidencePerAttempt":400}  ->  200 {"ok":true}
+GET   /api/settings   ->  concurrent: 2250 | evidence: 400
+GET   /api/tenants    ->  TKR override -> live: None | evidence: None      (still inheriting)
+GET   /api/admin/invariants -> ok: true, all four quota columns present
+```
+
+Platform-global defaults only. The one real college keeps both overrides `null`, so it inherits
+2,250 and 400. `PATCH /api/settings` patches only the keys present in the body and ignores masked
+API-key fields, so sending the two quota keys alone touched nothing else.
+
+### Why these two numbers [arithmetic]
+
+**2,250 concurrent attempts ≈ 2× the largest roster you have ever actually run.** The Aug 27 exam
+was 1,122 students. Double it, round up. A number set at the roster size would refuse a student on
+a retry the moment attendance ran high; a number at 10× would never fire at all.
+
+**400 stored evidence rows per attempt ≈ 2× a full exam's frame count.** The client captures one
+periodic snapshot every 27 seconds, so a 90-minute paper produces about 200 frames
+(90 × 60 ÷ 27 ≈ 200). A student who sits the longest paper you run and never once loses their camera
+lands at roughly half the ceiling. Anything that reaches 400 is a loop, not a candidate.
+
+The property both numbers share is the one that matters: **high enough that no legitimate exam
+touches them, low enough to stop a runaway.** They are not capacity targets and they are not a
+licensing tier. If a real exam ever gets near one of them, the number is wrong and should be raised,
+not defended.
+
+### The system is no longer inert, and here is the bill [from code] [arithmetic]
+
+With a number set, three things that used to cost nothing now cost something. Stating the size
+plainly, for a 90-minute exam with a 1,122-student roster, per server process:
+
+| what | cadence | statements per exam |
+|---|---|---|
+| `tenantQuotas.load` — the tenant row | cached 60s per tenant | ~90 |
+| `concurrencyGate.check` — live `COUNT` on `attempts` | cached 5s per tenant, only on `/start` of a **new** sitter | ≤120 |
+| `evidenceMeter` seed — indexed `COUNT` on `integrity_events` | once per attempt per process, on its first captured frame | ~1,122 |
+| | | **≈1,330** |
+
+The 120 is the ceiling, not an estimate: even if all 1,122 students hammer `/start` inside a
+10-minute stampede, a 5-second cache admits at most 120 counts across the whole window. The live
+count is served by `attempts_status_idx` (§32) and the evidence seed by
+`integrity_attempt_type_idx`, so both are index scans, not table scans.
+
+For scale: §38 removed roughly 382,000 authorization `SELECT`s from a single exam of this size. This
+section adds back about 1,330 — **under 0.4% of what the previous section removed.** That is the
+trade I would make again, but it is not zero, and §39's "costs nothing until somebody sets a number"
+sentence is now historical, not current.
+
+### The 20,148 that looked alarming, and wasn't [measured]
+
+After the PATCH, `/api/health` reported `db.queries: 20148` where the same counter had read `83`
+earlier in the session. That is the sort of number that looks like a quota system gone feral. It
+isn't, and here is the check rather than the reassurance:
+
+```
+06:03:56  queries 20230   checkedAt 2026-08-31T05:37:09.399Z
+06:04:17  queries 20238   checkedAt 2026-08-31T05:37:09.399Z
+06:04:37  queries 20245   checkedAt 2026-08-31T05:37:09.399Z
+```
+
+15 statements in 41 seconds = **0.37/s**, and `invariants.checkedAt` never moved, so the process did
+not restart between samples. The `83` reading was taken minutes after the 05:37 Aug 31 boot;
+20,245 statements over the ~24.5 hours since that boot averages **0.23/s** — the same idle drift
+measured before quotas existed, from the background workers (grade tick 5s, heartbeat flush 5s,
+auto-submit sweep 60s, reconcile 10min).
+
+The counter is **cumulative since boot**. Comparing its absolute value across sessions is
+meaningless; only deltas over a known interval mean anything. I had that written down and still
+read the absolute number first, which is worth recording so the next reader doesn't.
+
+### The gate had never run — and my first attempt to test it proved nothing [measured]
+
+Production has no live exam (all 11 are `finished`), so the newly-active `/start` gate has never
+been exercised there. I tested it locally: a server on port 3100 against the throwaway load DB,
+globals set to the same 2,250 / 400.
+
+The first run looked like a pass — 20 students, 20/20 `START` at 100%, zero errors — and it was
+**worthless**. The load generator seeds its virtual students with attempts already
+`status = 'in_progress'`, and the gate is deliberately checked only where a *new* live sitter is
+admitted (`!attempt || attempt.status === 'not_started'`). Every one of those 20 starts was a resume
+and fell straight through the gate without evaluating it. I caught it by reading the route, not from
+the result — a green test on a code path that never executed. Recording it because the same shape of
+mistake is what makes a load test comfortable and useless.
+
+Re-run with every LOAD attempt reset to `not_started`, so `/start` genuinely admits:
+
+| ceiling | `START` ok | refused | autosave | heartbeat | `/snapshot-url` | `/events` | 500s |
+|---|---|---|---|---|---|---|---|
+| 2,250 | 20/20 (100%) | 0 | 100% | 100% | 100% | 100% | 0 |
+| 5 | 5/20 (25%) | 15 | 100% | 100% | 100% | 100% | 0 |
+
+At a ceiling of 5, **exactly 5** were admitted and 15 refused — the gate is exact on the way up
+inside its 5-second window, as §39 claimed, because `note()` increments the cached count on each
+admit rather than waiting for the next read. And the row that matters most: with the gate actively
+refusing, **autosave, heartbeat, snapshot-url, events and status all stayed at 100%.** Nothing that
+touches a student already writing was affected.
+
+A direct probe of 12 fresh starts at the ceiling of 5 returned `{200: 5, 429: 3, 409: 4}`, with the
+refusal body:
+
+```json
+{"message":"Your college has reached its limit of simultaneous exam attempts. Please wait a moment and press Start again.",
+ "code":"tenant_concurrency_quota","live":5,"limit":5}
+```
+
+The four `409`s are "Already submitted" — the local auto-submit sweep and grade worker had finished
+those attempts during the previous run. Not gate behaviour, and worth naming so it isn't read as one.
+
+Two caveats on these numbers. They are from a local SQLite file, so the latencies are not
+production claims — only the pass/refuse counts and the status codes transfer. And the local restart
+logged `[invariants] column check did not finish in 15s — serving anyway, will retry`, which is the
+documented fail-soft path on a busy local file, not a production signal.
+
+### What I expect on the next live exam
+
+Falsifiable, so you can hold me to it:
+
+1. **No student sees a 429.** With the ceiling at 2,250 and the largest roster at 1,122, the gate
+   must never fire. If even one student reports "your college has reached its limit", the gate is
+   wrong — most likely counting rows it shouldn't — and that is my bug, not a capacity problem.
+2. **Zero `evidence_capped` rows.** After a normal 90-minute exam,
+   `select count(*) from integrity_events where type = 'evidence_capped'` must return **0**, because
+   ~200 frames is half of 400. A non-zero count means either a client is looping or my frame-rate
+   arithmetic above is wrong.
+3. **Per-student statement counts unchanged from §38**, plus the ~1,330 whole-exam constant in the
+   table above and nothing more. If the per-student number moved, the quota checks leaked onto a
+   per-request path.
+
+One known limit, stated rather than discovered later: **the gate is per-process.** Production
+appears to run a single instance, but I have not verified the replica count [unverified]. If it ever
+runs two, the effective ceiling is 2,250 *per process* within a 5-second window — approximately
+4,500 — because each process holds its own cached count. That is a deliberate trade from §39 (a
+shared counter would need a round trip on every start), and it only matters at numbers no exam of
+this size approaches.
+
+### Still open
+
+Unchanged, and still the only item here that is not a performance problem: **Proview has no
+independent backup.** Turso's Developer plan gives 10-day point-in-time recovery, which covers a bad
+deploy and does not cover a deleted database or an accidental roster reconcile. Raised five times
+now.
