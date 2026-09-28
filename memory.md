@@ -271,6 +271,9 @@ trip. Only *relative* server cost is meaningful, and that caveat belongs in ever
 
 **Approved:** feature only; no production accounts reset during development/testing.
 
+**GitHub sync:** feature commit `880f67c5a4adf5948411dae41ea61fc175830bed` pushed to
+`main`; remote hash verified on 2026-09-28 `[measured]`. Deployment remains unverified.
+
 - Users → Students now supports selected students (including selection across pages) or
   all students in the current college. All includes Elite and disabled students, regardless
   of active search/section filters. Staff/TPO passwords are excluded `[from code]`.

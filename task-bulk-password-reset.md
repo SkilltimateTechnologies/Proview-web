@@ -37,9 +37,10 @@
 - Preview web/API typechecks and managed build passed. Template structural lint passed;
   full lint still reports 42 accessibility diagnostics in copied legacy Users/shared UI.
   No lint diagnostics remain in the new bulk reset dialog.
-- GitHub dry-run push is blocked by missing write authentication (`unable to get password
-  from user`). Source can be committed locally; do not claim it is pushed or deployed.
-  A fresh securely supplied repository write credential is needed to finish sync.
+- GitHub sync completed with a freshly supplied secure credential. Feature commit
+  `880f67c5a4adf5948411dae41ea61fc175830bed` was pushed to `main` and its remote hash
+  verified using `git ls-remote` on 2026-09-28. The initial missing-authentication blocker
+  is resolved. Production deployment and Railway signing-secret configuration are not verified.
 
 ## Deployment and honest limits
 - BETTER_AUTH_SECRET must be configured (minimum 16 characters; use a strong existing secret
