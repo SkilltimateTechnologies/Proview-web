@@ -25,6 +25,8 @@ import { attemptOwners } from "./lib/attempt-owner";
 import { attemptTenants, concurrencyGate, evidenceMeter, resolveLimit, tenantQuotas } from "./lib/tenant-quota";
 import { EMPTY_ROLLUP, loadAttemptRollups, rollupAvg } from "./lib/report-rollup";
 import { TenantDirectory } from "./lib/tenant-directory";
+import { createBulkStudentPasswords } from "./lib/bulk-student-passwords";
+import { bulkResetHandler } from "./routes/bulk-student-passwords";
 import { examEffStatus, isConcluded, isReportable, toMs, type StatusExam } from "./lib/exam-status";
 
 type Vars = { user: SessionUser | null; profile: ProfileCtx | null };
@@ -539,11 +541,24 @@ async function getMonitorSnapshot(tid: string): Promise<MonitorSnapshot> {
   return task;
 }
 
+const bulkStudentPasswords = createBulkStudentPasswords({
+  db,
+  secret: () => process.env.BETTER_AUTH_SECRET ?? "",
+  invalidate: (tenantId) => directory.invalidateStudents(tenantId),
+});
+
 const app = new Hono<{ Variables: Vars }>()
   .use(cors({ origin: (origin) => origin ?? "*", credentials: true, exposeHeaders: ["set-auth-token"] }))
   .on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw))
   .basePath("api")
   .use("*", authMiddleware)
+  .all("/rpc/*", requireAuth, requirePermission("users"), async (c) => {
+    const result = await bulkResetHandler.handle(c.req.raw, {
+      prefix: "/api/rpc",
+      context: { profile: c.get("profile"), service: bulkStudentPasswords },
+    });
+    return result.response ?? c.json({ message: "Not found" }, 404);
+  })
   // Health doubles as the visibility surface for the database uniqueness
   // guarantees asserted at boot. If a required unique index could not be put in
   // place, duplicate rows can silently corrupt scores again — so that must be

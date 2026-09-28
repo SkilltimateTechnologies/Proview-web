@@ -10,7 +10,12 @@ number is in the doc it came from. `[from code]` = read out of this repo at the 
 `[arithmetic]` = derived from measured numbers. `[unverified]` = believed but not proven.
 If something is untagged it is structural fact about the codebase.
 
-**Last verified:** 2026-09-01 against commit `8a962ed`, on a clean working tree.
+**Latest feature verification:** 2026-09-28, bulk student password reset, based on `3a432e7`.
+`bun run build` passed: API typecheck, **424 tests / 0 failures / 22 files**, and Vite build
+`[measured]`. Web typecheck has **56 pre-existing errors**, identical to the baseline
+(after ignoring line/column movement) `[measured]`. See §11 for scope and deployment prerequisites.
+
+**Previous production verification:** 2026-09-01 against commit `8a962ed`, on a clean working tree.
 **Verification run that day:** `bun test` → **400 pass / 0 fail / 21 files** `[measured]`;
 production `GET /api/health` → `status: "ok"`, `invariants.ok: true`,
 `checkedAt: 2026-09-01T07:37:27.274Z`, `db.queries: 5924`, `examChecks: []` `[measured]`.
@@ -261,3 +266,37 @@ trip. Only *relative* server cost is meaningful, and that caveat belongs in ever
 - **`task-scale.md`**, **`task-perf-admin.md`** — the earlier rounds.
 - **`task-camera-episode.md`** — the camera-failure investigation.
 - **This file** — updated whenever meaningful work ships.
+
+## 11. Bulk student password reset (2026-09-28)
+
+**Approved:** feature only; no production accounts reset during development/testing.
+
+- Users → Students now supports selected students (including selection across pages) or
+  all students in the current college. All includes Elite and disabled students, regardless
+  of active search/section filters. Staff/TPO passwords are excluded `[from code]`.
+- Temporary password is the existing default `Welcome@123`; only `students.password` and
+  `students.mustChangePassword` are updated. Enabled status, staff accounts, exam records,
+  and other student fields are preserved `[from code; measured in isolated tests]`.
+- Existing student login/forced-change UI consumes the flag. Existing sessions are **not
+  revoked**. Full production login integration is **unverified**, not tested with real accounts.
+- New oRPC procedures under `/api/rpc/bulkStudentPasswords/{preview,reset}` sit behind the
+  existing Hono authentication/users permission middleware. Service additionally checks
+  enabled actor and matching tenant, including scoped superadmins `[from code]`.
+- Five-minute signed confirmation binds actor, college, selection and credential/status
+  snapshot. Transaction rechecks the snapshot; stale/tampered/expired/replayed confirmations
+  fail. Reset mutations have no automatic retry `[from code; measured in isolated tests]`.
+- **Deployment prerequisite:** `BETTER_AUTH_SECRET` must be a stable, strong secret shared
+  across replicas (minimum 16 characters enforced). This feature fails closed if missing.
+  Railway configuration and deployment of this feature remain **unverified**. Do not replace
+  the secret with a development fallback or rotate an existing auth secret casually.
+- No migration, schema change or production password write was performed for this feature.
+- **Verification:** 24 new isolated tests, 424 total passing; API typecheck and Vite build
+  pass. Web typecheck remains at 56 baseline errors, no new diagnostics `[measured]`.
+  Tests use disposable file-backed libSQL, not the application database singleton.
+- Browser verification on a separate managed preview with 48 synthetic students covered
+  selected/all resets, cancellation, disabled status preservation, scope filters, keyboard
+  focus, mobile layout and network failure/no retry; zero browser page errors `[measured]`.
+  This preview is not a production deployment or a full auth integration test.
+- Details and limitations: `task-bulk-password-reset.md`. Main implementation:
+  `src/api/lib/bulk-student-passwords.ts`, `src/api/routes/bulk-student-passwords.ts`,
+  `src/web/components/bulk-password-reset.tsx`, `src/web/pages/users.tsx`.

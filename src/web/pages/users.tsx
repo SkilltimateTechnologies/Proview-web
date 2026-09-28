@@ -1,10 +1,12 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useLocation } from "wouter";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Plus, Upload, X, Search, GraduationCap, UserCog, Mail, Sliders, KeyRound, Layers, Copy, Check, Pencil, Trash2, AlertTriangle, Star, Undo2 } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Field, Drawer, usePagination, Pager } from "../components/ui";
+import { BulkPasswordReset } from "../components/bulk-password-reset";
+import { useSession, allowed } from "../lib/session";
 
 const MODULES = [
   { k: "dashboard", label: "Dashboard" },
@@ -54,6 +56,12 @@ function initials(name: string) {
 
 export default function Users() {
   const qc = useQueryClient();
+  const { me } = useSession();
+  const tenantId = me?.profile.tenantId ?? "";
+  const canManageUsers = !!me?.profile.enabled && allowed(me, "users");
+  const [selectedStudents, setSelectedStudents] = useState<Set<string>>(new Set());
+  const [bulkResetTarget, setBulkResetTarget] = useState<{ tenantId: string; selectedIds: string[]; totalCount: number } | null>(null);
+  useEffect(() => { setSelectedStudents(new Set()); setBulkResetTarget(null); }, [tenantId]);
   const [, navigate] = useLocation();
   const [filter, setFilter] = useState<Filter>("students");
   const [search, setSearch] = useState("");
@@ -72,7 +80,7 @@ export default function Users() {
     queryFn: async () => (await api.users.$get()).json() as Promise<{ users: UserRow[] }>,
   });
   const studentsQ = useQuery({
-    queryKey: ["students"],
+    queryKey: ["students", tenantId],
     queryFn: async () => (await api.students.$get()).json() as Promise<{ students: StudentRow[] }>,
   });
   const classesQ = useQuery({
@@ -133,6 +141,16 @@ export default function Users() {
 
   const studentPg = usePagination(filteredStudents);
   const staffPg = usePagination(staffRows);
+  const selectedIds = students.filter(st => selectedStudents.has(st.id)).map(st => st.id);
+  const pageSelected = studentPg.pageItems.length > 0 && studentPg.pageItems.every(st => selectedStudents.has(st.id));
+  const pagePartlySelected = !pageSelected && studentPg.pageItems.some(st => selectedStudents.has(st.id));
+  function toggleSelected(id: string) {
+    setSelectedStudents(old => { const next = new Set(old); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+  }
+  function togglePage() {
+    setSelectedStudents(old => { const next = new Set(old); for (const st of studentPg.pageItems) { if (pageSelected) next.delete(st.id); else next.add(st.id); } return next; });
+  }
+  function openBulkReset() { setBulkResetTarget({ tenantId, selectedIds, totalCount: students.length }); }
 
   const eliteStudents = eliteQ.data?.students ?? [];
   const eliteClassId = eliteQ.data?.eliteClassId ?? null;
@@ -152,6 +170,7 @@ export default function Users() {
           <div className="flex flex-wrap gap-2">
             {filter === "students" && <button className="btn btn-ghost" onClick={() => navigate("/sections")}><Layers size={16} /> Sections</button>}
             {filter === "students" && <button className="btn btn-ghost" onClick={() => setCsv(true)}><Upload size={16} /> Bulk upload CSV</button>}
+            {filter === "students" && canManageUsers && <button className="btn btn-ghost" disabled={!tenantId || !students.length || studentsQ.isFetching || studentsQ.isError} onClick={openBulkReset}><KeyRound size={16} /> Bulk reset passwords</button>}
             {filter === "students" && <button className="btn btn-primary" onClick={() => setAdd(true)}><Plus size={16} /> Add student</button>}
             {filter === "elite" && <button className="btn btn-primary" onClick={() => setEliteAdd(true)}><Plus size={16} /> Add to Elite batch</button>}
             {filter === "tpo" && <button className="btn btn-primary" onClick={() => setAdd(true)}><Plus size={16} /> Add TPO</button>}
@@ -166,6 +185,7 @@ export default function Users() {
       {csv && <CsvUpload onClose={() => setCsv(false)} />}
       {permFor && <PermissionDrawer user={permFor} onClose={() => setPermFor(null)} />}
       {resetUser && <ResetPasswordDrawer target={resetUser} onClose={() => setResetUser(null)} />}
+      {bulkResetTarget && <BulkPasswordReset {...bulkResetTarget} onClose={() => setBulkResetTarget(null)} onComplete={() => { setSelectedStudents(new Set()); qc.invalidateQueries({ queryKey: ["students"] }); qc.invalidateQueries({ queryKey: ["elite"] }); }} />}
       {confirmDelete && (
         <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-4" onClick={() => { if (!removeUser.isPending && !removeStudent.isPending) setConfirmDelete(null); }}>
           <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6" onClick={(e) => e.stopPropagation()}>
@@ -207,7 +227,7 @@ export default function Users() {
             return (
               <button
                 key={f.k}
-                onClick={() => { setFilter(f.k); setAdd(false); setEliteAdd(false); setCsv(false); setEditStudent(null); setEditUser(null); }}
+                onClick={() => { setFilter(f.k); setSelectedStudents(new Set()); setAdd(false); setEliteAdd(false); setCsv(false); setEditStudent(null); setEditUser(null); }}
                 className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm font-medium transition-colors shrink-0 ${active ? "bg-white shadow-sm text-[var(--color-ink)]" : "text-[var(--color-muted)] hover:text-[var(--color-ink)]"}`}
               >
                 <Icon size={16} className={active ? "text-[var(--brand)]" : ""} />
@@ -219,10 +239,10 @@ export default function Users() {
         </div>
         <div className="relative flex-1">
           <Search size={17} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--color-muted)]" />
-          <input className="input pl-10" placeholder={filter === "tpo" ? "Search name, ID or email…" : "Search name or roll no…"} value={search} onChange={(e) => setSearch(e.target.value)} />
+          <input className="input pl-10" placeholder={filter === "tpo" ? "Search name, ID or email…" : "Search name or roll no…"} value={search} onChange={(e) => { setSearch(e.target.value); setSelectedStudents(new Set()); studentPg.setPage(1); }} />
         </div>
         {filter === "students" && (
-          <select className="input sm:w-56" value={sectionFilter} onChange={(e) => setSectionFilter(e.target.value)}>
+          <select aria-label="Filter by section" className="input sm:w-56" value={sectionFilter} onChange={(e) => { setSectionFilter(e.target.value); setSelectedStudents(new Set()); studentPg.setPage(1); }}>
             <option value="all">All sections</option>
             {classes.map((c) => <option key={c.id} value={c.id}>{c.code}</option>)}
             <option value="__none__">No section</option>
@@ -240,11 +260,18 @@ export default function Users() {
         ) : (
           <>
             <div className="mono-label mb-2">{filteredStudents.length} student{filteredStudents.length === 1 ? "" : "s"}</div>
+            {canManageUsers && selectedIds.length > 0 && <div className="flex flex-wrap items-center gap-3 mb-3 px-4 py-3 rounded-xl bg-[var(--color-brand-soft)] border border-[var(--color-line)]">
+              <output className="text-sm font-semibold text-[var(--brand)]">{selectedIds.length} selected</output>
+              <button className="text-xs underline text-[var(--brand)]" onClick={() => setSelectedStudents(new Set(filteredStudents.map(st => st.id)))}>Select all {filteredStudents.length} matching students</button>
+              <button className="text-xs underline text-[var(--color-ink2)]" onClick={() => setSelectedStudents(new Set())}>Clear selection</button>
+              <button className="btn btn-ghost !py-1.5 sm:ml-auto" disabled={studentsQ.isFetching} onClick={openBulkReset}><KeyRound size={15} />Reset selected passwords</button>
+            </div>}
             <div className="table-wrap">
               <div className="table-scroll">
                 <table className="data-table">
                   <thead>
                     <tr>
+                      {canManageUsers && <th className="!w-10"><input type="checkbox" aria-label="Select students on this page" className="h-4 w-4 accent-[#1e3a5f]" checked={pageSelected} ref={el => { if (el) el.indeterminate = pagePartlySelected; }} onChange={togglePage} /></th>}
                       <th>Student</th>
                       <th>Roll No</th>
                       <th className="hidden lg:table-cell">Email</th>
@@ -256,6 +283,7 @@ export default function Users() {
                   <tbody>
                     {studentPg.pageItems.map((st) => (
                       <tr key={st.id}>
+                        {canManageUsers && <td><input type="checkbox" aria-label={`Select ${st.name} (${st.rollNo})`} className="h-4 w-4 accent-[#1e3a5f]" checked={selectedStudents.has(st.id)} onChange={() => toggleSelected(st.id)} /></td>}
                         <td>
                           <div className="flex items-center gap-3">
                             <div className="h-9 w-9 rounded-full flex items-center justify-center text-white text-xs font-semibold shrink-0" style={{ background: "#1e3a5f", fontFamily: "var(--font-mono)" }}>{initials(st.name)}</div>
