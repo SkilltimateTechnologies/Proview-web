@@ -7,10 +7,10 @@ import { z } from "zod";
 import * as schema from "../database/schema";
 
 export const resetScopeSchema = z.discriminatedUnion("scope", [
-  z.object({ tenantId: z.string().min(1), scope: z.literal("all") }).strict(),
-  z.object({ tenantId: z.string().min(1), scope: z.literal("selected"), studentIds: z.array(z.string().min(1)).min(1).max(10000) }).strict(),
+  z.object({ tenantId: z.string().min(1), scope: z.literal("all"), mustChangePassword: z.boolean().default(true) }).strict(),
+  z.object({ tenantId: z.string().min(1), scope: z.literal("selected"), studentIds: z.array(z.string().min(1)).min(1).max(10000), mustChangePassword: z.boolean().default(true) }).strict(),
 ]);
-export type ResetScope = z.infer<typeof resetScopeSchema>;
+export type ResetScope = z.input<typeof resetScopeSchema>;
 export type ResetActor = { userId: string; tenantId: string | null; role: string; enabled: boolean; permissions: Record<string, boolean> | null };
 type Db = LibSQLDatabase<typeof schema>;
 type Target = { id: string; password: string; mustChangePassword: boolean; enabled: boolean };
@@ -73,7 +73,7 @@ export function createBulkStudentPasswords(deps: {
       const rows = await targets(deps.db, input);
       const expiresAt = now() + TTL;
       const payload = Buffer.from(JSON.stringify({ actorId: actor.userId, scope: scopeKey(input), digest: digest(rows), expiresAt })).toString("base64url");
-      return { count: rows.length, disabledCount: rows.filter(r => !r.enabled).length, collegeName: tenant.name, tenantId: input.tenantId, expiresAt, confirmationToken: `${payload}.${signature(payload)}` };
+      return { count: rows.length, disabledCount: rows.filter(r => !r.enabled).length, collegeName: tenant.name, tenantId: input.tenantId, mustChangePassword: input.mustChangePassword, expiresAt, confirmationToken: `${payload}.${signature(payload)}` };
     },
     async reset(actorArg: ResetActor | null, inputArg: ResetScope, confirmationToken: string) {
       const input = resetScopeSchema.parse(inputArg);
@@ -89,15 +89,15 @@ export function createBulkStudentPasswords(deps: {
         if (confirmation.expiresAt <= now() || digest(rows) !== confirmation.digest) {
           throw new ORPCError("CONFLICT", { message: "Student accounts changed, or this reset was already applied. Refresh and review again." });
         }
-        const updated = await tx.update(schema.students).set({ password, mustChangePassword: true })
+        const updated = await tx.update(schema.students).set({ password, mustChangePassword: input.mustChangePassword })
           .where(condition(input)).returning({ id: schema.students.id });
         if (updated.length !== rows.length) throw new Error("Reset target count changed inside transaction");
         return updated.length;
       });
       deps.invalidate(input.tenantId);
       // No passwords, hashes, tokens, names or student IDs in logs/response.
-      console.info("[bulk-student-password-reset]", JSON.stringify({ actorId: actor.userId, tenantId: input.tenantId, scope: input.scope, count }));
-      return { count, mustChangePassword: true as const };
+      console.info("[bulk-student-password-reset]", JSON.stringify({ actorId: actor.userId, tenantId: input.tenantId, scope: input.scope, count, mustChangePassword: input.mustChangePassword }));
+      return { count, mustChangePassword: input.mustChangePassword };
     },
   };
 }

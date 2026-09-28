@@ -54,6 +54,38 @@ async function snapshot() { return db.select().from(schema.students).orderBy(sch
 async function confirm(input = all, who: ResetActor | null = actor) { return service.preview(who, input); }
 
 describe("bulk student passwords: isolated SQLite", () => {
+  test("omitted policy defaults to requiring a change, equivalent to explicit true", async () => {
+    const review = await confirm();
+    expect(review.mustChangePassword).toBe(true);
+    expect(await service.reset(actor, { ...all, mustChangePassword: true }, review.confirmationToken)).toEqual({ count: 3, mustChangePassword: true });
+  });
+  test.each(["all", "selected"] as const)("%s can skip next-login change and clear existing required flags only for targets", async scope => {
+    await db.update(schema.students).set({ mustChangePassword: true });
+    const target: ResetScope = { ...(scope === "all" ? all : selected), mustChangePassword: false };
+    const before = await snapshot(); const review = await confirm(target);
+    expect(review.mustChangePassword).toBe(false);
+    expect(await snapshot()).toEqual(before);
+    expect(await service.reset(actor, target, review.confirmationToken)).toEqual({ count: scope === "all" ? 3 : 2, mustChangePassword: false });
+    const after = await snapshot();
+    for (let i = 0; i < after.length; i++) {
+      const row = after[i]!;
+      const included = row.tenantId === "a" && (scope === "all" || ["a1", "a2"].includes(row.id));
+      expect(row).toEqual(included ? { ...before[i], password: "Welcome@123-salt-1", mustChangePassword: false } : before[i]);
+    }
+    expect((await client.execute("SELECT * FROM staff")).rows).toEqual([{ id: "staff", password: "untouched" }]);
+    expect((await client.execute("SELECT * FROM exams")).rows).toEqual([{ id: "exam", data: "answers untouched" }]);
+    expect(invalidated).toEqual(["a"]);
+    await expect(service.reset(actor, target, review.confirmationToken)).rejects.toThrow("already applied");
+  });
+  test.each([true, false])("confirmation binds policy %s and refuses toggling it without re-review", async mustChangePassword => {
+    const target = { ...selected, mustChangePassword };
+    const review = await confirm(target); const before = await snapshot();
+    await expect(service.reset(actor, { ...target, mustChangePassword: !mustChangePassword }, review.confirmationToken)).rejects.toThrow("does not match");
+    expect(await snapshot()).toEqual(before); expect(invalidated).toEqual([]);
+  });
+  test.each([null, "false", 0])("rejects non-boolean next-login policy %s", async value => {
+    await expect(confirm({ ...all, mustChangePassword: value } as unknown as ResetScope)).rejects.toThrow();
+  });
   test("preview reports all, elite and disabled, writes nothing and leaks no credentials", async () => {
     const before = await snapshot(); const review = await confirm();
     expect(review).toMatchObject({ count: 3, disabledCount: 1, collegeName: "College A", tenantId: "a", expiresAt: 301000 });
@@ -163,6 +195,11 @@ describe("bulk student passwords: isolated SQLite", () => {
     profile = { ...actor, role: "tpo" }; await expect(rpc.bulkStudentPasswords.reset(input)).rejects.toThrow("permission");
     profile = actor;
     expect(await rpc.bulkStudentPasswords.reset(input)).toEqual({ count: 2, mustChangePassword: true });
+    const optionalTarget = { ...selected, mustChangePassword: false };
+    const optionalReview = await rpc.bulkStudentPasswords.preview(optionalTarget);
+    expect(optionalReview.mustChangePassword).toBe(false);
+    expect(await rpc.bulkStudentPasswords.reset({ target: optionalTarget, confirmationToken: optionalReview.confirmationToken, acknowledged: true })).toEqual({ count: 2, mustChangePassword: false });
+    expect((await snapshot()).filter(row => ["a1", "a2"].includes(row.id)).every(row => !row.mustChangePassword)).toBe(true);
     expect((await app.request("/api/rpc/nonexistent")).status).toBe(404);
   });
 });

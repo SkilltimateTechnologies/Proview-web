@@ -8,5 +8,5 @@ This change extends the supplied Users page, not a redesign.
 - Add a secondary Bulk reset passwords action beside Bulk upload CSV.
 - Student row checkboxes, explicit page selection and a persistent selected-count bar. Selections persist across pages; changing search/section/tab clears them to prevent hidden selections.
 - Reset dialog: current college, selected/all scope, server-confirmed affected count including disabled students, default temporary-password notice, mandatory acknowledgment, loading/error/success states.
-- All-college scope explicitly ignores filters and includes Elite and disabled students; TPO/staff accounts never included. Require first-login password change.
+- All-college scope explicitly ignores filters and includes Elite and disabled students; TPO/staff accounts never included. Require next-login password change by default, with an explicit unchecked option to skip it. Show the selected behavior on review/success and a shared-password warning when skipped.
 - Disabled/loading controls and destructive confirmation use the current component vocabulary. Dialog is keyboard-accessible and focus-trapped.

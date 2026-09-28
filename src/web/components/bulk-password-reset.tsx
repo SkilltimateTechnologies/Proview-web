@@ -9,6 +9,7 @@ export function BulkPasswordReset({ tenantId, selectedIds, totalCount, onClose, 
   tenantId: string; selectedIds: string[]; totalCount: number; onClose: () => void; onComplete: () => void;
 }) {
   const [scope, setScope] = useState<"all" | "selected">(selectedIds.length ? "selected" : "all");
+  const [mustChangePassword, setMustChangePassword] = useState(true);
   const [acknowledged, setAcknowledged] = useState(false);
   const [target, setTarget] = useState<ResetScope | null>(null);
   const preview = useMutation(previewStudentPasswords());
@@ -38,7 +39,7 @@ export function BulkPasswordReset({ tenantId, selectedIds, totalCount, onClose, 
   }, []);
 
   function review() {
-    const input: ResetScope = scope === "all" ? { tenantId, scope } : { tenantId, scope, studentIds: selectedIds };
+    const input: ResetScope = scope === "all" ? { tenantId, scope, mustChangePassword } : { tenantId, scope, studentIds: selectedIds, mustChangePassword };
     setTarget(input); setAcknowledged(false); reset.reset();
     preview.mutate(input);
   }
@@ -58,7 +59,7 @@ export function BulkPasswordReset({ tenantId, selectedIds, totalCount, onClose, 
             <output className="block space-y-4">
               <div className="h-12 w-12 rounded-full bg-[#eaf4ee] text-[#246347] grid place-items-center"><Check size={25} /></div>
               <h3 className="font-semibold text-xl text-[var(--color-ink)]">{reset.data.count} student passwords reset</h3>
-              <p className="text-sm text-[var(--color-ink2)]">The temporary password is <strong className="font-mono text-[var(--color-ink)]">Welcome@123</strong>. These students must choose a new password at their next login.</p>
+              <p className="text-sm text-[var(--color-ink2)]">The reset password is <strong className="font-mono text-[var(--color-ink)]">Welcome@123</strong>. {reset.data.mustChangePassword ? "These students must choose a new password at their next login." : "These students do not need to change their password at their next login."}</p>
               <p className="text-sm text-[var(--color-ink2)]">Staff passwords, account status and exam records were not changed.</p>
               <button className="btn btn-primary w-full justify-center" onClick={onClose}>Done</button>
             </output>
@@ -90,10 +91,15 @@ export function BulkPasswordReset({ tenantId, selectedIds, totalCount, onClose, 
                 </>
               )}
               <div className="rounded-xl border border-[var(--color-line)] p-4">
-                <div className="mono-label mb-2">Temporary password</div><div className="font-mono font-semibold text-lg text-[var(--color-ink)]">Welcome@123</div>
-                <p className="flex gap-2 text-xs text-[var(--color-ink2)] mt-3"><ShieldCheck size={15} className="shrink-0 text-[#246347]" />Students must change it at their next login. Existing exam records are preserved.</p>
+                <div className="mono-label mb-2">Reset password</div><div className="font-mono font-semibold text-lg text-[var(--color-ink)]">Welcome@123</div>
+                {!preview.isSuccess && <label htmlFor="bulk-reset-require-change" className="flex gap-3 items-start text-sm text-[var(--color-ink)] cursor-pointer mt-4">
+                  <input id="bulk-reset-require-change" aria-label="Require password change at next login" type="checkbox" className="mt-1 h-4 w-4 shrink-0 accent-[#1e3a5f]" checked={mustChangePassword} disabled={busy} onChange={e => { setMustChangePassword(e.target.checked); preview.reset(); }} />
+                  <span>Require password change at next login</span>
+                </label>}
+                <p className="flex gap-2 text-xs text-[var(--color-ink2)] mt-3"><ShieldCheck size={15} className="shrink-0 text-[#246347]" />{(preview.data?.mustChangePassword ?? mustChangePassword) ? "Students must change it at their next login." : "Students do not need to change it at their next login."} Existing exam records are preserved.</p>
+                {!(preview.data?.mustChangePassword ?? mustChangePassword) && <p className="text-xs leading-relaxed rounded-lg bg-[#fff7ed] text-[#7c3e12] p-3 mt-3">Students can keep using Welcome@123. This leaves them with a shared password; requiring a personal password is safer.</p>}
               </div>
-              {preview.isSuccess && <label className="flex gap-3 items-start text-sm text-[var(--color-ink2)] cursor-pointer"><input className="mt-1 h-4 w-4 shrink-0 accent-[#1e3a5f]" aria-label="I confirm resetting these student passwords to the default temporary password" type="checkbox" checked={acknowledged} disabled={busy} onChange={e => setAcknowledged(e.target.checked)} /><span>I confirm resetting these {preview.data.count} student passwords to the default temporary password.</span></label>}
+              {preview.isSuccess && <label className="flex gap-3 items-start text-sm text-[var(--color-ink2)] cursor-pointer"><input className="mt-1 h-4 w-4 shrink-0 accent-[#1e3a5f]" aria-label="I confirm resetting these student passwords to the default temporary password" type="checkbox" checked={acknowledged} disabled={busy} onChange={e => setAcknowledged(e.target.checked)} /><span>I confirm resetting these {preview.data.count} student passwords to Welcome@123, {preview.data.mustChangePassword ? "with a required password change at next login." : "without requiring a password change at next login."}</span></label>}
               {(preview.error || reset.error) && <p role="alert" className="text-sm rounded-lg bg-[#fdeeed] text-[#a32c25] p-3">{(reset.error ?? preview.error)?.message} {reset.error && "If the connection was interrupted, the reset may already have completed. Check before using Back to review and try again."}</p>}
               <div className="flex justify-end gap-2 pt-1">
                 <button className="btn btn-ghost" disabled={busy} onClick={preview.isSuccess ? back : onClose}>{preview.isSuccess ? "Back" : "Cancel"}</button>

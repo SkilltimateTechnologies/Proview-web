@@ -10,8 +10,8 @@ number is in the doc it came from. `[from code]` = read out of this repo at the 
 `[arithmetic]` = derived from measured numbers. `[unverified]` = believed but not proven.
 If something is untagged it is structural fact about the codebase.
 
-**Latest feature verification:** 2026-09-28, bulk student password reset, based on `3a432e7`.
-`bun run build` passed: API typecheck, **424 tests / 0 failures / 22 files**, and Vite build
+**Latest feature verification:** 2026-09-28, optional next-login password change, based on `618ffcc`.
+`bun run build` passed: API typecheck, **432 tests / 0 failures / 22 files**, and Vite build
 `[measured]`. Web typecheck has **56 pre-existing errors**, identical to the baseline
 (after ignoring line/column movement) `[measured]`. See §11 for scope and deployment prerequisites.
 
@@ -280,6 +280,12 @@ trip. Only *relative* server cost is meaningful, and that caveat belongs in ever
 - Temporary password is the existing default `Welcome@123`; only `students.password` and
   `students.mustChangePassword` are updated. Enabled status, staff accounts, exam records,
   and other student fields are preserved `[from code; measured in isolated tests]`.
+- **Updated user decision:** requiring a password change at next login is now optional.
+  The checkbox defaults to checked; unchecked writes `mustChangePassword = false`, including
+  clearing a previous requirement on affected students. Default password remains unchanged.
+  Review, acknowledgment and success show the chosen policy, with a shared-password warning
+  when skipped. The policy is signed into confirmation and cannot be changed without a fresh
+  review. Omitted API values default to true; non-booleans are rejected `[from code; measured]`.
 - Existing student login/forced-change UI consumes the flag. Existing sessions are **not
   revoked**. Full production login integration is **unverified**, not tested with real accounts.
 - New oRPC procedures under `/api/rpc/bulkStudentPasswords/{preview,reset}` sit behind the
@@ -293,13 +299,16 @@ trip. Only *relative* server cost is meaningful, and that caveat belongs in ever
   Railway configuration and deployment of this feature remain **unverified**. Do not replace
   the secret with a development fallback or rotate an existing auth secret casually.
 - No migration, schema change or production password write was performed for this feature.
-- **Verification:** 24 new isolated tests, 424 total passing; API typecheck and Vite build
+- **Verification:** 32 bulk-reset tests, 432 total passing; API typecheck and Vite build
   pass. Web typecheck remains at 56 baseline errors, no new diagnostics `[measured]`.
   Tests use disposable file-backed libSQL, not the application database singleton.
 - Browser verification on a separate managed preview with 48 synthetic students covered
   selected/all resets, cancellation, disabled status preservation, scope filters, keyboard
   focus, mobile layout and network failure/no retry; zero browser page errors `[measured]`.
   This preview is not a production deployment or a full auth integration test.
+- Additional browser verification: default checked, opt-out cancellation/no writes, selected
+  and all-college opt-out, clearing prior required flags, Back/re-review policy changes,
+  correct acknowledgment/success copy and mobile controls; zero page errors `[measured]`.
 - Details and limitations: `task-bulk-password-reset.md`. Main implementation:
   `src/api/lib/bulk-student-passwords.ts`, `src/api/routes/bulk-student-passwords.ts`,
   `src/web/components/bulk-password-reset.tsx`, `src/web/pages/users.tsx`.
