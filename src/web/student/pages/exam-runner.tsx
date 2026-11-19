@@ -7,6 +7,7 @@ import { OBSTRUCTION_LOCK_MS, startLock, isLocked, lockRemainingMs, nextLockStat
 import { classifyCameraError, cameraLostFailure, escalateFailure, type CameraFailure } from "../lib/camera-failure";
 import { freshEpisode, onLoss, onCameraSeen } from "../lib/camera-episode";
 import { Icon, NetBadge, useOnline } from "../components/ui";
+import { PromptText } from "../components/prompt-text";
 
 type Phase = "brief" | "preflight" | "resume" | "running" | "validating" | "done";
 
@@ -1749,7 +1750,10 @@ export function ExamRunner() {
                 <Icon name="flag" size={13} /> {session.flags[q.id] ? "Flagged for review" : "Flag for review"}
               </button>
             </div>
-            <div style={{ fontSize: 19, fontWeight: 600, lineHeight: 1.5, marginBottom: 22 }}>{q.prompt}</div>
+            <PromptText
+              text={q.prompt}
+              style={q.type === "coding" || q.prompt.length > 280 ? { fontSize: 16, fontWeight: 400, lineHeight: 1.6, marginBottom: 22 } : { fontSize: 19, fontWeight: 600, lineHeight: 1.5, marginBottom: 22 }}
+            />
 
             <QuestionInput q={q} value={session.answers[q.id]} onChange={(v) => setAnswer(q.id, v)} online={online} />
 

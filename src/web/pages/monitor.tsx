@@ -4,6 +4,7 @@ import { Activity, Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, Us
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Drawer } from "../components/ui";
+import { PromptText } from "../student/components/prompt-text";
 
 type LiveStudent = {
   attemptId: string;
@@ -587,7 +588,7 @@ function AnswerCard({ a, index }: { a: SheetAnswer; index: number }) {
     <div className="rounded-xl border border-[var(--color-line)] p-3.5">
       <div className="flex items-start justify-between gap-3 mb-2">
         <div className="min-w-0">
-          <div className="text-sm font-medium text-[var(--color-ink)]">{index + 1}. {a.prompt}</div>
+          <PromptText className="text-sm font-medium text-[var(--color-ink)]" text={`${index + 1}. ${a.prompt ?? ""}`} />
           <div className="mono-label mt-1">{a.type}{a.topic ? ` · ${a.topic}` : ""}</div>
         </div>
         <span className="stat-num text-sm shrink-0" style={{ color: scoreColor }}>

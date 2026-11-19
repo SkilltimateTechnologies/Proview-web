@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useLocation, useParams } from "wouter";
 import { api, type Review as ReviewData, type ReviewQuestion } from "../lib/api";
 import { Icon, Pill, Loader, EmptyState } from "../components/ui";
+import { PromptText } from "../components/prompt-text";
 
 const LETTERS = ["A", "B", "C", "D", "E", "F"];
 
@@ -73,7 +74,7 @@ function ReviewCard({ q, index }: { q: ReviewQuestion; index: number }) {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 14 }}>
         <div style={{ display: "flex", gap: 10 }}>
           <span className="mono-label" style={{ paddingTop: 3 }}>Q{index + 1}</span>
-          <div style={{ fontSize: 16, fontWeight: 600, lineHeight: 1.5 }}>{q.prompt}</div>
+          <PromptText text={q.prompt} style={q.type === "coding" || q.prompt.length > 280 ? { fontSize: 15, fontWeight: 400, lineHeight: 1.6, minWidth: 0 } : { fontSize: 16, fontWeight: 600, lineHeight: 1.5 }} />
         </div>
         <Pill tone={tone}>{q.score ?? 0} / {q.maxScore} pt</Pill>
       </div>
