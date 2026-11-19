@@ -83,7 +83,13 @@ describe("lane routing", () => {
     const clients = { student: fakeClient("s", 0, timeout), admin: fakeClient("a"), background: fakeClient("b") };
     const stats = { student: freshLaneStats(), admin: freshLaneStats(), background: freshLaneStats() };
     const router = createLaneRouter(clients, stats);
-    await expect(runInLane("student", () => router.execute("x"))).rejects.toThrow("timed out");
+    let caught: unknown = null;
+    try {
+      await runInLane("student", () => router.execute("x"));
+    } catch (e) {
+      caught = e;
+    }
+    expect(String(caught)).toContain("timed out");
     expect(stats.student.pending).toBe(0);
     expect(stats.student.timeouts).toBe(1);
   });
@@ -99,7 +105,15 @@ describe("deadlineFetch", () => {
     const hang: typeof fetch = ((_: unknown, init?: RequestInit) =>
       new Promise((_r, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)))) as typeof fetch;
     const started = Date.now();
-    await expect(deadlineFetch(50, hang)("http://db/")).rejects.toThrow();
+    // try/catch rather than `rejects.toThrow()`: on Bun 1.1/1.2 (what production
+    // may run) that matcher never settles for an abort reason and stalls the run.
+    let caught: unknown = null;
+    try {
+      await deadlineFetch(50, hang)("http://db/");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).not.toBeNull();
     expect(Date.now() - started).toBeLessThan(1000);
   });
 

@@ -349,3 +349,14 @@ start p50 8.2 s → 2.8 s; timer zero — submit p95 14.7 s → 4.8 s, admin max
 1.4 s; 20 dropped DB requests — 5-minute freeze → the 20 affected requests fail at 15s,
 admin unaffected. Data check after 1,102 submits: 15/15 answers each, 0 duplicates,
 0 blank overwrites, all grading jobs deferred past close.
+
+**Hotfix, same day:** the merge above 500'd EVERY API call on production (both logins
+failed) because `hono/compress` needs the web `CompressionStream`, which Bun only has
+from 1.3 — Railway/Nixpacks runs an older Bun. Replaced with `lib/gzip-json.ts`
+(Bun.gzipSync, GET JSON only, never throws, reads the body once — `res.clone()` left
+the original body empty on Bun 1.1/1.2). The request deadline now uses a plain timer
+and falls back when `AbortSignal.any` is missing. Verified: full suite + login/admin
+smoke on Bun 1.1.38, 1.2.0, 1.2.20 and 1.4.4, file and remote-style databases.
+**Rule from this:** development runs a newer Bun than production — test any runtime
+API (web streams, AbortSignal helpers, Bun.* additions) against an old Bun before
+shipping.
