@@ -1,0 +1,852 @@
+From 130ae8b7882db86f2982a971150b6ef6bcf602b5 Mon Sep 17 00:00:00 2001
+From: Skilltimate <skilltimate.studio@gmail.com>
+Date: Thu, 19 Nov 2026 11:04:46 +0000
+Subject: [PATCH] Review fixes: close staff takeover path, college checks,
+ answer-key leak
+
+Security
+- A TPO with the Users permission could create a super admin, promote any
+  account (their own included) to super admin, and reset the super admin's
+  password (returned in the response). Confirmed against the live code.
+  lib/staff-policy.ts now enforces role ranks, own-college only and no
+  self-promotion on create, edit, password reset and delete.
+- 12 edit/delete routes (exams incl. hold and extra time, students, sections,
+  categories, questions) check the record's college; another college's id
+  answers 404 so ids cannot be probed.
+- Results and the answer key unlock only after end + extra time + holds;
+  they used to unlock at the raw end time while students were still writing.
+- Student tokens expire after 30 days (STUDENT_TOKEN_MAX_AGE_MS); the student
+  dashboard signs out cleanly on 401.
+- PATCH /tenants/:id writes known fields only.
+
+Performance
+- Live Monitor: the 2s staleness clock lives in its own banner, so it no
+  longer re-renders the whole table; a static icon replaces ~1,100 spinners.
+- Dashboard and exam report read only the columns they use; question count
+  done by the database.
+- Code editor highlighting memoized (it re-ran every second for the timer).
+
+Verified: 474 tests pass on Bun 1.1.38, 1.2.0, 1.2.20 and 1.4.4; API
+typecheck clean; web typecheck at the 56-error baseline; verify:scale and
+verify:option-order pass; attack script refused 10/10 (all 10 succeed on the
+live code) with normal admin work unaffected, on Bun 1.1.38 and 1.2.0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TToxUPwgvvN4Ft9dNXHDgP
+---
+ memory.md                             |  19 ++++
+ src/api/index.ts                      | 129 +++++++++++++++++++++-----
+ src/api/lib/exam-status.test.ts       |  28 ++++++
+ src/api/lib/exam-status.ts            |  17 ++++
+ src/api/lib/staff-policy.test.ts      |  73 +++++++++++++++
+ src/api/lib/staff-policy.ts           |  69 ++++++++++++++
+ src/api/lib/student-token.test.ts     |  48 ++++++++++
+ src/api/lib/student-token.ts          |  16 +++-
+ src/web/pages/monitor.tsx             |  67 +++++++------
+ src/web/student/pages/exam-runner.tsx |   6 +-
+ src/web/student/pages/shell.tsx       |   8 +-
+ 11 files changed, 427 insertions(+), 53 deletions(-)
+ create mode 100644 src/api/lib/staff-policy.test.ts
+ create mode 100644 src/api/lib/staff-policy.ts
+ create mode 100644 src/api/lib/student-token.test.ts
+
+diff --git a/memory.md b/memory.md
+index 0d9301e..a5c7b9e 100644
+--- a/memory.md
++++ b/memory.md
+@@ -360,3 +360,22 @@ smoke on Bun 1.1.38, 1.2.0, 1.2.20 and 1.4.4, file and remote-style databases.
+ **Rule from this:** development runs a newer Bun than production — test any runtime
+ API (web streams, AbortSignal helpers, Bun.* additions) against an old Bun before
+ shipping.
++
++## 13. Full-code review fixes (2026-11-19, branch `review/after-exam`, NOT yet merged)
++
++Merge after the exam. Review write-up: Claude Docs "Proview — full code review (Nov 2026)".
++
++- **Critical, confirmed on live code:** a TPO with the `users` permission could create a
++  super admin, promote any account (own included) to super admin, and reset the super admin's
++  password (returned in the response). Fixed with `lib/staff-policy.ts` (role ranks, own
++  college only, no self-promotion), unit-tested and attack-tested against a running server.
++- 12 edit/delete routes (exams incl. hold/extra time, students, sections, categories,
++  questions) now check the record's college; another college's id answers 404.
++- Results/answer key now unlock only after end + extra time + holds (`resultsUnlocked`).
++- Student tokens expire after 30 days (`STUDENT_TOKEN_MAX_AGE_MS`); the dashboard signs out on 401.
++- `PATCH /tenants/:id` writes known fields only.
++- Live Monitor's 2s clock moved into its own banner (no full-table re-render); static icon
++  instead of ~1,100 spinners. Dashboard/report read only the columns they use. Code editor
++  highlight memoized.
++- Rejected on review: an AI output-token cap (reasoning models count hidden thinking against
++  it and could return nothing — grading 0). A faster highlighter (no measurable gain).
+diff --git a/src/api/index.ts b/src/api/index.ts
+index cc2c373..a347116 100644
+--- a/src/api/index.ts
++++ b/src/api/index.ts
+@@ -26,9 +26,10 @@ import { attemptOwners } from "./lib/attempt-owner";
+ import { attemptTenants, concurrencyGate, evidenceMeter, resolveLimit, tenantQuotas } from "./lib/tenant-quota";
+ import { EMPTY_ROLLUP, loadAttemptRollups, rollupAvg } from "./lib/report-rollup";
+ import { TenantDirectory } from "./lib/tenant-directory";
++import { assignableRoles, canChangeRole, canManageStaff, inCollege } from "./lib/staff-policy";
+ import { createBulkStudentPasswords } from "./lib/bulk-student-passwords";
+ import { bulkResetHandler } from "./routes/bulk-student-passwords";
+-import { examEffStatus, isConcluded, isReportable, toMs, type StatusExam } from "./lib/exam-status";
++import { examEffStatus, isConcluded, isReportable, resultsUnlocked, toMs, type StatusExam } from "./lib/exam-status";
+ 
+ type Vars = { user: SessionUser | null; profile: ProfileCtx | null };
+ 
+@@ -621,6 +622,25 @@ async function getMonitorSnapshot(tid: string): Promise<MonitorSnapshot> {
+   return task;
+ }
+ 
++/**
++ * Which college owns a record, for the cross-college check (lib/staff-policy.ts
++ * `inCollege`). `undefined` = no such record. Several edit/delete endpoints used to
++ * look a record up by id alone, so staff of one college could change another
++ * college's exams, students, sections or questions just by knowing an id.
++ */
++async function tenantOf(kind: "exam" | "student" | "class" | "category" | "question", id: string): Promise<string | undefined> {
++  const t =
++    kind === "exam" ? schema.exams
++    : kind === "student" ? schema.students
++    : kind === "class" ? schema.classes
++    : kind === "category" ? schema.categories
++    : schema.questions;
++  const [row] = await db.select({ tenantId: t.tenantId }).from(t).where(eq(t.id, id)).limit(1);
++  return row?.tenantId;
++}
++/** 404 (not 403) for another college's record, so ids cannot be probed for existence. */
++const NOT_FOUND = { message: "Not found" } as const;
++
+ const bulkStudentPasswords = createBulkStudentPasswords({
+   db,
+   secret: () => process.env.BETTER_AUTH_SECRET ?? "",
+@@ -1118,7 +1138,14 @@ const app = new Hono<{ Variables: Vars }>()
+       const n = Math.floor(Number(b[k]));
+       b[k] = b[k] === null || b[k] === "" || !Number.isFinite(n) || n <= 0 ? null : n;
+     }
+-    const [t] = await db.update(schema.tenants).set(b).where(eq(schema.tenants.id, tid)).returning();
++    // Only known, editable columns: the body used to go to the database as-is, so a
++    // request could rewrite any column (id, slug, createdAt...).
++    const tenantPatch: Record<string, unknown> = {};
++    for (const k of ["name", "shortName", "slug", "primaryColor", "logoUrl", "enabled", "maxConcurrentAttempts", "maxEvidencePerAttempt"] as const) {
++      if (b[k] !== undefined) tenantPatch[k] = b[k];
++    }
++    if (Object.keys(tenantPatch).length === 0) return c.json({ message: "Nothing to update" }, 400);
++    const [t] = await db.update(schema.tenants).set(tenantPatch).where(eq(schema.tenants.id, tid)).returning();
+     // Apply the new ceiling immediately rather than at the next cache expiry, and
+     // latch "an override exists" so it is honoured even with no global default.
+     tenantQuotas.invalidate(tid);
+@@ -1169,13 +1196,21 @@ const app = new Hono<{ Variables: Vars }>()
+     const actor = c.get("profile")!;
+     const b = await c.req.json();
+     const tenantId = actor.role === "super_admin" ? (b.tenantId ?? actor.tenantId) : actor.tenantId;
++    // The role used to be taken from the body unchecked, so any TPO with the `users`
++    // permission could create a super admin. Only roles the caller may hand out are
++    // accepted (lib/staff-policy.ts), and it is checked BEFORE the login is created.
++    const role = String(b.role ?? "tpo");
++    if (!assignableRoles({ userId: actor.userId, role: actor.role, tenantId: actor.tenantId }).includes(role)) {
++      return c.json({ message: "You are not allowed to create an account with that role." }, 403);
++    }
++    if (role !== "super_admin" && !tenantId) return c.json({ message: "Choose a college for this account." }, 400);
+     // create auth user
+     const res = await auth.api.signUpEmail({ body: { email: b.email, password: b.password, name: b.name } });
+     const newUserId = (res as { user?: { id: string } }).user?.id;
+     if (!newUserId) return c.json({ message: "Failed to create user" }, 400);
+     const [cnt] = await db.select({ n: dsql<number>`count(*)` }).from(schema.profiles);
+     const defaultPerms =
+-      b.role === "tpo"
++      role === "tpo"
+         ? (b.permissions ?? { dashboard: true, liveMonitor: true, reports: true })
+         : null;
+     const [prof] = await db
+@@ -1183,7 +1218,7 @@ const app = new Hono<{ Variables: Vars }>()
+       .values({
+         userId: newUserId,
+         tenantId,
+-        role: b.role, // tpo | student (super_admin seeded only)
++        role,
+         displayId: displayId("USR", (cnt?.n ?? 0) + 1),
+         phone: b.phone ?? null,
+         permissions: defaultPerms,
+@@ -1193,11 +1228,21 @@ const app = new Hono<{ Variables: Vars }>()
+   })
+   .patch("/users/:id", requireAuth, requirePermission("users"), async (c) => {
+     const uid = c.req.param("id");
++    const me = c.get("profile")!;
+     const b = await c.req.json();
++    // Whose account, and what role: see lib/staff-policy.ts. Without these checks a
++    // TPO could promote any account (their own included) to super admin.
++    const [target] = await db.select().from(schema.profiles).where(eq(schema.profiles.userId, uid)).limit(1);
++    if (!target) return c.json({ message: "User not found" }, 404);
++    if (!canManageStaff(me, target)) return c.json({ message: "Not allowed" }, 403);
++    if (b.role !== undefined && b.role !== target.role && !canChangeRole(me, target, String(b.role))) {
++      return c.json({ message: "You are not allowed to give this account that role." }, 403);
++    }
++    if (b.enabled === false && uid === me.userId) return c.json({ message: "You cannot disable your own account." }, 400);
+     const patch: Record<string, unknown> = {};
+     if (b.enabled !== undefined) patch.enabled = b.enabled;
+     if (b.permissions !== undefined) patch.permissions = b.permissions;
+-    if (b.role !== undefined) patch.role = b.role;
++    if (b.role !== undefined) patch.role = String(b.role);
+     if (b.phone !== undefined) patch.phone = b.phone;
+     if (Object.keys(patch).length) await db.update(schema.profiles).set(patch).where(eq(schema.profiles.userId, uid));
+     const userPatch: Record<string, unknown> = {};
+@@ -1213,6 +1258,12 @@ const app = new Hono<{ Variables: Vars }>()
+   })
+   .post("/users/:id/reset-password", requireAuth, requirePermission("users"), async (c) => {
+     const uid = c.req.param("id");
++    const me = c.get("profile")!;
++    // This returns the new password in the response, so it must never work on an
++    // account the caller does not manage (it used to work on the super admin).
++    const [target] = await db.select().from(schema.profiles).where(eq(schema.profiles.userId, uid)).limit(1);
++    if (!target) return c.json({ message: "User not found" }, 404);
++    if (!canManageStaff(me, target)) return c.json({ message: "Not allowed" }, 403);
+     const b = await c.req.json();
+     const newPassword: string = b.password && String(b.password).length >= 8 ? b.password : "Welcome@123";
+     const hash = await hashPassword(newPassword);
+@@ -1230,8 +1281,8 @@ const app = new Hono<{ Variables: Vars }>()
+     const [target] = await db.select().from(schema.profiles).where(eq(schema.profiles.userId, uid));
+     if (!target) return c.json({ message: "User not found" }, 404);
+     if (target.role === "super_admin") return c.json({ message: "The super admin account cannot be deleted." }, 403);
+-    // Non-super-admins can only delete users within their own tenant.
+-    if (me.role !== "super_admin" && target.tenantId !== me.tenantId) return c.json({ message: "Not allowed" }, 403);
++    // Own college only, and never an account that outranks the caller.
++    if (!canManageStaff(me, target)) return c.json({ message: "Not allowed" }, 403);
+     // Remove auth rows first (session, credential account), then profile, then user.
+     await db.delete(schema.session).where(eq(schema.session.userId, uid));
+     await db.delete(schema.account).where(eq(schema.account.userId, uid));
+@@ -1269,6 +1320,7 @@ const app = new Hono<{ Variables: Vars }>()
+   })
+   .patch("/classes/:id", requireAuth, requirePermission("users"), async (c) => {
+     const cid = c.req.param("id");
++    if (!inCollege(c.get("profile"), await tenantOf("class", cid))) return c.json(NOT_FOUND, 404);
+     const b = await c.req.json();
+     const sec = String(b.section ?? "").trim();
+     const code = sec ? `${b.branch}-${sec}` : String(b.branch).trim();
+@@ -1285,6 +1337,7 @@ const app = new Hono<{ Variables: Vars }>()
+   })
+   .delete("/classes/:id", requireAuth, requirePermission("users"), async (c) => {
+     const cid = c.req.param("id");
++    if (!inCollege(c.get("profile"), await tenantOf("class", cid))) return c.json(NOT_FOUND, 404);
+     // Unassign any students in this section, then delete it. Students promoted OUT of
+     // this section keep their originalClassId pointer, so clear those too to avoid
+     // dangling references breaking "restore to original section".
+@@ -1465,6 +1518,7 @@ const app = new Hono<{ Variables: Vars }>()
+   })
+   .patch("/students/:id", requireAuth, requirePermission("users"), async (c) => {
+     const sid = c.req.param("id");
++    if (!inCollege(c.get("profile"), await tenantOf("student", sid))) return c.json(NOT_FOUND, 404);
+     const b = await c.req.json();
+     const patch: Record<string, unknown> = {};
+     for (const k of ["name", "rollNo", "email", "classId", "enabled"]) {
+@@ -1628,6 +1682,7 @@ const app = new Hono<{ Variables: Vars }>()
+ 
+   .post("/students/:id/reset-password", requireAuth, requirePermission("users"), async (c) => {
+     const sid = c.req.param("id");
++    if (!inCollege(c.get("profile"), await tenantOf("student", sid))) return c.json(NOT_FOUND, 404);
+     const b = await c.req.json();
+     const newPassword: string = b.password && String(b.password).length >= 6 ? String(b.password) : "Welcome@123";
+     await db.update(schema.students).set({ password: await hashPassword(newPassword), mustChangePassword: true }).where(eq(schema.students.id, sid));
+@@ -1767,10 +1822,10 @@ const app = new Hono<{ Variables: Vars }>()
+       // start) is still just upcoming — never auto-treated as live.
+       else if (e.status === "live" || (startMs && now >= startMs)) phase = "available";
+       else phase = "upcoming";
+-      // Results stay locked until the exam closes for everyone — either the
+-      // admin flipped it to "finished", or its deadline has passed. This stops
+-      // early finishers from leaking the answer key to students still writing.
+-      const resultsReady = e.status === "finished" || (endMs != null && now > endMs);
++      // Results stay locked until the exam closes for everyone — admin finished it,
++      // or the window INCLUDING extra time and holds has closed (lib/exam-status).
++      // This stops early finishers leaking the answer key to students still writing.
++      const resultsReady = resultsUnlocked(e, now);
+       return {
+         id: e.id,
+         title: e.title,
+@@ -2322,10 +2377,9 @@ const app = new Hono<{ Variables: Vars }>()
+     const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.id, aid), eq(schema.attempts.studentId, sid))).limit(1);
+     if (!attempt) return c.json({ message: "Not found" }, 404);
+     const [exam] = await db.select().from(schema.exams).where(eq(schema.exams.id, attempt.examId)).limit(1);
+-    // Gate results until the exam closes for everyone (admin finished it, or the
+-    // deadline passed) — prevents early finishers leaking the answer key.
+-    const endMs = exam?.endAt ? new Date(exam.endAt).getTime() : null;
+-    const resultsReady = exam?.status === "finished" || (endMs != null && Date.now() > endMs);
++    // Gate results until the exam closes for everyone, extra time and holds
++    // included — prevents early finishers leaking the answer key (lib/exam-status).
++    const resultsReady = !!exam && resultsUnlocked(exam);
+     if (!resultsReady) return c.json({ message: "Results are locked until this exam closes. Please check back later." }, 403);
+     const ans = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, aid));
+     const aMap = new Map(ans.map((a) => [a.questionId, a]));
+@@ -2453,6 +2507,7 @@ const app = new Hono<{ Variables: Vars }>()
+     return c.json({ category: row }, 201);
+   })
+   .patch("/categories/:id", requireAuth, requirePermission("questionBank"), async (c) => {
++    if (!inCollege(c.get("profile"), await tenantOf("category", c.req.param("id")))) return c.json(NOT_FOUND, 404);
+     const b = await c.req.json();
+     const [row] = await db
+       .update(schema.categories)
+@@ -2463,6 +2518,7 @@ const app = new Hono<{ Variables: Vars }>()
+   })
+   .delete("/categories/:id", requireAuth, requirePermission("questionBank"), async (c) => {
+     const cid = c.req.param("id");
++    if (!inCollege(c.get("profile"), await tenantOf("category", cid))) return c.json(NOT_FOUND, 404);
+     // Detach questions from this category (keep the questions).
+     await db.update(schema.questions).set({ categoryId: null }).where(eq(schema.questions.categoryId, cid));
+     await db.delete(schema.categories).where(eq(schema.categories.id, cid));
+@@ -2520,6 +2576,7 @@ const app = new Hono<{ Variables: Vars }>()
+     return c.json({ question: row }, 201);
+   })
+   .patch("/questions/:id", requireAuth, requirePermission("questionBank"), async (c) => {
++    if (!inCollege(c.get("profile"), await tenantOf("question", c.req.param("id")))) return c.json(NOT_FOUND, 404);
+     const b = await c.req.json();
+     const patch: Record<string, unknown> = {};
+     for (const k of ["type", "prompt", "options", "correct", "meta", "points", "difficulty", "topic", "isGlobal", "categoryId"]) {
+@@ -2537,6 +2594,7 @@ const app = new Hono<{ Variables: Vars }>()
+     return c.json({ question: row }, 200);
+   })
+   .delete("/questions/:id", requireAuth, requirePermission("questionBank"), async (c) => {
++    if (!inCollege(c.get("profile"), await tenantOf("question", c.req.param("id")))) return c.json(NOT_FOUND, 404);
+     await db.delete(schema.questions).where(eq(schema.questions.id, c.req.param("id")));
+     examQuestionsCache.clear();
+     examPaperCache.clear();
+@@ -2657,6 +2715,7 @@ const app = new Hono<{ Variables: Vars }>()
+   })
+   .patch("/exams/:id", requireAuth, requirePermission("exams"), async (c) => {
+     const eid = c.req.param("id");
++    if (!inCollege(c.get("profile"), await tenantOf("exam", eid))) return c.json(NOT_FOUND, 404);
+     const b = await c.req.json();
+     const patch: Record<string, unknown> = {};
+     for (const k of ["title", "status", "durationMin"]) if (b[k] !== undefined) patch[k] = b[k];
+@@ -2773,7 +2832,7 @@ const app = new Hono<{ Variables: Vars }>()
+   .post("/exams/:id/hold", requireAuth, requirePermission("exams"), async (c) => {
+     const eid = c.req.param("id");
+     const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+-    if (!ex) return c.json({ message: "Not found" }, 404);
++    if (!ex || !inCollege(c.get("profile"), ex.tenantId)) return c.json({ message: "Not found" }, 404);
+     if (!ex.heldAt) await db.update(schema.exams).set({ heldAt: new Date() }).where(eq(schema.exams.id, eid));
+     invalidateExam(eid);
+     return c.json({ ok: true, held: true }, 200);
+@@ -2783,7 +2842,7 @@ const app = new Hono<{ Variables: Vars }>()
+   .post("/exams/:id/unhold", requireAuth, requirePermission("exams"), async (c) => {
+     const eid = c.req.param("id");
+     const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+-    if (!ex) return c.json({ message: "Not found" }, 404);
++    if (!ex || !inCollege(c.get("profile"), ex.tenantId)) return c.json({ message: "Not found" }, 404);
+     if (ex.heldAt) {
+       const elapsed = Math.max(0, Date.now() - new Date(ex.heldAt).getTime());
+       await db.update(schema.exams).set({ heldAt: null, holdMs: (ex.holdMs ?? 0) + elapsed }).where(eq(schema.exams.id, eid));
+@@ -2794,6 +2853,7 @@ const app = new Hono<{ Variables: Vars }>()
+   // Grant extra minutes to the whole exam (shifts every deadline forward).
+   .post("/exams/:id/extra-time", requireAuth, requirePermission("exams"), async (c) => {
+     const eid = c.req.param("id");
++    if (!inCollege(c.get("profile"), await tenantOf("exam", eid))) return c.json(NOT_FOUND, 404);
+     const b = await c.req.json().catch(() => ({}));
+     let minutes = Number(b.minutes);
+     if (!Number.isFinite(minutes)) minutes = 0;
+@@ -3089,7 +3149,15 @@ const app = new Hono<{ Variables: Vars }>()
+       return isFinished && inPeriod(e);
+     });
+     const examIds = finishedExams.map((e) => e.id);
+-    const atts = examIds.length ? await db.select().from(schema.attempts).where(inArray(schema.attempts.examId, examIds)) : [];
++    // Only the three columns the dashboard uses. Full attempt rows (user agent,
++    // timestamps, flags) for every attempt of every finished exam were read on each
++    // load — 2,520 wide rows today, growing with every exam.
++    const atts = examIds.length
++      ? await db
++          .select({ examId: schema.attempts.examId, studentId: schema.attempts.studentId, score: schema.attempts.score })
++          .from(schema.attempts)
++          .where(inArray(schema.attempts.examId, examIds))
++      : [];
+     const graded = atts.filter((a) => a.score != null);
+ 
+     const avg = graded.length ? graded.reduce((s, a) => s + (a.score ?? 0), 0) / graded.length : 0;
+@@ -3240,9 +3308,28 @@ const app = new Hono<{ Variables: Vars }>()
+     // Same rule as the /reports list: gate on DERIVED status, not the raw column, or a
+     // TPO who can see a conducted exam in the list gets a 403 when opening it.
+     if (p.role === "tpo" && !isConcluded(ex)) return c.json({ message: "Report not available until finished" }, 403);
+-    const atts = await db.select().from(schema.attempts).where(eq(schema.attempts.examId, eid));
+-    // Total questions on the exam so the report can show "answered N/total".
+-    const totalQuestions = (await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, eid))).length;
++    // Only the columns the report uses (the user-agent column alone is up to 300
++    // characters per row).
++    const atts = await db
++      .select({
++        id: schema.attempts.id,
++        studentId: schema.attempts.studentId,
++        sectionSnapshot: schema.attempts.sectionSnapshot,
++        score: schema.attempts.score,
++        status: schema.attempts.status,
++        submittedAt: schema.attempts.submittedAt,
++        disconnected: schema.attempts.disconnected,
++        answeredCount: schema.attempts.answeredCount,
++      })
++      .from(schema.attempts)
++      .where(eq(schema.attempts.examId, eid));
++    // Total questions on the exam so the report can show "answered N/total" —
++    // counted by the database instead of shipping every exam_questions row back.
++    const [qCount] = await db
++      .select({ n: dsql<number>`count(*)` })
++      .from(schema.examQuestions)
++      .where(eq(schema.examQuestions.examId, eid));
++    const totalQuestions = Number(qCount?.n ?? 0);
+     // Directory cache. This report used to read all 1,124 students and every class
+     // on EVERY open, purely to label attempt rows with a name and a section code.
+     const studentIdx = await directory.studentIndex(p.tenantId!);
+diff --git a/src/api/lib/exam-status.test.ts b/src/api/lib/exam-status.test.ts
+index c6e83cb..c3edd08 100644
+--- a/src/api/lib/exam-status.test.ts
++++ b/src/api/lib/exam-status.test.ts
+@@ -113,3 +113,31 @@ describe("isReportable — the Reports list filter", () => {
+     expect(isReportable({ ...lapsed, startAt: new Date(NOW + 60 * MIN), endAt: new Date(NOW + 120 * MIN) }, NOW)).toBe(false);
+   });
+ });
++
++import { resultsUnlocked } from "./exam-status";
++
++describe("resultsUnlocked (answer key release)", () => {
++  const end = Date.UTC(2026, 10, 19, 12, 0, 0);
++  const base = { status: "scheduled", startAt: end - 90 * 60_000, endAt: end };
++
++  it("opens after the end when there was no extra time", () => {
++    expect(resultsUnlocked(base, end - 1)).toBe(false);
++    expect(resultsUnlocked(base, end + 1)).toBe(true);
++  });
++
++  it("stays locked through admin extra time (it used to unlock at the raw end)", () => {
++    const e = { ...base, extraMin: 10 };
++    expect(resultsUnlocked(e, end + 5 * 60_000)).toBe(false);
++    expect(resultsUnlocked(e, end + 10 * 60_000 + 1)).toBe(true);
++  });
++
++  it("stays locked through accumulated and current holds", () => {
++    expect(resultsUnlocked({ ...base, holdMs: 120_000 }, end + 60_000)).toBe(false);
++    expect(resultsUnlocked({ ...base, heldAt: end - 1000 }, end + 60 * 60_000)).toBe(false);
++  });
++
++  it("an admin-finished exam is always open; no end time means never by clock", () => {
++    expect(resultsUnlocked({ ...base, status: "finished" }, end - 3600_000)).toBe(true);
++    expect(resultsUnlocked({ status: "scheduled", startAt: null, endAt: null }, end)).toBe(false);
++  });
++});
+diff --git a/src/api/lib/exam-status.ts b/src/api/lib/exam-status.ts
+index ac3a951..e486277 100644
+--- a/src/api/lib/exam-status.ts
++++ b/src/api/lib/exam-status.ts
+@@ -86,3 +86,20 @@ export function isReportable(e: StatusExam, now: number = Date.now()): boolean {
+   const s = examEffStatus(e, now);
+   return s === "finished" || s === "ended" || s === "live";
+ }
++
++/**
++ * Whether a finished student may see results — including the answer key — yet.
++ *
++ * Results used to unlock at the RAW end time, ignoring admin extra time and holds.
++ * So whenever an invigilator granted extra minutes (or held the exam), students
++ * who had already submitted could open their review, with every correct answer,
++ * while classmates were still writing in the extra time. Now: the admin marked it
++ * finished, or the whole window — end + extra time + holds — has closed and the
++ * exam is not held right now.
++ */
++export function resultsUnlocked(e: StatusExam, now: number = Date.now()): boolean {
++  if (e.status === "finished") return true;
++  if (e.heldAt) return false;
++  const closes = closesAtMs(e);
++  return closes !== null && now > closes;
++}
+diff --git a/src/api/lib/staff-policy.test.ts b/src/api/lib/staff-policy.test.ts
+new file mode 100644
+index 0000000..fc190fd
+--- /dev/null
++++ b/src/api/lib/staff-policy.test.ts
+@@ -0,0 +1,73 @@
++/**
++ * Pins the staff-account rules that closed the takeover path found in review:
++ * a TPO with the `users` permission could create a super admin, promote anyone
++ * (themselves included) to super admin, or reset the super admin's password.
++ */
++import { describe, expect, test } from "bun:test";
++import { assignableRoles, canChangeRole, canManageStaff, inCollege } from "./staff-policy";
++
++const superAdmin = { userId: "u_super", role: "super_admin", tenantId: null };
++const collegeAdminA = { userId: "u_ca", role: "college_admin", tenantId: "ten_a" };
++const tpoA = { userId: "u_tpo", role: "tpo", tenantId: "ten_a" };
++const tpoA2 = { userId: "u_tpo2", role: "tpo", tenantId: "ten_a" };
++const tpoB = { userId: "u_tpob", role: "tpo", tenantId: "ten_b" };
++
++describe("who may manage whom", () => {
++  test("nobody but a super admin can touch a super admin", () => {
++    for (const actor of [collegeAdminA, tpoA, tpoB]) expect(canManageStaff(actor, superAdmin)).toBe(false);
++    expect(canManageStaff(superAdmin, superAdmin)).toBe(true);
++  });
++
++  test("never across colleges", () => {
++    expect(canManageStaff(tpoA, tpoB)).toBe(false);
++    expect(canManageStaff(collegeAdminA, tpoB)).toBe(false);
++    expect(canManageStaff(superAdmin, tpoB)).toBe(true);
++  });
++
++  test("a TPO cannot manage a college admin, but a college admin can manage a TPO", () => {
++    expect(canManageStaff(tpoA, collegeAdminA)).toBe(false);
++    expect(canManageStaff(collegeAdminA, tpoA)).toBe(true);
++    expect(canManageStaff(tpoA, tpoA2)).toBe(true);
++  });
++
++  test("an actor without a college manages no one unless super admin", () => {
++    expect(canManageStaff({ userId: "x", role: "tpo", tenantId: null }, { userId: "y", role: "tpo", tenantId: null })).toBe(false);
++  });
++
++  test("unknown roles rank lowest and grant nothing", () => {
++    const odd = { userId: "u_odd", role: "student", tenantId: "ten_a" };
++    expect(assignableRoles(odd)).toEqual([]);
++    expect(canManageStaff(odd, tpoA)).toBe(false);
++  });
++});
++
++describe("which roles may be handed out", () => {
++  test("only a super admin can create or grant super admin", () => {
++    expect(assignableRoles(superAdmin)).toContain("super_admin");
++    expect(assignableRoles(collegeAdminA)).not.toContain("super_admin");
++    expect(assignableRoles(tpoA)).toEqual(["tpo"]);
++  });
++
++  test("no self-promotion below super admin", () => {
++    expect(canChangeRole(tpoA, tpoA, "super_admin")).toBe(false);
++    expect(canChangeRole(tpoA, tpoA, "college_admin")).toBe(false);
++    expect(canChangeRole(collegeAdminA, collegeAdminA, "super_admin")).toBe(false);
++  });
++
++  test("a TPO cannot promote a colleague to college admin; a college admin can", () => {
++    expect(canChangeRole(tpoA, tpoA2, "college_admin")).toBe(false);
++    expect(canChangeRole(collegeAdminA, tpoA, "college_admin")).toBe(true);
++    expect(canChangeRole(collegeAdminA, tpoA, "super_admin")).toBe(false);
++  });
++});
++
++describe("inCollege", () => {
++  test("own college only, super admin everywhere, unowned records super admin only", () => {
++    expect(inCollege(tpoA, "ten_a")).toBe(true);
++    expect(inCollege(tpoA, "ten_b")).toBe(false);
++    expect(inCollege(tpoA, undefined)).toBe(false);
++    expect(inCollege(tpoA, null)).toBe(false);
++    expect(inCollege(superAdmin, "ten_b")).toBe(true);
++    expect(inCollege(null, "ten_a")).toBe(false);
++  });
++});
+diff --git a/src/api/lib/staff-policy.ts b/src/api/lib/staff-policy.ts
+new file mode 100644
+index 0000000..2c5bdf5
+--- /dev/null
++++ b/src/api/lib/staff-policy.ts
+@@ -0,0 +1,69 @@
++/**
++ * Who may manage which staff account, and which college a record may be touched from.
++ *
++ * WHY THIS EXISTS (security review, 2026-11-19)
++ * ---------------------------------------------
++ * The staff-account endpoints only asked "does the caller have the `users`
++ * permission?". They never asked WHOSE account was being changed or WHAT role was
++ * being granted, so any TPO with that permission could:
++ *   - create an account with role `super_admin` (POST /users took `role` from the body),
++ *   - promote any account, including their own, to `super_admin` (PATCH /users/:id),
++ *   - reset the platform super admin's password and receive it in the response
++ *     (POST /users/:id/reset-password),
++ * in their own college or any other. That is a full platform takeover from one TPO login.
++ * Separately, many edit/delete endpoints looked a record up by id alone, so a staff
++ * user of one college could change another college's exams, students or questions
++ * by id. Both rules live here, pure and unit-tested, so every route asks the same way.
++ */
++
++export type StaffActor = { userId: string; role: string; tenantId: string | null };
++export type StaffTarget = { userId: string; role: string; tenantId: string | null };
++
++/** Higher outranks lower. Unknown roles rank lowest, so they can never escalate. */
++const RANK: Record<string, number> = { tpo: 1, college_admin: 2, super_admin: 3 };
++const rank = (role: string | null | undefined) => RANK[role ?? ""] ?? 0;
++
++export const isSuperAdmin = (actor: { role: string } | null | undefined) => actor?.role === "super_admin";
++
++/** Roles this actor may hand out (on create, or by changing someone's role). */
++export function assignableRoles(actor: StaffActor): string[] {
++  if (actor.role === "super_admin") return ["super_admin", "college_admin", "tpo"];
++  if (actor.role === "college_admin") return ["college_admin", "tpo"];
++  if (actor.role === "tpo") return ["tpo"];
++  return [];
++}
++
++/**
++ * May `actor` edit, reset the password of, or delete `target`?
++ *  - a super admin may manage anyone;
++ *  - everyone else only inside their own college, never a super admin, and only
++ *    accounts that do not outrank them (a TPO cannot reset a college admin's password).
++ */
++export function canManageStaff(actor: StaffActor, target: StaffTarget): boolean {
++  if (actor.role === "super_admin") return true;
++  if (!actor.tenantId || target.tenantId !== actor.tenantId) return false;
++  if (target.role === "super_admin") return false;
++  return rank(target.role) <= rank(actor.role);
++}
++
++/**
++ * Is a role change from `from` to `to` allowed for this actor on this target?
++ * Nobody but a super admin changes their own role (no self-promotion).
++ */
++export function canChangeRole(actor: StaffActor, target: StaffTarget, to: string): boolean {
++  if (!canManageStaff(actor, target)) return false;
++  if (actor.role !== "super_admin" && actor.userId === target.userId) return false;
++  return assignableRoles(actor).includes(to);
++}
++
++/**
++ * May this staff profile touch a record that belongs to `recordTenantId`?
++ * A super admin may (they work across colleges, scoped by the X-Tenant-Id header);
++ * everyone else only within their own college. A record with no college is
++ * treated as nobody's, so only a super admin can touch it.
++ */
++export function inCollege(profile: { role: string; tenantId: string | null } | null | undefined, recordTenantId: string | null | undefined): boolean {
++  if (!profile) return false;
++  if (profile.role === "super_admin") return true;
++  return !!profile.tenantId && !!recordTenantId && profile.tenantId === recordTenantId;
++}
+diff --git a/src/api/lib/student-token.test.ts b/src/api/lib/student-token.test.ts
+new file mode 100644
+index 0000000..fe40b83
+--- /dev/null
++++ b/src/api/lib/student-token.test.ts
+@@ -0,0 +1,48 @@
++/**
++ * Student tokens now expire (they used to be valid forever). The risk of adding
++ * expiry is cutting a student off mid-exam, so pin both directions: a fresh
++ * token works, an old one does not, a forged or malformed one never does.
++ */
++import { afterEach, describe, expect, test } from "bun:test";
++import { STUDENT_TOKEN_DEFAULT_MAX_AGE_MS, signStudentToken, verifyStudentToken } from "./student-token";
++
++const realNow = Date.now;
++afterEach(() => {
++  Date.now = realNow;
++  delete process.env.STUDENT_TOKEN_MAX_AGE_MS;
++});
++
++describe("student token expiry", () => {
++  test("a fresh token verifies to its student", async () => {
++    const t = await signStudentToken("stu_abc");
++    expect(await verifyStudentToken(t)).toBe("stu_abc");
++  });
++
++  test("still valid just inside the default window, rejected just past it", async () => {
++    const t = await signStudentToken("stu_abc");
++    const issued = realNow();
++    Date.now = () => issued + STUDENT_TOKEN_DEFAULT_MAX_AGE_MS - 60_000;
++    expect(await verifyStudentToken(t)).toBe("stu_abc");
++    Date.now = () => issued + STUDENT_TOKEN_DEFAULT_MAX_AGE_MS + 60_000;
++    expect(await verifyStudentToken(t)).toBeNull();
++  });
++
++  test("the window can be set by environment", async () => {
++    process.env.STUDENT_TOKEN_MAX_AGE_MS = "1000";
++    const t = await signStudentToken("stu_abc");
++    const issued = realNow();
++    Date.now = () => issued + 5000;
++    expect(await verifyStudentToken(t)).toBeNull();
++  });
++
++  test("tampered, malformed and empty tokens never verify", async () => {
++    const t = await signStudentToken("stu_abc");
++    const [p, sig] = t.split(".");
++    const forged = Buffer.from("stu_other." + Date.now()).toString("base64url");
++    expect(await verifyStudentToken(`${forged}.${sig}`)).toBeNull();
++    expect(await verifyStudentToken(`${p}.AAAA`)).toBeNull();
++    expect(await verifyStudentToken("garbage")).toBeNull();
++    expect(await verifyStudentToken("")).toBeNull();
++    expect(await verifyStudentToken(undefined)).toBeNull();
++  });
++});
+diff --git a/src/api/lib/student-token.ts b/src/api/lib/student-token.ts
+index b95e959..f5f160d 100644
+--- a/src/api/lib/student-token.ts
++++ b/src/api/lib/student-token.ts
+@@ -4,6 +4,13 @@
+ 
+ const enc = new TextEncoder();
+ 
++/** How long a student login stays valid. Default 30 days; override with STUDENT_TOKEN_MAX_AGE_MS. */
++export const STUDENT_TOKEN_DEFAULT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
++function studentTokenMaxAgeMs(): number {
++  const n = Number(process.env.STUDENT_TOKEN_MAX_AGE_MS);
++  return Number.isFinite(n) && n > 0 ? n : STUDENT_TOKEN_DEFAULT_MAX_AGE_MS;
++}
++
+ function secret(): string {
+   return process.env.BETTER_AUTH_SECRET || "examly-dev-secret-please-change";
+ }
+@@ -67,7 +74,14 @@ export async function verifyStudentToken(token: string | undefined | null): Prom
+     const ok = await crypto.subtle.verify("HMAC", key, fromB64url(sigB64) as unknown as BufferSource, payloadBytes as unknown as BufferSource);
+     if (!ok) return null;
+     const payload = new TextDecoder().decode(payloadBytes);
+-    const [studentId] = payload.split(".");
++    const [studentId, issuedRaw] = payload.split(".");
++    // Tokens used to be valid forever: one copied off a lab PC (it sits in
++    // localStorage) worked indefinitely. Now they expire; the dashboard signs the
++    // student out cleanly on the resulting 401. Generous on purpose: an exam is
++    // hours long, and a student must never be cut off mid-paper by expiry.
++    const issuedAt = Number(issuedRaw);
++    if (!Number.isFinite(issuedAt) || issuedAt <= 0) return null;
++    if (Date.now() - issuedAt > studentTokenMaxAgeMs()) return null;
+     return studentId || null;
+   } catch {
+     return null;
+diff --git a/src/web/pages/monitor.tsx b/src/web/pages/monitor.tsx
+index 9ee5074..8370e68 100644
+--- a/src/web/pages/monitor.tsx
++++ b/src/web/pages/monitor.tsx
+@@ -1,6 +1,6 @@
+ import { useState, useEffect } from "react";
+ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+-import { Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, UserX, Pause, Play, Plus, Wifi, WifiOff, RotateCcw, ShieldAlert, ShieldCheck, AlertTriangle } from "lucide-react";
++import { Activity, Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, UserX, Pause, Play, Plus, Wifi, WifiOff, RotateCcw, ShieldAlert, ShieldCheck, AlertTriangle } from "lucide-react";
+ import { api } from "../lib/api";
+ import { PageHeader } from "../components/shell";
+ import { Loader, EmptyState, Pill, Drawer } from "../components/ui";
+@@ -122,6 +122,38 @@ function ExamControls({ examId, held, extraMin }: { examId: string; held: boolea
+   );
+ }
+ 
++type MonitorHealth = { degraded: boolean; lastBuildMs: number | null; worstBuildMs: number | null; budgetMs: number; pollMs: number };
++
++/**
++ * Freeze early-warning banner. Owns the 2-second clock it needs, so the tick
++ * re-renders only this banner instead of the whole Live Monitor table.
++ */
++function LagWarning({ dataUpdatedAt, health }: { dataUpdatedAt: number; health: MonitorHealth | null | undefined }) {
++  const [now, setNow] = useState(() => Date.now());
++  useEffect(() => {
++    const t = setInterval(() => setNow(Date.now()), 2000);
++    return () => clearInterval(t);
++  }, []);
++  const staleMs = dataUpdatedAt ? now - dataUpdatedAt : 0;
++  const stale = !!dataUpdatedAt && staleMs > 15_000;
++  if (!health?.degraded && !stale) return null;
++  return (
++    <div className="card mb-4 flex items-start gap-3 border-l-4 border-l-[#c2410c] bg-[#fff7ed] p-4">
++      <AlertTriangle size={18} className="mt-0.5 shrink-0 text-[#c2410c]" />
++      <div className="text-sm text-[#7c2d12]">
++        <div className="font-semibold">
++          {stale ? "This page may be out of date" : "Live Monitor is running slow"}
++        </div>
++        <div className="mt-0.5">
++          {stale
++            ? `No successful refresh for ${Math.round(staleMs / 1000)}s. Numbers below may be stale — students are unaffected and the exam is still running normally.`
++            : `The server is taking ${health?.lastBuildMs}ms to build this view (target under ${health?.budgetMs}ms). Refreshes may start to lag. Students are unaffected.`}
++        </div>
++      </div>
++    </div>
++  );
++}
++
+ export default function Monitor() {
+   const [active, setActive] = useState<LiveStudent | null>(null);
+   const [filter, setFilter] = useState<FilterKey>("all");
+@@ -145,18 +177,7 @@ export default function Monitor() {
+   //     network stall, server gone).
+   // Either way the invigilator is told the screen may be out of date, instead of
+   // silently trusting stale numbers while an exam runs.
+-  const health = (q.data as any)?.health as
+-    | { degraded: boolean; lastBuildMs: number | null; worstBuildMs: number | null; budgetMs: number; pollMs: number }
+-    | null
+-    | undefined;
+-  const [now, setNow] = useState(() => Date.now());
+-  useEffect(() => {
+-    const t = setInterval(() => setNow(Date.now()), 2000);
+-    return () => clearInterval(t);
+-  }, []);
+-  const staleMs = q.dataUpdatedAt ? now - q.dataUpdatedAt : 0;
+-  const stale = !!q.dataUpdatedAt && staleMs > 15_000;
+-  const showLagWarning = !!health?.degraded || stale;
++  const health = (q.data as any)?.health as MonitorHealth | null | undefined;
+ 
+   function matchFilter(s: LiveStudent) {
+     if (filter === "in_progress") return s.status === "in_progress";
+@@ -170,21 +191,9 @@ export default function Monitor() {
+     <div className="rise">
+       <PageHeader eyebrow="Proctoring" title="Live Monitor" action={<Pill label="AUTO-REFRESH 5s" color="#2e7d5b" />} />
+ 
+-      {showLagWarning ? (
+-        <div className="card mb-4 flex items-start gap-3 border-l-4 border-l-[#c2410c] bg-[#fff7ed] p-4">
+-          <AlertTriangle size={18} className="mt-0.5 shrink-0 text-[#c2410c]" />
+-          <div className="text-sm text-[#7c2d12]">
+-            <div className="font-semibold">
+-              {stale ? "This page may be out of date" : "Live Monitor is running slow"}
+-            </div>
+-            <div className="mt-0.5">
+-              {stale
+-                ? `No successful refresh for ${Math.round(staleMs / 1000)}s. Numbers below may be stale — students are unaffected and the exam is still running normally.`
+-                : `The server is taking ${health?.lastBuildMs}ms to build this view (target under ${health?.budgetMs}ms). Refreshes may start to lag. Students are unaffected.`}
+-            </div>
+-          </div>
+-        </div>
+-      ) : null}
++      {/* Its own component: the 2s staleness clock used to live in this page, so
++          every tick re-rendered the whole table (~1,100 rows during a full exam). */}
++      <LagWarning dataUpdatedAt={q.dataUpdatedAt} health={health} />
+ 
+       {q.isLoading ? (
+         <Loader />
+@@ -284,7 +293,7 @@ export default function Monitor() {
+                               <td>
+                                 {s.status === "in_progress" ? (
+                                   <span className="inline-flex items-center gap-2">
+-                                    <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--brand)]"><Loader2 size={14} className="animate-spin" /> In progress</span>
++                                    <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--brand)]"><Activity size={14} /> In progress</span>
+                                     {s.online ? (
+                                       <span className="inline-flex items-center gap-1 text-xs font-medium text-[var(--color-success)]"><Wifi size={12} /> Online</span>
+                                     ) : (
+diff --git a/src/web/student/pages/exam-runner.tsx b/src/web/student/pages/exam-runner.tsx
+index ac28238..dba7937 100644
+--- a/src/web/student/pages/exam-runner.tsx
++++ b/src/web/student/pages/exam-runner.tsx
+@@ -1930,6 +1930,10 @@ function highlightCode(code: string, lang: string): string {
+ }
+ 
+ function CodeEditor({ code, language, onChange }: { code: string; language: string; onChange: (v: string) => void }) {
++  // Re-highlight only when the code or language changes: the exam screen re-renders
++  // every second for its countdown, and this re-coloured the whole program on every
++  // tick even when nothing was typed.
++  const highlighted = useMemo(() => highlightCode(code, language), [code, language]);
+   const taRef = useRef<HTMLTextAreaElement>(null);
+   const preRef = useRef<HTMLPreElement>(null);
+   const gutRef = useRef<HTMLDivElement>(null);
+@@ -1980,7 +1984,7 @@ function CodeEditor({ code, language, onChange }: { code: string; language: stri
+         {Array.from({ length: lineCount }, (_, i) => <div key={i}>{i + 1}</div>)}
+       </div>
+       <div className="ide-code">
+-        <pre className="ide-hl" ref={preRef} aria-hidden="true"><code dangerouslySetInnerHTML={{ __html: highlightCode(code, language) }} /></pre>
++        <pre className="ide-hl" ref={preRef} aria-hidden="true"><code dangerouslySetInnerHTML={{ __html: highlighted }} /></pre>
+         <textarea
+           ref={taRef}
+           className="ide-input"
+diff --git a/src/web/student/pages/shell.tsx b/src/web/student/pages/shell.tsx
+index 0ac2394..144a308 100644
+--- a/src/web/student/pages/shell.tsx
++++ b/src/web/student/pages/shell.tsx
+@@ -1,6 +1,6 @@
+ import { useEffect, useMemo, useRef, useState } from "react";
+ import { useLocation, useParams, Link } from "wouter";
+-import { api, type ExamListItem, type Review as ReviewData } from "../lib/api";
++import { api, ApiError, type ExamListItem, type Review as ReviewData } from "../lib/api";
+ import { useSession } from "../lib/session";
+ import { ChangePasswordForm } from "./change-password";
+ import { ReviewBody } from "./review";
+@@ -59,6 +59,12 @@ export function Shell() {
+       setExams(res.exams);
+       setErr("");
+     } catch (e) {
++      // The server no longer recognises this login (it expired, or the account was
++      // disabled): go back to the sign-in screen instead of an endless error card.
++      if (e instanceof ApiError && e.status === 401) {
++        logout();
++        return;
++      }
+       setErr(e instanceof Error ? e.message : "Failed to load exams");
+       setExams((prev) => prev ?? []);
+     }
+-- 
+2.43.0
+
