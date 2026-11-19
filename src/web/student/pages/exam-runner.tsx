@@ -17,10 +17,29 @@ type Alert = { id: number; text: string; tone: "danger" | "warn" };
 type RunSession = {
   attemptId: string;
   endAt: number; // absolute ms deadline (server-anchored)
+  // Earliest Submit, in THIS computer's clock (converted with the server's own
+  // time, so a lab PC whose clock is off cannot unlock Submit early).
+  submitAvailableAt?: number;
   answers: Record<string, unknown>;
   flags: Record<string, boolean>;
   integrityEvents: ProctorEvent[];
 };
+
+/** Server "submit available at" in this computer's clock (null = no minimum). */
+function localSubmitAt(info: { submitAvailableAt?: string | null; serverNow?: string | null }): number | undefined {
+  if (!info.submitAvailableAt || !info.serverNow) return undefined;
+  const skew = Date.now() - new Date(info.serverNow).getTime();
+  const at = new Date(info.submitAvailableAt).getTime() + skew;
+  return Number.isFinite(at) ? at : undefined;
+}
+
+/** Minimum writing time: Submit stays locked until then, unless the exam is nearly over. */
+const SUBMIT_UNLOCK_MARGIN_MS = 2_000;
+function submitLockedFor(s: { submitAvailableAt?: number; endAt: number } | null, nowMs: number): number {
+  if (!s?.submitAvailableAt) return 0;
+  if (s.endAt - nowMs <= 60_000) return 0;
+  return Math.max(0, s.submitAvailableAt + SUBMIT_UNLOCK_MARGIN_MS - nowMs);
+}
 
 function fmtClock(ms: number): string {
   const t = Math.max(0, Math.floor(ms / 1000));
@@ -53,7 +72,7 @@ const AUTO_SUBMIT_SPREAD_MS = 15_000;
 // network. endAt is an absolute wall-clock deadline (not a countdown), so it stays
 // honest across a reload; the online heartbeat re-reads the authoritative server
 // endAt on reconnect and corrects any drift (admin hold / extra time).
-type SavedProgress = { answers: Record<string, unknown>; flags: Record<string, boolean>; cur?: number; attemptId?: string; endAt?: number };
+type SavedProgress = { answers: Record<string, unknown>; flags: Record<string, boolean>; cur?: number; attemptId?: string; endAt?: number; submitAvailableAt?: number };
 function progressKey(examId: string) { return `examly:progress:${examId}`; }
 function saveProgress(examId: string, p: SavedProgress) {
   try {
@@ -672,15 +691,17 @@ export function ExamRunner() {
       // /start returns the server-anchored deadline already folding in any admin
       // hold time + extra minutes, so we use it directly.
       const endAt = new Date(start.endAt).getTime();
+      const submitAvailableAt = localSubmitAt(start);
       setSession({
         attemptId: start.attemptId,
         endAt,
+        submitAvailableAt,
         answers: mergedAnswers,
         flags: saved?.flags ?? {},
         integrityEvents: [],
       });
       // Persist attemptId + absolute deadline so an offline refresh can resume.
-      saveProgress(examId, { attemptId: start.attemptId, endAt, answers: mergedAnswers, flags: saved?.flags ?? {}, cur: curRef.current });
+      saveProgress(examId, { attemptId: start.attemptId, endAt, submitAvailableAt, answers: mergedAnswers, flags: saved?.flags ?? {}, cur: curRef.current });
       setHeld(!!start.held);
       enterRunning();
       // Flush the camera-check frames now that an attempt exists to hang them on.
@@ -737,6 +758,7 @@ export function ExamRunner() {
       setSession({
         attemptId: saved.attemptId,
         endAt: saved.endAt,
+        submitAvailableAt: saved.submitAvailableAt,
         answers: saved.answers ?? {},
         flags: saved.flags ?? {},
         integrityEvents: [],
@@ -768,15 +790,17 @@ export function ExamRunner() {
         const saved = loadProgress(examId);
         const merged = { ...(st.answers ?? {}), ...(saved?.answers ?? {}) };
         const endAt = new Date(st.endAt).getTime();
+        const submitAvailableAt = localSubmitAt(st);
         setSession({
           attemptId: st.attemptId,
           endAt,
+          submitAvailableAt,
           answers: merged,
           flags: saved?.flags ?? {},
           integrityEvents: [],
         });
         // Refresh the persisted attemptId + deadline from the authoritative server.
-        saveProgress(examId, { attemptId: st.attemptId, endAt, answers: merged, flags: saved?.flags ?? {}, cur: saved?.cur });
+        saveProgress(examId, { attemptId: st.attemptId, endAt, submitAvailableAt, answers: merged, flags: saved?.flags ?? {}, cur: saved?.cur });
         if (typeof saved?.cur === "number" && Number.isFinite(saved.cur)) setCur(saved.cur);
         setHeld(!!st.held);
         const cfg = proctoringRef.current;
@@ -990,15 +1014,17 @@ export function ExamRunner() {
           setGradeDone(false);
           const saved = loadProgress(examId);
           const endAt = new Date(st.endAt).getTime();
+          const submitAvailableAt = localSubmitAt(st);
           const merged = { ...(st.answers ?? {}), ...(saved?.answers ?? {}) };
           setSession({
             attemptId: st.attemptId,
             endAt,
+            submitAvailableAt,
             answers: merged,
             flags: saved?.flags ?? {},
             integrityEvents: [],
           });
-          saveProgress(examId, { attemptId: st.attemptId, endAt, answers: merged, flags: saved?.flags ?? {}, cur: saved?.cur });
+          saveProgress(examId, { attemptId: st.attemptId, endAt, submitAvailableAt, answers: merged, flags: saved?.flags ?? {}, cur: saved?.cur });
           if (typeof saved?.cur === "number" && Number.isFinite(saved.cur)) setCur(saved.cur);
           setHeld(!!st.held);
           const cfg = proctoringRef.current;
@@ -1232,6 +1258,9 @@ export function ExamRunner() {
   const doSubmit = useCallback(async (opts?: { spreadMs?: number }) => {
     const s = sessionRef.current;
     if (!s || submittedRef.current || !bundle) return;
+    // A manual Submit before the minimum writing time never leaves the exam: the
+    // camera and fullscreen stay on. (The timer's own submit passes spreadMs.)
+    if (!opts?.spreadMs && submitLockedFor(s, Date.now()) > 0) return;
     // Push any queued violations before we flip the submitted flag (after which
     // recording stops). They also ride along in the payload as a backstop.
     flushEventsRef.current();
@@ -1350,6 +1379,7 @@ export function ExamRunner() {
   // student gets a chance to unflag/revisit before finishing. Auto-submit on
   // timeout never runs through here (it calls doSubmit directly, silently).
   function handleSubmitClick() {
+    if (submitLockedFor(session, Date.now()) > 0) return;
     if (flagCount > 0) {
       const ok = window.confirm(
         `You still have ${flagCount} question${flagCount > 1 ? "s" : ""} flagged for review.\n\n` +
@@ -1777,8 +1807,8 @@ export function ExamRunner() {
                   <span><strong>{answeredCount}</strong> of {questions.length} answered</span>
                   {flagCount > 0 && <span style={{ color: "var(--color-warn)" }}><Icon name="flag" size={13} /> {flagCount} flagged for review</span>}
                 </div>
-                <button className="btn btn-primary" style={{ padding: 14, fontSize: 15 }} onClick={handleSubmitClick} disabled={submitting}>
-                  {submitting ? <Icon name="loader-circle" className="animate-spin" /> : <Icon name="send" />} Submit exam
+                <button className="btn btn-primary" style={{ padding: 14, fontSize: 15 }} onClick={handleSubmitClick} disabled={submitting || submitLockedFor(session, now) > 0} title={submitLockedFor(session, now) > 0 ? "Submit unlocks after the minimum writing time" : undefined}>
+                  {submitting ? <Icon name="loader-circle" className="animate-spin" /> : <Icon name="send" />} {submitLockedFor(session, now) > 0 ? `Submit in ${fmtClock(submitLockedFor(session, now))}` : "Submit exam"}
                 </button>
               </div>
             )}

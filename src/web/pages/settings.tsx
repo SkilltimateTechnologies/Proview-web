@@ -21,6 +21,7 @@ type ProctorConfig = {
   autoSubmitOnTimeout: boolean;
   requireSeb?: boolean;
   sebConfigKeys?: string[];
+  minSubmitMinutes?: number;
 };
 
 type SebStatus = { lastSeenAt: string | null; lastMatched: boolean | null; lastUserAgent: string | null };
@@ -187,6 +188,16 @@ export default function Settings() {
         {/* --- Timer --- */}
         <div className="text-[11px] font-semibold tracking-wide uppercase text-[var(--color-ink2)] mt-5 mb-1">Timer</div>
         <Toggle label="Auto-submit when timer hits zero" sub="Force-submit the exam the moment the countdown reaches 0. Turn off to let students keep the screen open past time." checked={pc.autoSubmitOnTimeout} onChange={(v) => setPc({ autoSubmitOnTimeout: v })} />
+        <label className="flex items-start justify-between gap-4 py-3 border-b border-[var(--color-line)]">
+          <span className="min-w-0">
+            <span className="block font-medium text-sm">Minimum time before Submit</span>
+            <span className="block text-xs text-[var(--color-ink2)] mt-0.5">Minutes a student must write before the Submit button works, counted from when they start. The exam still ends at its deadline (including for late starters). 0 turns it off.</span>
+          </span>
+          <span className="flex items-center gap-2 shrink-0">
+            <input className="input w-20" type="number" min={0} max={600} step={1} value={pc.minSubmitMinutes ?? 20} onChange={(e) => setPc({ minSubmitMinutes: Math.max(0, Math.min(600, Math.floor(Number(e.target.value) || 0))) })} />
+            <span className="mono-label">min</span>
+          </span>
+        </label>
 
         {/* --- Safe Exam Browser --- */}
         <div className="text-[11px] font-semibold tracking-wide uppercase text-[var(--color-ink2)] mt-5 mb-1">Safe Exam Browser</div>

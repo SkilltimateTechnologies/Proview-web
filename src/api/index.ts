@@ -13,7 +13,7 @@ import { checkRunSize, runLimiter } from "./lib/run-code-guard";
 import { checkSeb, isSebProtectedPath, normaliseConfigKeys, sebMonitor, SEB_REQUIRED_CODE, SEB_REQUIRED_MESSAGE } from "./lib/seb";
 import { allowedOrigins, bodyLimitFor, isAllowedOrigin, normaliseContentType, safeEqual, storedFileHeaders, UPLOAD_TYPES } from "./lib/http-guard";
 import type { SessionUser, ProfileCtx } from "./middleware/auth";
-import { id, displayId, computeYear, effectiveEndMs } from "./lib/util";
+import { id, displayId, computeYear, effectiveEndMs, submitAvailableAtMs } from "./lib/util";
 import { generateQuestions, gradeSubjective } from "./lib/ai";
 import { finalizeAttempt, hasContent } from "./lib/grade-queue";
 import { presignPut, presignGetCached, getObject } from "./lib/s3";
@@ -114,6 +114,13 @@ async function hasExamInProgress(studentId: string): Promise<boolean> {
     .limit(1);
   if (row) examInProgressCache.set(studentId, true);
   return !!row;
+}
+
+/** Minimum minutes before a student may submit (Settings → Proctoring). */
+async function minSubmitMinutes(): Promise<number> {
+  const gs = await getGlobalSettings();
+  const v = Number({ ...schema.DEFAULT_PROCTORING, ...(gs.proctoring ?? {}) }.minSubmitMinutes);
+  return Number.isFinite(v) && v > 0 ? Math.min(v, 600) : 0;
 }
 
 async function getGlobalSettings() {
@@ -2165,7 +2172,8 @@ const app = new Hono<{ Variables: Vars }>()
     for (const a of startSaved) if (a.response != null) startAnswers[a.questionId] = startTrans.toDisplay(a.questionId, a.response);
     // Absolute deadline includes admin extra-minutes + global hold time.
     const endAtMs = effectiveEndMs(exam, attempt, now);
-    return c.json({ attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), serverNow: new Date(now), durationMin: exam.durationMin, pausedMs: attempt.pausedMs ?? 0, held: !!exam.heldAt, answers: startAnswers }, 200);
+    const submitAt = submitAvailableAtMs(exam, attempt, await minSubmitMinutes(), now);
+    return c.json({ attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), submitAvailableAt: new Date(Math.min(submitAt, endAtMs)), serverNow: new Date(now), durationMin: exam.durationMin, pausedMs: attempt.pausedMs ?? 0, held: !!exam.heldAt, answers: startAnswers }, 200);
   })
 
   // Read-only status probe. Used by the client on mount to detect an in-progress
@@ -2204,7 +2212,8 @@ const app = new Hono<{ Variables: Vars }>()
       const stTrans = await answerTranslator(attempt.examId, sid, c.req.query("optionOrder"));
       const stAnswers: Record<string, unknown> = {};
       for (const a of stSaved) if (a.response != null) stAnswers[a.questionId] = stTrans.toDisplay(a.questionId, a.response);
-      return c.json({ status: "in_progress", attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), serverNow: new Date(now), held: !!exam.heldAt, answers: stAnswers }, 200);
+      const submitAt = submitAvailableAtMs(exam, attempt, await minSubmitMinutes(), now);
+      return c.json({ status: "in_progress", attemptId: attempt.id, startedAt: attempt.startedAt, endAt: new Date(endAtMs), submitAvailableAt: new Date(Math.min(submitAt, endAtMs)), serverNow: new Date(now), held: !!exam.heldAt, answers: stAnswers }, 200);
     }
     return c.json({ status: attempt.status, attemptId: attempt.id, startedAt: attempt.startedAt, endAt: null, serverNow: new Date(now), held: false, score: attempt.score }, 200);
   })
@@ -2440,6 +2449,26 @@ const app = new Hono<{ Variables: Vars }>()
     const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.id, aid), eq(schema.attempts.studentId, sid))).limit(1);
     if (!attempt) return c.json({ message: "Not found" }, 404);
     if (attempt.status === "submitted" || attempt.status === "graded") return c.json({ ok: true, alreadySubmitted: true }, 200);
+
+    // Minimum writing time (Settings → Proctoring). A submit before it is refused
+    // unless the exam's own time is (nearly) up: the timer's automatic submit at
+    // the deadline, a late starter cut short by the exam window, and the server
+    // sweep are never blocked. During an admin hold the guard stands aside too.
+    if (attempt.status === "in_progress") {
+      const nowMs = Date.now();
+      const exam = await getExamForPolling(attempt.examId);
+      if (exam) {
+        const submitAt = submitAvailableAtMs(exam, attempt, await minSubmitMinutes(), nowMs);
+        const endMs = effectiveEndMs(exam, attempt, nowMs);
+        if (nowMs < submitAt && nowMs < endMs - 60_000 && !exam.heldAt) {
+          const mins = Math.ceil((submitAt - nowMs) / 60_000);
+          return c.json(
+            { ok: false, code: "too_early", submitAvailableAt: new Date(submitAt), message: `You can submit after ${mins} more minute${mins === 1 ? "" : "s"}. Keep working on your answers.` },
+            409,
+          );
+        }
+      }
+    }
 
     const body = await c.req.json().catch(() => ({}));
     const rawResp: { questionId: string; response: unknown }[] = Array.isArray(body.answers) ? body.answers : [];
@@ -3892,6 +3921,9 @@ const app = new Hono<{ Variables: Vars }>()
       const cur = await getGlobalSettings();
       const next = { ...schema.DEFAULT_PROCTORING, ...(cur.proctoring ?? {}), ...b.proctoring };
       next.sebConfigKeys = normaliseConfigKeys(next.sebConfigKeys);
+      // Whole minutes, 0 (off) to 600. Junk or an empty box keeps the default.
+      const m = Math.floor(Number(next.minSubmitMinutes));
+      next.minSubmitMinutes = Number.isFinite(m) && m >= 0 ? Math.min(m, 600) : schema.DEFAULT_PROCTORING.minSubmitMinutes;
       next.requireSeb = next.requireSeb === true;
       patch.proctoring = next;
     }
