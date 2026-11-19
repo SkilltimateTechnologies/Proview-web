@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { auth } from "../auth";
 import { db } from "../database";
 import * as schema from "../database/schema";
+import { AuthCache, type CachedIdentity } from "../lib/auth-cache";
 
 export type SessionUser = {
   id: string;
@@ -31,16 +32,18 @@ export type ProfileCtx = {
  */
 const STUDENT_PATH = /^\/api\/student\//;
 
-export const authMiddleware = createMiddleware(async (c, next) => {
-  if (STUDENT_PATH.test(c.req.path)) {
-    c.set("user", null);
-    c.set("profile", null);
-    return next();
-  }
-  const session = await auth.api.getSession({ headers: c.req.raw.headers });
+/**
+ * Identity is cached for a few seconds per credential set (see lib/auth-cache.ts):
+ * it used to cost 3 database statements on EVERY staff request, including each
+ * 5-second Live Monitor poll. Exported so account-changing writes can invalidate.
+ */
+export const authCache = new AuthCache<SessionUser, ProfileCtx>(Number(process.env.AUTH_CACHE_MS) || 10_000);
+
+async function loadIdentity(headers: Headers): Promise<CachedIdentity<SessionUser, ProfileCtx>> {
+  const session = await auth.api.getSession({ headers });
   const user = (session?.user ?? null) as SessionUser | null;
-  c.set("user", user);
   let profile: ProfileCtx | null = null;
+  let defaultTenantId: string | null = null;
   if (user) {
     const [p] = await db.select().from(schema.profiles).where(eq(schema.profiles.userId, user.id));
     if (p) {
@@ -51,9 +54,28 @@ export const authMiddleware = createMiddleware(async (c, next) => {
         enabled: p.enabled,
         permissions: p.permissions ?? null,
       };
+      // A super admin with no college of their own: remember the sole tenant (if
+      // there is exactly one) so the per-request default below needs no query.
+      if (p.role === "super_admin" && !p.tenantId) {
+        const ts = await db.select({ id: schema.tenants.id }).from(schema.tenants).limit(2);
+        if (ts.length === 1) defaultTenantId = ts[0].id;
+      }
     }
   }
-  // Super admin may scope to a specific college via X-Tenant-Id header.
+  return { user, profile, defaultTenantId };
+}
+
+export const authMiddleware = createMiddleware(async (c, next) => {
+  if (STUDENT_PATH.test(c.req.path)) {
+    c.set("user", null);
+    c.set("profile", null);
+    return next();
+  }
+  const key = AuthCache.keyOf(c.req.header("authorization"), c.req.header("cookie"));
+  const { user, profile, defaultTenantId } = await authCache.resolve(key, () => loadIdentity(c.req.raw.headers));
+  c.set("user", user);
+  // Super admin may scope to a specific college via X-Tenant-Id header. `profile`
+  // is a per-request copy, so this never leaks into another request.
   if (profile && profile.role === "super_admin") {
     const scope = c.req.header("x-tenant-id");
     if (scope) {
@@ -62,8 +84,7 @@ export const authMiddleware = createMiddleware(async (c, next) => {
       // No explicit scope yet (e.g. first paint before the college switcher
       // has resolved). Default to the sole tenant when exactly one exists so
       // analytics/lists populate instead of returning an empty payload.
-      const ts = await db.select({ id: schema.tenants.id }).from(schema.tenants).limit(2);
-      if (ts.length === 1) profile.tenantId = ts[0].id;
+      if (defaultTenantId) profile.tenantId = defaultTenantId;
     }
   }
   c.set("profile", profile);

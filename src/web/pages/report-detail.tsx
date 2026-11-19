@@ -2,7 +2,6 @@ import { useState, useEffect, useRef, type CSSProperties } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, Link } from "wouter";
 import { ArrowLeft, Download, ChevronRight, Check, X, Sparkles, Lightbulb, MoreVertical, UserX, Trash2, FileText, FileSpreadsheet, Files, ChevronDown, Loader2, ShieldAlert, VideoOff, MonitorX, Maximize, Copy, EyeOff, Camera } from "lucide-react";
-import JSZip from "jszip";
 import { api, getScope } from "../lib/api";
 import { getBearer } from "../lib/auth";
 import { useSession } from "../lib/session";
@@ -225,6 +224,8 @@ export default function ReportDetail() {
     const targets = sectionRows.filter((r) => !r.absent);
     if (targets.length === 0) { alert("No appeared students to export in this section."); return; }
     const { generateStudentReport } = await import("../lib/pdf/student-report");
+    // Loaded on demand: 97 KB that only a bulk download needs.
+    const { default: JSZip } = await import("jszip");
     const zip = new JSZip();
     setBulk({ done: 0, total: targets.length });
     let done = 0;
@@ -776,6 +777,8 @@ function SnapshotsPanel({ shots, label }: { shots: IntegrityRow[]; label: string
     setZipping(true);
     setDone(0);
     try {
+      // Loaded on demand: 97 KB that only a bulk download needs.
+      const { default: JSZip } = await import("jszip");
       const zip = new JSZip();
       const lines = [`Webcam snapshot trail — ${label}`, `${asc.length} frames`, ""];
       for (let i = 0; i < asc.length; i++) {

@@ -10,7 +10,7 @@
  * is recomputed and the attempt flips to "graded".
  */
 import { and, eq, inArray, notInArray, sql as dsql } from "drizzle-orm";
-import { db } from "../database";
+import { db, runInLane } from "../database";
 import * as schema from "../database/schema";
 import { gradeSubjective } from "./ai";
 import {
@@ -240,9 +240,14 @@ export function queueAttemptGrading(attemptId: string, provider?: string | null)
         if (res.done) await completeGradeJobByAttempt(db, attemptId).catch(() => {});
       }
     : () => gradeAttempt(attemptId, provider);
-  pass()
-    .catch((e) => console.error(`[grade-queue] attempt ${attemptId} failed:`, e))
-    .finally(() => inFlight.delete(attemptId));
+  // Background lane: this is usually called from inside a student's submit
+  // request, and AI grading must never take database slots from students who are
+  // still writing (see database/lanes.ts).
+  runInLane("background", () =>
+    pass()
+      .catch((e) => console.error(`[grade-queue] attempt ${attemptId} failed:`, e))
+      .finally(() => inFlight.delete(attemptId)),
+  );
 }
 
 /**
@@ -458,11 +463,21 @@ export async function finalizeAttempt(
   respArr: { questionId: string; response: unknown }[],
   provider: string | null,
   examRow?: typeof schema.exams.$inferSelect | null,
+  /**
+   * The exam's paper (exam_questions in order + question rows), when the caller
+   * already holds it — the submit route passes its per-exam cache so the final
+   * bell does not re-read the same paper once per student. Read here otherwise.
+   */
+  paper?: { eqs: (typeof schema.examQuestions.$inferSelect)[]; qs: (typeof schema.questions.$inferSelect)[] },
 ): Promise<{ score: number; status: "submitted" | "graded"; gradeAt: number | null }> {
   const aid = attempt.id;
-  const eqs = await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, attempt.examId)).orderBy(schema.examQuestions.order);
+  const eqs = paper
+    ? paper.eqs
+    : await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, attempt.examId)).orderBy(schema.examQuestions.order);
   const qids = eqs.map((q) => q.questionId);
-  const qs = qids.length ? await db.select().from(schema.questions).where(inArray(schema.questions.id, qids)) : [];
+  const qs = paper
+    ? paper.qs
+    : qids.length ? await db.select().from(schema.questions).where(inArray(schema.questions.id, qids)) : [];
   const qById = new Map(qs.map((q) => [q.id, q]));
   const pointsById = new Map(eqs.map((e) => [e.questionId, e.points]));
 
@@ -603,11 +618,13 @@ export async function finalizeAttempt(
     const now = Date.now();
     const delayMs = gradeReleaseDelayMs(exam, now);
     gradeAt = delayMs > 0 ? now + delayMs : null;
-    const queued = await recordGradeJob(aid, attempt.examId, delayMs);
-    // Grade in-process only when there is nothing to wait for, or when the durable
-    // queue is unavailable. In the second case grading now is worse for load but
-    // strictly better than a paper nobody ever grades.
-    if (!queued || delayMs === 0) queueAttemptGrading(aid, provider);
+    await recordGradeJob(aid, attempt.examId, delayMs);
+    // Grade in-process only when there is nothing to wait for. AI grading NEVER
+    // starts while the exam window is still open — not even when the durable queue
+    // is unavailable: the attempt stays `submitted`, and the reconcile sweep
+    // (sweepPendingGrading, every 10 minutes) picks it up once the release time
+    // has passed. Before, a degraded queue graded on the spot, mid-exam.
+    if (delayMs === 0) queueAttemptGrading(aid, provider);
   }
   return { score: scorePct, status, gradeAt };
 }
@@ -905,9 +922,17 @@ export async function sweepPendingGrading() {
         // Still has ungraded content. With the durable queue this is just "make
         // sure a job row exists" — the worker owns the retry schedule. Without it,
         // fall back to grading in-process as before.
+        const releaseIn = gradeReleaseDelayMs(reconcileExamById.get(a.examId), reconcileNow);
         if (jobsAvailable) {
-          await recordGradeJob(a.id, a.examId, gradeReleaseDelayMs(reconcileExamById.get(a.examId), reconcileNow));
-        } else queueAttemptGrading(a.id, provider);
+          await recordGradeJob(a.id, a.examId, releaseIn);
+        } else if (releaseIn === 0) {
+          queueAttemptGrading(a.id, provider);
+        } else {
+          // In-memory fallback and the exam is still open: leave it for a later
+          // sweep rather than grading in the middle of the exam.
+          skipped++;
+          continue;
+        }
         queued++;
         continue;
       }

@@ -91,8 +91,10 @@ export function Shell() {
       .filter((t) => t > now)
       .sort((a, b) => a - b)[0];
     if (nextStart == null) return;
-    // +500ms cushion so the server has definitely crossed startAt when we refetch.
-    const delay = Math.min(nextStart - now + 500, 2_147_000_000);
+    // +500ms cushion so the server has definitely crossed startAt when we refetch,
+    // plus a random 0–3s so a hall of waiting students does not refetch in the
+    // same instant (every one of them used to, at exactly startAt + 500ms).
+    const delay = Math.min(nextStart - now + 500 + Math.random() * 3000, 2_147_000_000);
     const t = setTimeout(() => void loadRef.current(), delay);
     return () => clearTimeout(t);
   }, [exams]);

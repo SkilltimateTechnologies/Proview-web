@@ -312,3 +312,40 @@ trip. Only *relative* server cost is meaningful, and that caveat belongs in ever
 - Details and limitations: `task-bulk-password-reset.md`. Main implementation:
   `src/api/lib/bulk-student-passwords.ts`, `src/api/routes/bulk-student-passwords.ts`,
   `src/web/components/bulk-password-reset.tsx`, `src/web/pages/users.tsx`.
+
+## 12. Exam-day stability: the "everything hangs" fix (2026-11-19)
+
+**Symptom:** under exam load the app — students AND the admin console — hung.
+**Cause** `[measured, stand-in database speaking the real libSQL HTTP protocol]`: the
+whole process shared ONE `@libsql/client` with the library defaults — 20 statements at
+a time, an unbounded queue behind them, and no deadline on any statement. Synchronized
+moments (start bell, timer zero) queued thousands of statements and every request
+waited behind them; 20 unanswered database requests froze every DB-backed endpoint for
+~5 minutes while `/api/health` stayed green.
+
+**What changed** (no schema change, no migration, no data rewritten):
+
+- `database/lanes.ts`: separate pools for `student` / `admin` / `background` work
+  (48/16/8), chosen per request via AsyncLocalStorage; 15s deadline on every DB request.
+  Kill switch `DB_LANES=off`. Per-lane `pending`/`peakPending`/`timeouts` on `/api/health`.
+- Staff identity cached 10s (`lib/auth-cache.ts`, per-request copies; invalidated on
+  sign-out and staff-account writes). Was 3 statements per admin request.
+- gzip on API JSON > 1 KB (monitor 294 KB → ~22 KB per poll).
+- Live Monitor reads only the attempt columns it uses and no longer signs a snapshot
+  URL per student (the page never showed it; field kept as `null`).
+- Per-exam paper cache for `/bundle` and submit; 5s tenant cache for `/student/exams`
+  (dropped after any exam/roster/register write). Duplicate concurrent submits for one
+  attempt share one finalize.
+- AI grading never starts while the exam window is open — also in the degraded
+  (in-memory) queue path, which used to grade on the spot.
+- Client: timer-zero auto-submit spread over 15s (screen locked first); no heartbeat
+  retries; start-time refetch jittered 0–3s. Student bundle 924 KB → 331 KB (explicit
+  icon map, guarded by `ui.test.ts`); admin pages and JSZip load on demand.
+- `/api/__diag` now super-admin only.
+
+**Measured before → after** (1,100 simulated students + an admin, `[measured]`):
+start bell at 50 ms DB — admin pages max 19.9 s → 1.8 s, bundle p50 18.1 s → 0.1 s,
+start p50 8.2 s → 2.8 s; timer zero — submit p95 14.7 s → 4.8 s, admin max 11.8 s →
+1.4 s; 20 dropped DB requests — 5-minute freeze → the 20 affected requests fail at 15s,
+admin unaffected. Data check after 1,102 submits: 15/15 answers each, 0 duplicates,
+0 blank overwrites, all grading jobs deferred past close.
