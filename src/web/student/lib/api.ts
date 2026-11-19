@@ -212,7 +212,7 @@ export const api = {
     // two more times tripled this, the highest-volume call, exactly when the
     // server could least absorb it (measured: 2,326 retries in 90 s at 50 ms DB).
     req<HeartbeatInfo>(`/student/heartbeat/${examId}`, { method: "POST" }, { retries: 0, timeoutMs: 10000 }),
-  exams: () => req<{ exams: ExamListItem[]; student: { id: string; name: string; rollNo: string; email: string | null } }>("/student/exams"),
+  exams: () => req<{ exams: ExamListItem[]; serverNow?: string; student: { id: string; name: string; rollNo: string; email: string | null } }>("/student/exams"),
   // Read-only, and the paper is what the student came for: retry hard. A failed
   // bundle fetch falls back to the localStorage cache, so this only has to win
   // on a student's FIRST sitting — where there is no cache to fall back to.

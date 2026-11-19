@@ -1967,7 +1967,8 @@ const app = new Hono<{ Variables: Vars }>()
         attempt: a ? { id: a.id, status: a.status, score: a.score, submittedAt: a.submittedAt } : null,
       };
     });
-    return c.json({ exams, student: { id: stu.id, name: stu.name, rollNo: stu.rollNo, email: stu.email } }, 200);
+    // serverNow lets the waiting room count down on the server's clock, not the PC's.
+    return c.json({ exams, serverNow: new Date(), student: { id: stu.id, name: stu.name, rollNo: stu.rollNo, email: stu.email } }, 200);
   })
 
   // Full exam bundle for offline download: all questions with options (no answers).
