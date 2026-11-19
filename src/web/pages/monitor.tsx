@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, UserX, Pause, Play, Plus, Wifi, WifiOff, RotateCcw, ShieldAlert, ShieldCheck, AlertTriangle } from "lucide-react";
+import { Activity, Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, UserX, Pause, Play, Plus, Wifi, WifiOff, RotateCcw, ShieldAlert, ShieldCheck, AlertTriangle } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Drawer } from "../components/ui";
@@ -122,6 +122,38 @@ function ExamControls({ examId, held, extraMin }: { examId: string; held: boolea
   );
 }
 
+type MonitorHealth = { degraded: boolean; lastBuildMs: number | null; worstBuildMs: number | null; budgetMs: number; pollMs: number };
+
+/**
+ * Freeze early-warning banner. Owns the 2-second clock it needs, so the tick
+ * re-renders only this banner instead of the whole Live Monitor table.
+ */
+function LagWarning({ dataUpdatedAt, health }: { dataUpdatedAt: number; health: MonitorHealth | null | undefined }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 2000);
+    return () => clearInterval(t);
+  }, []);
+  const staleMs = dataUpdatedAt ? now - dataUpdatedAt : 0;
+  const stale = !!dataUpdatedAt && staleMs > 15_000;
+  if (!health?.degraded && !stale) return null;
+  return (
+    <div className="card mb-4 flex items-start gap-3 border-l-4 border-l-[#c2410c] bg-[#fff7ed] p-4">
+      <AlertTriangle size={18} className="mt-0.5 shrink-0 text-[#c2410c]" />
+      <div className="text-sm text-[#7c2d12]">
+        <div className="font-semibold">
+          {stale ? "This page may be out of date" : "Live Monitor is running slow"}
+        </div>
+        <div className="mt-0.5">
+          {stale
+            ? `No successful refresh for ${Math.round(staleMs / 1000)}s. Numbers below may be stale — students are unaffected and the exam is still running normally.`
+            : `The server is taking ${health?.lastBuildMs}ms to build this view (target under ${health?.budgetMs}ms). Refreshes may start to lag. Students are unaffected.`}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Monitor() {
   const [active, setActive] = useState<LiveStudent | null>(null);
   const [filter, setFilter] = useState<FilterKey>("all");
@@ -145,18 +177,7 @@ export default function Monitor() {
   //     network stall, server gone).
   // Either way the invigilator is told the screen may be out of date, instead of
   // silently trusting stale numbers while an exam runs.
-  const health = (q.data as any)?.health as
-    | { degraded: boolean; lastBuildMs: number | null; worstBuildMs: number | null; budgetMs: number; pollMs: number }
-    | null
-    | undefined;
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 2000);
-    return () => clearInterval(t);
-  }, []);
-  const staleMs = q.dataUpdatedAt ? now - q.dataUpdatedAt : 0;
-  const stale = !!q.dataUpdatedAt && staleMs > 15_000;
-  const showLagWarning = !!health?.degraded || stale;
+  const health = (q.data as any)?.health as MonitorHealth | null | undefined;
 
   function matchFilter(s: LiveStudent) {
     if (filter === "in_progress") return s.status === "in_progress";
@@ -170,21 +191,9 @@ export default function Monitor() {
     <div className="rise">
       <PageHeader eyebrow="Proctoring" title="Live Monitor" action={<Pill label="AUTO-REFRESH 5s" color="#2e7d5b" />} />
 
-      {showLagWarning ? (
-        <div className="card mb-4 flex items-start gap-3 border-l-4 border-l-[#c2410c] bg-[#fff7ed] p-4">
-          <AlertTriangle size={18} className="mt-0.5 shrink-0 text-[#c2410c]" />
-          <div className="text-sm text-[#7c2d12]">
-            <div className="font-semibold">
-              {stale ? "This page may be out of date" : "Live Monitor is running slow"}
-            </div>
-            <div className="mt-0.5">
-              {stale
-                ? `No successful refresh for ${Math.round(staleMs / 1000)}s. Numbers below may be stale — students are unaffected and the exam is still running normally.`
-                : `The server is taking ${health?.lastBuildMs}ms to build this view (target under ${health?.budgetMs}ms). Refreshes may start to lag. Students are unaffected.`}
-            </div>
-          </div>
-        </div>
-      ) : null}
+      {/* Its own component: the 2s staleness clock used to live in this page, so
+          every tick re-rendered the whole table (~1,100 rows during a full exam). */}
+      <LagWarning dataUpdatedAt={q.dataUpdatedAt} health={health} />
 
       {q.isLoading ? (
         <Loader />
@@ -284,7 +293,7 @@ export default function Monitor() {
                               <td>
                                 {s.status === "in_progress" ? (
                                   <span className="inline-flex items-center gap-2">
-                                    <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--brand)]"><Loader2 size={14} className="animate-spin" /> In progress</span>
+                                    <span className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--brand)]"><Activity size={14} /> In progress</span>
                                     {s.online ? (
                                       <span className="inline-flex items-center gap-1 text-xs font-medium text-[var(--color-success)]"><Wifi size={12} /> Online</span>
                                     ) : (

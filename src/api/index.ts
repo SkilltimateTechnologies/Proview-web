@@ -26,9 +26,10 @@ import { attemptOwners } from "./lib/attempt-owner";
 import { attemptTenants, concurrencyGate, evidenceMeter, resolveLimit, tenantQuotas } from "./lib/tenant-quota";
 import { EMPTY_ROLLUP, loadAttemptRollups, rollupAvg } from "./lib/report-rollup";
 import { TenantDirectory } from "./lib/tenant-directory";
+import { assignableRoles, canChangeRole, canManageStaff, inCollege } from "./lib/staff-policy";
 import { createBulkStudentPasswords } from "./lib/bulk-student-passwords";
 import { bulkResetHandler } from "./routes/bulk-student-passwords";
-import { examEffStatus, isConcluded, isReportable, toMs, type StatusExam } from "./lib/exam-status";
+import { examEffStatus, isConcluded, isReportable, resultsUnlocked, toMs, type StatusExam } from "./lib/exam-status";
 
 type Vars = { user: SessionUser | null; profile: ProfileCtx | null };
 
@@ -621,6 +622,25 @@ async function getMonitorSnapshot(tid: string): Promise<MonitorSnapshot> {
   return task;
 }
 
+/**
+ * Which college owns a record, for the cross-college check (lib/staff-policy.ts
+ * `inCollege`). `undefined` = no such record. Several edit/delete endpoints used to
+ * look a record up by id alone, so staff of one college could change another
+ * college's exams, students, sections or questions just by knowing an id.
+ */
+async function tenantOf(kind: "exam" | "student" | "class" | "category" | "question", id: string): Promise<string | undefined> {
+  const t =
+    kind === "exam" ? schema.exams
+    : kind === "student" ? schema.students
+    : kind === "class" ? schema.classes
+    : kind === "category" ? schema.categories
+    : schema.questions;
+  const [row] = await db.select({ tenantId: t.tenantId }).from(t).where(eq(t.id, id)).limit(1);
+  return row?.tenantId;
+}
+/** 404 (not 403) for another college's record, so ids cannot be probed for existence. */
+const NOT_FOUND = { message: "Not found" } as const;
+
 const bulkStudentPasswords = createBulkStudentPasswords({
   db,
   secret: () => process.env.BETTER_AUTH_SECRET ?? "",
@@ -1118,7 +1138,14 @@ const app = new Hono<{ Variables: Vars }>()
       const n = Math.floor(Number(b[k]));
       b[k] = b[k] === null || b[k] === "" || !Number.isFinite(n) || n <= 0 ? null : n;
     }
-    const [t] = await db.update(schema.tenants).set(b).where(eq(schema.tenants.id, tid)).returning();
+    // Only known, editable columns: the body used to go to the database as-is, so a
+    // request could rewrite any column (id, slug, createdAt...).
+    const tenantPatch: Record<string, unknown> = {};
+    for (const k of ["name", "shortName", "slug", "primaryColor", "logoUrl", "enabled", "maxConcurrentAttempts", "maxEvidencePerAttempt"] as const) {
+      if (b[k] !== undefined) tenantPatch[k] = b[k];
+    }
+    if (Object.keys(tenantPatch).length === 0) return c.json({ message: "Nothing to update" }, 400);
+    const [t] = await db.update(schema.tenants).set(tenantPatch).where(eq(schema.tenants.id, tid)).returning();
     // Apply the new ceiling immediately rather than at the next cache expiry, and
     // latch "an override exists" so it is honoured even with no global default.
     tenantQuotas.invalidate(tid);
@@ -1169,13 +1196,21 @@ const app = new Hono<{ Variables: Vars }>()
     const actor = c.get("profile")!;
     const b = await c.req.json();
     const tenantId = actor.role === "super_admin" ? (b.tenantId ?? actor.tenantId) : actor.tenantId;
+    // The role used to be taken from the body unchecked, so any TPO with the `users`
+    // permission could create a super admin. Only roles the caller may hand out are
+    // accepted (lib/staff-policy.ts), and it is checked BEFORE the login is created.
+    const role = String(b.role ?? "tpo");
+    if (!assignableRoles({ userId: actor.userId, role: actor.role, tenantId: actor.tenantId }).includes(role)) {
+      return c.json({ message: "You are not allowed to create an account with that role." }, 403);
+    }
+    if (role !== "super_admin" && !tenantId) return c.json({ message: "Choose a college for this account." }, 400);
     // create auth user
     const res = await auth.api.signUpEmail({ body: { email: b.email, password: b.password, name: b.name } });
     const newUserId = (res as { user?: { id: string } }).user?.id;
     if (!newUserId) return c.json({ message: "Failed to create user" }, 400);
     const [cnt] = await db.select({ n: dsql<number>`count(*)` }).from(schema.profiles);
     const defaultPerms =
-      b.role === "tpo"
+      role === "tpo"
         ? (b.permissions ?? { dashboard: true, liveMonitor: true, reports: true })
         : null;
     const [prof] = await db
@@ -1183,7 +1218,7 @@ const app = new Hono<{ Variables: Vars }>()
       .values({
         userId: newUserId,
         tenantId,
-        role: b.role, // tpo | student (super_admin seeded only)
+        role,
         displayId: displayId("USR", (cnt?.n ?? 0) + 1),
         phone: b.phone ?? null,
         permissions: defaultPerms,
@@ -1193,11 +1228,21 @@ const app = new Hono<{ Variables: Vars }>()
   })
   .patch("/users/:id", requireAuth, requirePermission("users"), async (c) => {
     const uid = c.req.param("id");
+    const me = c.get("profile")!;
     const b = await c.req.json();
+    // Whose account, and what role: see lib/staff-policy.ts. Without these checks a
+    // TPO could promote any account (their own included) to super admin.
+    const [target] = await db.select().from(schema.profiles).where(eq(schema.profiles.userId, uid)).limit(1);
+    if (!target) return c.json({ message: "User not found" }, 404);
+    if (!canManageStaff(me, target)) return c.json({ message: "Not allowed" }, 403);
+    if (b.role !== undefined && b.role !== target.role && !canChangeRole(me, target, String(b.role))) {
+      return c.json({ message: "You are not allowed to give this account that role." }, 403);
+    }
+    if (b.enabled === false && uid === me.userId) return c.json({ message: "You cannot disable your own account." }, 400);
     const patch: Record<string, unknown> = {};
     if (b.enabled !== undefined) patch.enabled = b.enabled;
     if (b.permissions !== undefined) patch.permissions = b.permissions;
-    if (b.role !== undefined) patch.role = b.role;
+    if (b.role !== undefined) patch.role = String(b.role);
     if (b.phone !== undefined) patch.phone = b.phone;
     if (Object.keys(patch).length) await db.update(schema.profiles).set(patch).where(eq(schema.profiles.userId, uid));
     const userPatch: Record<string, unknown> = {};
@@ -1213,6 +1258,12 @@ const app = new Hono<{ Variables: Vars }>()
   })
   .post("/users/:id/reset-password", requireAuth, requirePermission("users"), async (c) => {
     const uid = c.req.param("id");
+    const me = c.get("profile")!;
+    // This returns the new password in the response, so it must never work on an
+    // account the caller does not manage (it used to work on the super admin).
+    const [target] = await db.select().from(schema.profiles).where(eq(schema.profiles.userId, uid)).limit(1);
+    if (!target) return c.json({ message: "User not found" }, 404);
+    if (!canManageStaff(me, target)) return c.json({ message: "Not allowed" }, 403);
     const b = await c.req.json();
     const newPassword: string = b.password && String(b.password).length >= 8 ? b.password : "Welcome@123";
     const hash = await hashPassword(newPassword);
@@ -1230,8 +1281,8 @@ const app = new Hono<{ Variables: Vars }>()
     const [target] = await db.select().from(schema.profiles).where(eq(schema.profiles.userId, uid));
     if (!target) return c.json({ message: "User not found" }, 404);
     if (target.role === "super_admin") return c.json({ message: "The super admin account cannot be deleted." }, 403);
-    // Non-super-admins can only delete users within their own tenant.
-    if (me.role !== "super_admin" && target.tenantId !== me.tenantId) return c.json({ message: "Not allowed" }, 403);
+    // Own college only, and never an account that outranks the caller.
+    if (!canManageStaff(me, target)) return c.json({ message: "Not allowed" }, 403);
     // Remove auth rows first (session, credential account), then profile, then user.
     await db.delete(schema.session).where(eq(schema.session.userId, uid));
     await db.delete(schema.account).where(eq(schema.account.userId, uid));
@@ -1269,6 +1320,7 @@ const app = new Hono<{ Variables: Vars }>()
   })
   .patch("/classes/:id", requireAuth, requirePermission("users"), async (c) => {
     const cid = c.req.param("id");
+    if (!inCollege(c.get("profile"), await tenantOf("class", cid))) return c.json(NOT_FOUND, 404);
     const b = await c.req.json();
     const sec = String(b.section ?? "").trim();
     const code = sec ? `${b.branch}-${sec}` : String(b.branch).trim();
@@ -1285,6 +1337,7 @@ const app = new Hono<{ Variables: Vars }>()
   })
   .delete("/classes/:id", requireAuth, requirePermission("users"), async (c) => {
     const cid = c.req.param("id");
+    if (!inCollege(c.get("profile"), await tenantOf("class", cid))) return c.json(NOT_FOUND, 404);
     // Unassign any students in this section, then delete it. Students promoted OUT of
     // this section keep their originalClassId pointer, so clear those too to avoid
     // dangling references breaking "restore to original section".
@@ -1465,6 +1518,7 @@ const app = new Hono<{ Variables: Vars }>()
   })
   .patch("/students/:id", requireAuth, requirePermission("users"), async (c) => {
     const sid = c.req.param("id");
+    if (!inCollege(c.get("profile"), await tenantOf("student", sid))) return c.json(NOT_FOUND, 404);
     const b = await c.req.json();
     const patch: Record<string, unknown> = {};
     for (const k of ["name", "rollNo", "email", "classId", "enabled"]) {
@@ -1628,6 +1682,7 @@ const app = new Hono<{ Variables: Vars }>()
 
   .post("/students/:id/reset-password", requireAuth, requirePermission("users"), async (c) => {
     const sid = c.req.param("id");
+    if (!inCollege(c.get("profile"), await tenantOf("student", sid))) return c.json(NOT_FOUND, 404);
     const b = await c.req.json();
     const newPassword: string = b.password && String(b.password).length >= 6 ? String(b.password) : "Welcome@123";
     await db.update(schema.students).set({ password: await hashPassword(newPassword), mustChangePassword: true }).where(eq(schema.students.id, sid));
@@ -1767,10 +1822,10 @@ const app = new Hono<{ Variables: Vars }>()
       // start) is still just upcoming — never auto-treated as live.
       else if (e.status === "live" || (startMs && now >= startMs)) phase = "available";
       else phase = "upcoming";
-      // Results stay locked until the exam closes for everyone — either the
-      // admin flipped it to "finished", or its deadline has passed. This stops
-      // early finishers from leaking the answer key to students still writing.
-      const resultsReady = e.status === "finished" || (endMs != null && now > endMs);
+      // Results stay locked until the exam closes for everyone — admin finished it,
+      // or the window INCLUDING extra time and holds has closed (lib/exam-status).
+      // This stops early finishers leaking the answer key to students still writing.
+      const resultsReady = resultsUnlocked(e, now);
       return {
         id: e.id,
         title: e.title,
@@ -2322,10 +2377,9 @@ const app = new Hono<{ Variables: Vars }>()
     const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.id, aid), eq(schema.attempts.studentId, sid))).limit(1);
     if (!attempt) return c.json({ message: "Not found" }, 404);
     const [exam] = await db.select().from(schema.exams).where(eq(schema.exams.id, attempt.examId)).limit(1);
-    // Gate results until the exam closes for everyone (admin finished it, or the
-    // deadline passed) — prevents early finishers leaking the answer key.
-    const endMs = exam?.endAt ? new Date(exam.endAt).getTime() : null;
-    const resultsReady = exam?.status === "finished" || (endMs != null && Date.now() > endMs);
+    // Gate results until the exam closes for everyone, extra time and holds
+    // included — prevents early finishers leaking the answer key (lib/exam-status).
+    const resultsReady = !!exam && resultsUnlocked(exam);
     if (!resultsReady) return c.json({ message: "Results are locked until this exam closes. Please check back later." }, 403);
     const ans = await db.select().from(schema.answers).where(eq(schema.answers.attemptId, aid));
     const aMap = new Map(ans.map((a) => [a.questionId, a]));
@@ -2453,6 +2507,7 @@ const app = new Hono<{ Variables: Vars }>()
     return c.json({ category: row }, 201);
   })
   .patch("/categories/:id", requireAuth, requirePermission("questionBank"), async (c) => {
+    if (!inCollege(c.get("profile"), await tenantOf("category", c.req.param("id")))) return c.json(NOT_FOUND, 404);
     const b = await c.req.json();
     const [row] = await db
       .update(schema.categories)
@@ -2463,6 +2518,7 @@ const app = new Hono<{ Variables: Vars }>()
   })
   .delete("/categories/:id", requireAuth, requirePermission("questionBank"), async (c) => {
     const cid = c.req.param("id");
+    if (!inCollege(c.get("profile"), await tenantOf("category", cid))) return c.json(NOT_FOUND, 404);
     // Detach questions from this category (keep the questions).
     await db.update(schema.questions).set({ categoryId: null }).where(eq(schema.questions.categoryId, cid));
     await db.delete(schema.categories).where(eq(schema.categories.id, cid));
@@ -2520,6 +2576,7 @@ const app = new Hono<{ Variables: Vars }>()
     return c.json({ question: row }, 201);
   })
   .patch("/questions/:id", requireAuth, requirePermission("questionBank"), async (c) => {
+    if (!inCollege(c.get("profile"), await tenantOf("question", c.req.param("id")))) return c.json(NOT_FOUND, 404);
     const b = await c.req.json();
     const patch: Record<string, unknown> = {};
     for (const k of ["type", "prompt", "options", "correct", "meta", "points", "difficulty", "topic", "isGlobal", "categoryId"]) {
@@ -2537,6 +2594,7 @@ const app = new Hono<{ Variables: Vars }>()
     return c.json({ question: row }, 200);
   })
   .delete("/questions/:id", requireAuth, requirePermission("questionBank"), async (c) => {
+    if (!inCollege(c.get("profile"), await tenantOf("question", c.req.param("id")))) return c.json(NOT_FOUND, 404);
     await db.delete(schema.questions).where(eq(schema.questions.id, c.req.param("id")));
     examQuestionsCache.clear();
     examPaperCache.clear();
@@ -2657,6 +2715,7 @@ const app = new Hono<{ Variables: Vars }>()
   })
   .patch("/exams/:id", requireAuth, requirePermission("exams"), async (c) => {
     const eid = c.req.param("id");
+    if (!inCollege(c.get("profile"), await tenantOf("exam", eid))) return c.json(NOT_FOUND, 404);
     const b = await c.req.json();
     const patch: Record<string, unknown> = {};
     for (const k of ["title", "status", "durationMin"]) if (b[k] !== undefined) patch[k] = b[k];
@@ -2773,7 +2832,7 @@ const app = new Hono<{ Variables: Vars }>()
   .post("/exams/:id/hold", requireAuth, requirePermission("exams"), async (c) => {
     const eid = c.req.param("id");
     const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
-    if (!ex) return c.json({ message: "Not found" }, 404);
+    if (!ex || !inCollege(c.get("profile"), ex.tenantId)) return c.json({ message: "Not found" }, 404);
     if (!ex.heldAt) await db.update(schema.exams).set({ heldAt: new Date() }).where(eq(schema.exams.id, eid));
     invalidateExam(eid);
     return c.json({ ok: true, held: true }, 200);
@@ -2783,7 +2842,7 @@ const app = new Hono<{ Variables: Vars }>()
   .post("/exams/:id/unhold", requireAuth, requirePermission("exams"), async (c) => {
     const eid = c.req.param("id");
     const [ex] = await db.select().from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
-    if (!ex) return c.json({ message: "Not found" }, 404);
+    if (!ex || !inCollege(c.get("profile"), ex.tenantId)) return c.json({ message: "Not found" }, 404);
     if (ex.heldAt) {
       const elapsed = Math.max(0, Date.now() - new Date(ex.heldAt).getTime());
       await db.update(schema.exams).set({ heldAt: null, holdMs: (ex.holdMs ?? 0) + elapsed }).where(eq(schema.exams.id, eid));
@@ -2794,6 +2853,7 @@ const app = new Hono<{ Variables: Vars }>()
   // Grant extra minutes to the whole exam (shifts every deadline forward).
   .post("/exams/:id/extra-time", requireAuth, requirePermission("exams"), async (c) => {
     const eid = c.req.param("id");
+    if (!inCollege(c.get("profile"), await tenantOf("exam", eid))) return c.json(NOT_FOUND, 404);
     const b = await c.req.json().catch(() => ({}));
     let minutes = Number(b.minutes);
     if (!Number.isFinite(minutes)) minutes = 0;
@@ -3089,7 +3149,15 @@ const app = new Hono<{ Variables: Vars }>()
       return isFinished && inPeriod(e);
     });
     const examIds = finishedExams.map((e) => e.id);
-    const atts = examIds.length ? await db.select().from(schema.attempts).where(inArray(schema.attempts.examId, examIds)) : [];
+    // Only the three columns the dashboard uses. Full attempt rows (user agent,
+    // timestamps, flags) for every attempt of every finished exam were read on each
+    // load — 2,520 wide rows today, growing with every exam.
+    const atts = examIds.length
+      ? await db
+          .select({ examId: schema.attempts.examId, studentId: schema.attempts.studentId, score: schema.attempts.score })
+          .from(schema.attempts)
+          .where(inArray(schema.attempts.examId, examIds))
+      : [];
     const graded = atts.filter((a) => a.score != null);
 
     const avg = graded.length ? graded.reduce((s, a) => s + (a.score ?? 0), 0) / graded.length : 0;
@@ -3240,9 +3308,28 @@ const app = new Hono<{ Variables: Vars }>()
     // Same rule as the /reports list: gate on DERIVED status, not the raw column, or a
     // TPO who can see a conducted exam in the list gets a 403 when opening it.
     if (p.role === "tpo" && !isConcluded(ex)) return c.json({ message: "Report not available until finished" }, 403);
-    const atts = await db.select().from(schema.attempts).where(eq(schema.attempts.examId, eid));
-    // Total questions on the exam so the report can show "answered N/total".
-    const totalQuestions = (await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, eid))).length;
+    // Only the columns the report uses (the user-agent column alone is up to 300
+    // characters per row).
+    const atts = await db
+      .select({
+        id: schema.attempts.id,
+        studentId: schema.attempts.studentId,
+        sectionSnapshot: schema.attempts.sectionSnapshot,
+        score: schema.attempts.score,
+        status: schema.attempts.status,
+        submittedAt: schema.attempts.submittedAt,
+        disconnected: schema.attempts.disconnected,
+        answeredCount: schema.attempts.answeredCount,
+      })
+      .from(schema.attempts)
+      .where(eq(schema.attempts.examId, eid));
+    // Total questions on the exam so the report can show "answered N/total" —
+    // counted by the database instead of shipping every exam_questions row back.
+    const [qCount] = await db
+      .select({ n: dsql<number>`count(*)` })
+      .from(schema.examQuestions)
+      .where(eq(schema.examQuestions.examId, eid));
+    const totalQuestions = Number(qCount?.n ?? 0);
     // Directory cache. This report used to read all 1,124 students and every class
     // on EVERY open, purely to label attempt rows with a name and a section code.
     const studentIdx = await directory.studentIndex(p.tenantId!);
