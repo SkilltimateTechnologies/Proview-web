@@ -2,6 +2,15 @@ import { StrictMode, Suspense, lazy } from "react";
 import { createRoot } from "react-dom/client";
 import { Router } from "wouter";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+/* Fonts are bundled and served from our own origin. They used to come from
+ * Google Fonts through an @import at the top of styles.css, which holds back the
+ * first paint until fonts.googleapis.com answers: on a lab network or inside the
+ * Safe Exam Browser's URL filter that request can stall, and the login page
+ * stayed blank. These files get hashed names, so they are cached as immutable. */
+import "@fontsource-variable/inter/wght.css";
+import "@fontsource-variable/jetbrains-mono/wght.css";
+import "@fontsource/instrument-serif/400.css";
+import "@fontsource/instrument-serif/400-italic.css";
 import "./styles.css";
 import { StudentApp } from "./student";
 import { ErrorBoundary } from "./components/error-boundary";

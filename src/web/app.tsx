@@ -1,6 +1,5 @@
 import { Suspense, lazy } from "react";
 import { Route, Switch } from "wouter";
-import { AgentFeedback } from "@runablehq/website-runtime";
 import { SessionProvider, useSession } from "./lib/session";
 import { Shell } from "./components/shell";
 import { Loader } from "./components/ui";
@@ -62,7 +61,6 @@ function App() {
   return (
     <SessionProvider>
       <Protected />
-      {import.meta.env.DEV && <AgentFeedback />}
     </SessionProvider>
   );
 }

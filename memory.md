@@ -57,7 +57,7 @@ Tables `[from code]`: `tenants`, `profiles`, `classes`, `students`, `categories`
 Env keys `[from code, .env]`: `DATABASE_URL`, `DATABASE_AUTH_TOKEN`, `S3_ENDPOINT`,
 `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `AI_GATEWAY_BASE_URL`,
 `AI_GATEWAY_API_KEY`, `BETTER_AUTH_SECRET`, `AUTUMN_SECRET_KEY`, `WEBSITE_URL`,
-`APPLICATION_ID`, `RUNABLE_URL`, `VITE_*`.
+`VITE_*`.
 
 ## 3. Non-negotiable rules of this codebase
 
@@ -379,3 +379,39 @@ Merge after the exam. Review write-up: Claude Docs "Proview — full code review
   highlight memoized.
 - Rejected on review: an AI output-token cap (reasoning models count hidden thinking against
   it and could return nothing — grading 0). A faster highlighter (no measurable gain).
+
+## 14. Review round 3 (2026-11-19, branch `fix/review-round-7`)
+
+- **Coding answers with test cases are graded by running them** (`lib/test-grading.ts`). A coding
+  question whose `meta.tests` holds `{ input, expected }` pairs runs every test through Judge0 after the
+  exam with `meta.timeLimitSec` (default 2 s); score = points x passed / total; `ai_notes` lists the
+  failures. Output compare ignores line endings, trailing spaces and trailing blank lines. A Judge0
+  outage throws `RunnerUnavailable` so the answer stays ungraded and retries; it is never scored 0.
+  Without tests (or without a Judge0 key) the AI grades the code as before. Tests never reach students:
+  the paper ships only `language` + `starter`. The question editor has a test-case section.
+- **Judge0 queue priority** (`lib/judge0-queue.ts`): `priority: "background"` jobs (grading) run only
+  when no student run is waiting, at most `JUDGE0_MAX_BG_INFLIGHT` (2) batches. Jobs may carry
+  `cpuTimeLimit` / `wallTimeLimit` / `memoryLimitKb`.
+- **Run code limits** (`lib/run-code-guard.ts`): needs an attempt in progress, code and stdin capped
+  at 64k chars, one run at a time per student, 30 runs per 5 minutes. `judge0Used` is never enforced
+  as a hard block (it is a lifetime counter; blocking would switch off Run code mid-exam).
+- **Question lists carry slim meta** (`lib/question-meta.ts`): no rubric/solution/tests, only
+  `testCount` / `hasRubric`. The editor loads `GET /questions/:id`. `PATCH /questions/:id` refuses a
+  meta that still has the list markers (409), so a list copy can never erase rubrics or tests.
+- **Optional "Require Safe Exam Browser"** (`lib/seb.ts`, Settings → Proctoring): checks
+  `X-SafeExamBrowser-ConfigKeyHash = SHA-256(url + Config Key)` on `/api/student/*` and
+  `/api/students/verify-login`. Off by default; never enforced with zero keys; keys are stripped from
+  everything students receive. Lab test: `/api/student/seb-check` and the "Last SEB request" line in
+  Settings. Stored in `settings.proctoring` (JSON, no migration).
+- **Server guards** (`lib/http-guard.ts`): CORS and better-auth trusted origins are an allow-list
+  (live domain + `WEBSITE_URL` + `RAILWAY_PUBLIC_DOMAIN` + `ALLOWED_ORIGINS`; localhost outside
+  production). Body limits by Content-Length: student 2 MB, staff 5 MB, bulk imports 20 MB, Bun ceiling
+  25 MB. Uploads: images and PDF only; `/api/files` serves anything else as a sandboxed download.
+- **`/api/health`** is `{ status }` for everyone; the internals need a super-admin session or the
+  `x-health-token` header matching `HEALTH_TOKEN` (scripts/verify-scale.py sends it from the env).
+- **Fonts are bundled** (@fontsource, served from /assets as immutable). The Google Fonts `@import`
+  blocked first paint and could leave the SEB login page blank on a stalled network.
+- **Service worker**: a page load falls back to the saved shell after 6 s with no answer; only real
+  HTML pages refresh the saved shell.
+- Runable template leftovers removed (analytics script + plugin, runtime package, jsdom).
+  `tsconfig.node.json` now declares the DOM lib itself (it used to arrive via `@types/jsdom`).

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Sparkles, Trash2, Check, FolderOpen, ArrowLeft, Pencil, Library } from "lucide-react";
+import { Plus, Sparkles, Trash2, Check, FolderOpen, ArrowLeft, Pencil, Library, X } from "lucide-react";
 import { api } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Field, Drawer, RadioBox, usePagination, Pager } from "../components/ui";
@@ -276,7 +276,7 @@ function CategoryView({ cat, onBack, onDelete }: { cat: Cat; onBack: () => void;
 
       {mode === "manual" && <ManualForm categoryId={cat.id} onClose={() => { setMode("none"); refresh(); }} />}
       {mode === "ai" && <AIGenForm categoryId={cat.id} onClose={() => { setMode("none"); refresh(); }} />}
-      {editing && <ManualForm categoryId={cat.id} initial={editing} onClose={() => { setEditing(null); refresh(); }} />}
+      {editing && <EditQuestion categoryId={cat.id} id={editing.id} onClose={() => { setEditing(null); refresh(); }} />}
 
       {allQuestions.length > 0 && (
         <div className="flex flex-col sm:flex-row gap-3 mb-4">
@@ -361,6 +361,32 @@ function CategoryView({ cat, onBack, onDelete }: { cat: Cat; onBack: () => void;
   );
 }
 
+/**
+ * The list carries only a summary of each question's meta (no rubric, solution or
+ * test cases), so editing loads the full question first. Saving the list copy
+ * would erase those fields; the server refuses that too.
+ */
+function EditQuestion({ categoryId, id, onClose }: { categoryId: string; id: string; onClose: () => void }) {
+  const full = useQuery({
+    queryKey: ["question", id],
+    queryFn: async () => {
+      const res = await api.questions[":id"].$get({ param: { id } });
+      if (!res.ok) throw new Error("Could not load this question. Try again.");
+      return ((await res.json()) as { question: Q }).question;
+    },
+    staleTime: 0,
+    gcTime: 0,
+  });
+  if (full.data) return <ManualForm categoryId={categoryId} initial={full.data} onClose={onClose} />;
+  return (
+    <Drawer eyebrow="Question" title="Edit question" onClose={onClose} width="max-w-3xl">
+      {full.isError ? <div role="alert" className="text-sm text-[var(--color-danger)]">{(full.error as Error).message}</div> : <Loader />}
+    </Drawer>
+  );
+}
+
+type CodeTestRow = { input: string; expected: string };
+
 function ManualForm({ categoryId, initial, onClose }: { categoryId: string; initial?: Q; onClose: () => void }) {
   const qc = useQueryClient();
   const initCorrect = (): number[] => {
@@ -382,6 +408,12 @@ function ManualForm({ categoryId, initial, onClose }: { categoryId: string; init
   const [codeLangId, setCodeLangId] = useState<number>((initial?.meta as any)?.languageId ?? 71);
   const codeLang = CODE_LANGS.find((l) => l.id === codeLangId) ?? CODE_LANGS[0];
   const [starter, setStarter] = useState<string>((initial?.meta as any)?.starter ?? "");
+  const [tests, setTests] = useState<CodeTestRow[]>(() => {
+    const raw = (initial?.meta as any)?.tests;
+    return Array.isArray(raw) ? raw.map((t: any) => ({ input: String(t?.input ?? ""), expected: String(t?.expected ?? "") })) : [];
+  });
+  const [timeLimitSec, setTimeLimitSec] = useState<number>(Number((initial?.meta as any)?.timeLimitSec) || 2);
+  const setTest = (i: number, patch: Partial<CodeTestRow>) => setTests((prev) => prev.map((t, j) => (j === i ? { ...t, ...patch } : t)));
 
   const hasOptions = ["mcq", "multi", "fillblank"].includes(type);
 
@@ -404,11 +436,28 @@ function ManualForm({ categoryId, initial, onClose }: { categoryId: string; init
         meta: {
           ...(initial?.meta ?? {}),
           explanation: explanation.trim() || undefined,
-          ...(type === "coding" ? { language: codeLang.hl, languageId: codeLang.id, languageLabel: codeLang.label, starter: starter || undefined } : {}),
+          ...(type === "coding"
+            ? {
+                language: codeLang.hl,
+                languageId: codeLang.id,
+                languageLabel: codeLang.label,
+                starter: starter || undefined,
+                // Test cases with an expected output; none = AI grades the code.
+                tests: tests.filter((t) => t.expected.trim()).length ? tests.filter((t) => t.expected.trim()) : undefined,
+                timeLimitSec: tests.some((t) => t.expected.trim()) ? timeLimitSec : undefined,
+              }
+            : {}),
         },
       };
-      if (initial) return (await api.questions[":id"].$patch({ param: { id: initial.id }, json })).json();
-      return (await api.questions.$post({ json })).json();
+      const res = initial
+        ? await api.questions[":id"].$patch({ param: { id: initial.id }, json })
+        : await api.questions.$post({ json });
+      // A refused save used to close the drawer as if it had worked.
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { message?: string };
+        throw new Error(body.message || `Could not save (error ${res.status}).`);
+      }
+      return res.json();
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ["questions", categoryId] }); onClose(); },
   });
@@ -516,6 +565,38 @@ function ManualForm({ categoryId, initial, onClose }: { categoryId: string; init
           <div className="text-sm text-[var(--color-ink2)] bg-[var(--color-brand-soft)] rounded-lg px-3 py-2">
             The student's IDE loads in <b>{codeLang.label}</b> and runs against Judge0. Tip: add starter code that reads the input (e.g. <code className="font-mono">input()</code>) so students only write the logic — click <b>Insert input template</b> above.
           </div>
+
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <div className="mono-label">Test cases · hidden from students</div>
+              <div className="flex items-center gap-2">
+                <span className="mono-label">Time limit</span>
+                <input className="input w-20" type="number" min={1} max={10} step={1} value={timeLimitSec} onChange={(e) => setTimeLimitSec(Math.min(10, Math.max(1, Number(e.target.value) || 2)))} />
+                <span className="mono-label">s / test</span>
+              </div>
+            </div>
+            <div className="text-sm text-[var(--color-ink2)] mb-2">
+              {tests.some((t) => t.expected.trim())
+                ? <>After the exam, each student's program runs on every test; the score is the share of tests whose output matches. Trailing spaces and blank lines are ignored.</>
+                : <>No test cases: the AI grades this code by reading it. Add test cases to grade it like a coding contest.</>}
+            </div>
+            <div className="space-y-2">
+              {tests.map((t, i) => (
+                <div key={i} className="rounded-lg border border-[var(--color-line)] p-2.5">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="mono-label">Test {i + 1}</span>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => setTests((prev) => prev.filter((_, j) => j !== i))} aria-label={`Remove test ${i + 1}`}><X size={13} /> Remove</button>
+                  </div>
+                  <div className="grid sm:grid-cols-2 gap-2">
+                    <textarea className="input font-mono text-[12px]" rows={4} value={t.input} onChange={(e) => setTest(i, { input: e.target.value })} placeholder="Input (stdin)" spellCheck={false} />
+                    <textarea className="input font-mono text-[12px]" rows={4} value={t.expected} onChange={(e) => setTest(i, { expected: e.target.value })} placeholder="Expected output" spellCheck={false} />
+                  </div>
+                  {(t.input.length > 20000 || t.expected.length > 20000) && <div className="mono-label mt-1">{Math.round((t.input.length + t.expected.length) / 1024)} KB</div>}
+                </div>
+              ))}
+            </div>
+            <button type="button" className="btn btn-ghost btn-sm mt-2" onClick={() => setTests((prev) => [...prev, { input: "", expected: "" }])}><Plus size={13} /> Add test case</button>
+          </div>
         </div>
       )}
 
@@ -550,6 +631,7 @@ function ManualForm({ categoryId, initial, onClose }: { categoryId: string; init
           {save.isPending ? "Saving…" : initial ? "Save changes" : "Save question"}
         </button>
       </div>
+      {save.isError && <div role="alert" className="mt-3 text-sm text-[var(--color-danger)]">{(save.error as Error).message}</div>}
     </Drawer>
   );
 }

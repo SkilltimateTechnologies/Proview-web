@@ -6,6 +6,7 @@ import { startAutoSubmitSweep, startGradeQueue } from "./api/lib/grade-queue";
 import { heartbeats } from "./api/lib/heartbeat-queue";
 import { backups } from "./api/lib/backups-runtime";
 import { db, runInLane } from "./api/database";
+import { BODY_LIMITS } from "./api/lib/http-guard";
 import { ensureDatabaseInvariants, ensureRequiredColumns } from "./api/database/invariants";
 import {
 	CompressedAssets,
@@ -171,6 +172,9 @@ const server = Bun.serve({
   // body — which is exactly what students saw as "Request failed (502)". 255s is
   // Bun's max and comfortably covers the worst-case synchronous run-code time.
   idleTimeout: 255,
+  // Hard ceiling for any request body (per-route limits are enforced in the API,
+  // see lib/http-guard.ts). Bun's default is 128 MB.
+  maxRequestBodySize: BODY_LIMITS.ceiling,
   async fetch(request) {
     const url = new URL(request.url);
 

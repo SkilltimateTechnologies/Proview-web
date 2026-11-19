@@ -83,7 +83,7 @@ export async function gradeSubjective(opts: {
     ? `You are grading a student's code (${language || "unknown language"}) written in a browser-based exam IDE.
 
 READ THIS GRADING CONTEXT CAREFULLY — IT OVERRIDES YOUR DEFAULT INSTINCTS:
-- The exam IDE has NO standard input (stdin). Students are REQUIRED to hardcode / declare their own sample values (e.g. n = 121) to demonstrate their logic. This is correct, expected exam practice.
+- Students may declare their own sample values (e.g. n = 121) instead of reading standard input, to demonstrate their logic. This is accepted exam practice.
   * NEVER deduct marks for hardcoded values, a declared variable instead of input(), or "not taking user input / not being general / reusability". Treat a hardcoded value EXACTLY as if it were valid user input.
 - Grade ONLY on whether the core algorithm / logic is CORRECT and would produce the right result for the problem.
 - If the logic correctly solves what the question asks, award FULL marks (${maxPoints} out of ${maxPoints}) — even if it does not handle uncommon edge cases (negative numbers, empty input, zero, very large values, etc.). Do NOT invent edge-case requirements. Only require an edge case if the QUESTION TEXT explicitly demands it.

@@ -425,6 +425,10 @@ export type ProctorConfig = {
   requireSingleScreen: boolean;    // block exam if more than one display is connected
   blockScreenshots: boolean;       // trap PrintScreen / Win+Shift+S screenshot shortcuts
   autoSubmitOnTimeout: boolean;    // force-submit the moment the exam timer reaches 0
+  // Optional (JSON field, no migration): refuse the exam API unless the request
+  // comes from Safe Exam Browser running one of these configs (lib/seb.ts).
+  requireSeb?: boolean;
+  sebConfigKeys?: string[];        // SEB Config Keys (64 hex), never sent to students
 };
 
 export const DEFAULT_PROCTORING: ProctorConfig = {
@@ -442,4 +446,6 @@ export const DEFAULT_PROCTORING: ProctorConfig = {
   requireSingleScreen: true,
   blockScreenshots: true,
   autoSubmitOnTimeout: true,
+  requireSeb: false,
+  sebConfigKeys: [],
 };

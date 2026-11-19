@@ -8,6 +8,10 @@ import { db, dbConfig, dbStats, runInLane } from "./database";
 import * as schema from "./database/schema";
 import { INDEX_STATE, REQUIRED_COLUMNS, REQUIRED_PERF_INDEXES, REQUIRED_UNIQUE_INDEXES } from "./database/invariants";
 import { authCache, authMiddleware, requireAuth, requireSuperAdmin, requirePermission } from "./middleware/auth";
+import { listMeta } from "./lib/question-meta";
+import { checkRunSize, runLimiter } from "./lib/run-code-guard";
+import { checkSeb, isSebProtectedPath, normaliseConfigKeys, sebMonitor, SEB_REQUIRED_CODE, SEB_REQUIRED_MESSAGE } from "./lib/seb";
+import { allowedOrigins, bodyLimitFor, isAllowedOrigin, normaliseContentType, safeEqual, storedFileHeaders, UPLOAD_TYPES } from "./lib/http-guard";
 import type { SessionUser, ProfileCtx } from "./middleware/auth";
 import { id, displayId, computeYear, effectiveEndMs } from "./lib/util";
 import { generateQuestions, gradeSubjective } from "./lib/ai";
@@ -95,6 +99,23 @@ const directory = new TenantDirectory<StudentRow, ClassRow>({
 
 /** Platform-global settings live in a single row (id = "global"). */
 const GLOBAL_SETTINGS = "global";
+/**
+ * Whether a student is writing an exam right now ("Run code" is allowed only
+ * then). Positive answers are cached briefly; a negative answer is re-checked on
+ * the next run, so a student who just started is never refused for long.
+ */
+const examInProgressCache = new TtlCache<boolean>(60_000, Date.now, 20_000);
+async function hasExamInProgress(studentId: string): Promise<boolean> {
+  if (examInProgressCache.get(studentId)) return true;
+  const [row] = await db
+    .select({ id: schema.attempts.id })
+    .from(schema.attempts)
+    .where(and(eq(schema.attempts.status, "in_progress"), eq(schema.attempts.studentId, studentId)))
+    .limit(1);
+  if (row) examInProgressCache.set(studentId, true);
+  return !!row;
+}
+
 async function getGlobalSettings() {
   return settingsCache.load(GLOBAL_SETTINGS, async () => {
     let [s] = await db.select().from(schema.settings).where(eq(schema.settings.id, GLOBAL_SETTINGS));
@@ -660,9 +681,38 @@ const bulkStudentPasswords = createBulkStudentPasswords({
  */
 const STUDENT_LANE_PATH = /^\/api\/(student\/|students\/verify-login$|register\/)/;
 
+/** Browser origins allowed to call the API (see lib/http-guard.ts). */
+const ALLOWED_ORIGINS = allowedOrigins(process.env);
+
 const app = new Hono<{ Variables: Vars }>()
+  // Refuse an oversized body before anything reads it. Bun's own ceiling
+  // (server.ts) covers requests that send no Content-Length.
+  .use(async (c, next) => {
+    const len = Number(c.req.header("content-length") ?? 0);
+    if (len > 0 && len > bodyLimitFor(c.req.path)) {
+      return c.json({ message: "This request is too large." }, 413);
+    }
+    return next();
+  })
   .use((c, next) => runInLane(STUDENT_LANE_PATH.test(c.req.path) ? "student" : "admin", next))
-  .use(cors({ origin: (origin) => origin ?? "*", credentials: true, exposeHeaders: ["set-auth-token"] }))
+  // Optional "Require Safe Exam Browser" (Settings → Proctoring, lib/seb.ts). Off
+  // by default; with no Config Keys entered it never refuses anyone, so it cannot
+  // lock every student out by accident.
+  .use(async (c, next) => {
+    if (!isSebProtectedPath(c.req.path)) return next();
+    const gs = await getGlobalSettings();
+    const pc = { ...schema.DEFAULT_PROCTORING, ...(gs.proctoring ?? {}) };
+    const keys = normaliseConfigKeys(pc.sebConfigKeys);
+    const check = checkSeb({ requestUrl: c.req.url, headers: c.req.raw.headers, keys, websiteUrl: process.env.WEBSITE_URL });
+    sebMonitor.record(check, c.req.header("user-agent") ?? null);
+    if (pc.requireSeb && keys.length && !check.matched) {
+      return c.json({ ok: false, code: SEB_REQUIRED_CODE, message: SEB_REQUIRED_MESSAGE }, 403);
+    }
+    return next();
+  })
+  // Only our own site may make credentialed cross-origin calls. This used to echo
+  // back ANY origin with credentials allowed.
+  .use(cors({ origin: (origin) => (isAllowedOrigin(origin, ALLOWED_ORIGINS) ? origin : null), credentials: true, exposeHeaders: ["set-auth-token"] }))
   // gzip large JSON reads (GET only). NOT hono/compress: it needs the web
   // CompressionStream, which production's older Bun lacks — it 500'd every API
   // call. See lib/gzip-json.ts.
@@ -700,13 +750,23 @@ const app = new Hono<{ Variables: Vars }>()
     const inv = INDEX_STATE;
     const monitor = monitorTiming();
     const badExams = failingExamChecks();
+    // Anyone may ask whether the server is up; only a signed-in super admin (or a
+    // caller holding HEALTH_TOKEN, for scripts) sees the internals: database
+    // counters, runtime version, backup state, exam checks.
+    const p = c.get("profile");
+    const token = process.env.HEALTH_TOKEN;
+    const sent = c.req.header("x-health-token");
+    const detailed = (p?.role === "super_admin" && p.enabled) || (!!token && !!sent && safeEqual(sent, token));
     if (inv.checkedAt && !inv.ok) {
-      return c.json({ status: "degraded", invariants: inv, monitor, examChecks: badExams }, 503);
+      return detailed
+        ? c.json({ status: "degraded", invariants: inv, monitor, examChecks: badExams }, 503)
+        : c.json({ status: "degraded" }, 503);
     }
     // A slow Live Monitor or an exam that finished with bad data is reported but
     // does NOT 503: the exam server is still serving students correctly and must
     // stay in the load balancer. It shows up as "warn" for whoever is looking.
     const warn = monitor.degraded || badExams.length > 0;
+    if (!detailed) return c.json({ status: warn ? "warn" : "ok" }, 200);
     return c.json(
       {
         status: warn ? "warn" : "ok",
@@ -891,8 +951,12 @@ const app = new Hono<{ Variables: Vars }>()
   // ---- file upload presign (client -> tigris directly) ----
   .post("/upload/presign", requireAuth, async (c) => {
     const { name, contentType } = await c.req.json();
-    const key = `uploads/${Date.now()}-${id()}-${(name ?? "file").replace(/[^\w.-]/g, "_")}`;
-    const url = await presignPut(key, contentType ?? "application/octet-stream");
+    // Uploads are served back from our own origin (/api/files), so only types that
+    // cannot run script are accepted: images and PDFs.
+    const type = normaliseContentType(contentType);
+    if (!UPLOAD_TYPES.has(type)) return c.json({ message: "Only PNG, JPEG, WebP, GIF or PDF files can be uploaded." }, 400);
+    const key = `uploads/${Date.now()}-${id()}-${String(name ?? "file").slice(0, 120).replace(/[^\w.-]/g, "_")}`;
+    const url = await presignPut(key, type);
     // Tigris objects are not public-read (raw endpoint URL returns 403), so we
     // serve uploads through our own same-origin proxy route below.
     return c.json({ url, key, publicUrl: `/api/files/${key}` }, 200);
@@ -944,7 +1008,9 @@ const app = new Hono<{ Variables: Vars }>()
       // Cast: transformToByteArray gives Uint8Array<ArrayBufferLike>, Hono wants
       // an ArrayBuffer-backed view. Same bytes, no copy.
       return c.body(buf as unknown as Uint8Array<ArrayBuffer>, 200, {
-        "Content-Type": out.ContentType ?? "application/octet-stream",
+        // Images and PDFs show inline; anything else downloads in a sandbox and can
+        // never render as a page on our origin (lib/http-guard.ts).
+        ...storedFileHeaders(out.ContentType),
         // `private`: the response is authorised per-session, so shared/proxy
         // caches must never hold a copy. Browser caching is still fine —
         // object keys are content-addressed and never rewritten.
@@ -1950,7 +2016,9 @@ const app = new Hono<{ Variables: Vars }>()
     }
 
     const gs = await getGlobalSettings();
-    const proctoring = { ...schema.DEFAULT_PROCTORING, ...(gs.proctoring ?? {}) };
+    // The SEB Config Keys stay on the server: a student holding them could forge
+    // the SEB header from an ordinary browser.
+    const { sebConfigKeys: _sebKeys, ...proctoring } = { ...schema.DEFAULT_PROCTORING, ...(gs.proctoring ?? {}) };
     return c.json({
       exam: { id: exam.id, title: exam.title, durationMin: exam.durationMin, totalPoints: exam.totalPoints, startAt: exam.startAt, endAt: exam.endAt },
       questions: shuffled,
@@ -2367,6 +2435,8 @@ const app = new Hono<{ Variables: Vars }>()
     const sid = await verifyStudentToken(c.req.header("x-student-token"));
     if (!sid) return c.json({ message: "Unauthorized" }, 401);
     const aid = c.req.param("attemptId");
+    // Submitting ends "Run code" for this student (see hasExamInProgress).
+    examInProgressCache.invalidate(sid);
     const [attempt] = await db.select().from(schema.attempts).where(and(eq(schema.attempts.id, aid), eq(schema.attempts.studentId, sid))).limit(1);
     if (!attempt) return c.json({ message: "Not found" }, 404);
     if (attempt.status === "submitted" || attempt.status === "graded") return c.json({ ok: true, alreadySubmitted: true }, 200);
@@ -2421,6 +2491,7 @@ const app = new Hono<{ Variables: Vars }>()
     // wait for, i.e. graded already or grading now). The client uses it to decide
     // whether to keep polling for a score: with grading held until after the exam
     // closes, a fast poll would burn 40 reads per student and never see "graded".
+    examInProgressCache.invalidate(sid);
     return c.json({ ok: true, attemptId: aid, score, status, gradeAt }, 200);
   })
 
@@ -2481,6 +2552,16 @@ const app = new Hono<{ Variables: Vars }>()
 
   // Run a student's code against Judge0 (RapidAPI) — lets them test before submit.
   // Returns stdout / stderr / compile output; never reveals hidden test cases.
+  // Lab check for the SEB switch: open /api/student/seb-check inside the Proview
+  // SEB client to see whether this server recognises it. Reveals no keys.
+  .get("/student/seb-check", async (c) => {
+    const gs = await getGlobalSettings();
+    const pc = { ...schema.DEFAULT_PROCTORING, ...(gs.proctoring ?? {}) };
+    const keys = normaliseConfigKeys(pc.sebConfigKeys);
+    const check = checkSeb({ requestUrl: c.req.url, headers: c.req.raw.headers, keys, websiteUrl: process.env.WEBSITE_URL });
+    sebMonitor.record(check, c.req.header("user-agent") ?? null);
+    return c.json({ safeExamBrowser: check.seb, configRecognised: check.matched, required: !!pc.requireSeb && keys.length > 0, keysConfigured: keys.length }, 200);
+  })
   .post("/student/run-code", async (c) => {
     const sid = await verifyStudentToken(c.req.header("x-student-token"));
     if (!sid) return c.json({ message: "Unauthorized" }, 401);
@@ -2489,6 +2570,12 @@ const app = new Hono<{ Variables: Vars }>()
     const language = String(b.language ?? "python").toLowerCase();
     const stdin = b.stdin != null ? String(b.stdin) : "";
     if (!source.trim()) return c.json({ ok: false, message: "Write some code before running." }, 400);
+    const size = checkRunSize(source, stdin);
+    if (!size.ok) return c.json({ ok: false, message: size.message }, size.status);
+    // Runs are paid executions from one shared quota: only during an exam.
+    if (!(await hasExamInProgress(sid))) {
+      return c.json({ ok: false, message: "Code can only be run while you are writing an exam." }, 403);
+    }
 
     // Judge0 CE language IDs (compatible across RapidAPI CE and self-hosted CE).
     const LANG: Record<string, number> = {
@@ -2513,10 +2600,18 @@ const app = new Hono<{ Variables: Vars }>()
     // together (<=10 req/s), batches runs (<=20) into single HTTP calls, polls
     // each batch, and retries transient failures with backoff. The student's
     // request stays synchronous — it just waits in line (bounded by MAX_WAIT_MS).
-    const result = await judge0Queue.run(
-      { source, languageId, stdin },
-      () => resolveJudge0Config(key),
-    );
+    // One run at a time per student, and a cap per few minutes (lib/run-code-guard.ts).
+    const slot = runLimiter.start(sid);
+    if (!slot.ok) return c.json({ ok: false, message: slot.message }, slot.status);
+    let result;
+    try {
+      result = await judge0Queue.run(
+        { source, languageId, stdin },
+        () => resolveJudge0Config(key),
+      );
+    } finally {
+      runLimiter.finish(sid);
+    }
 
     if (!result.ok) {
       return c.json({ ok: false, message: result.message ?? "Couldn't run your code. Try again." }, (result.httpStatus ?? 502) as never);
@@ -2599,11 +2694,24 @@ const app = new Hono<{ Variables: Vars }>()
       .orderBy(desc(schema.questions.createdAt));
     const questions = rows.map((r) => ({
       ...r.q,
+      // Lists carry a summary of meta only: rubrics, reference solutions and test
+      // cases can be tens of KB per question, and the exam builder loads every
+      // question visible to the college. The editor fetches the full question
+      // (GET /questions/:id) when it opens.
+      meta: listMeta(r.q.meta),
       categoryName: r.catName ?? null,
       ownedByOther: r.q.tenantId !== tid,
       ownerName: r.q.tenantId !== tid ? r.ownerName ?? null : null,
     }));
     return c.json({ questions }, 200);
+  })
+  // One question with its full meta (rubric, solution, test cases), for the editor.
+  .get("/questions/:id", requireAuth, requirePermission("questionBank"), async (c) => {
+    const p = c.get("profile")!;
+    const [q] = await db.select().from(schema.questions).where(eq(schema.questions.id, c.req.param("id"))).limit(1);
+    // Same visibility as the list: own college's questions plus global ones.
+    if (!q || (p.role !== "super_admin" && q.tenantId !== p.tenantId && !q.isGlobal)) return c.json(NOT_FOUND, 404);
+    return c.json({ question: { ...q, ownedByOther: q.tenantId !== p.tenantId } }, 200);
   })
   .post("/questions", requireAuth, requirePermission("questionBank"), async (c) => {
     const p = c.get("profile")!;
@@ -2633,6 +2741,11 @@ const app = new Hono<{ Variables: Vars }>()
   .patch("/questions/:id", requireAuth, requirePermission("questionBank"), async (c) => {
     if (!inCollege(c.get("profile"), await tenantOf("question", c.req.param("id")))) return c.json(NOT_FOUND, 404);
     const b = await c.req.json();
+    // A list copy of meta (see listMeta) lacks the rubric, solution and tests;
+    // saving it back would erase them. The editor always loads the full question.
+    if (b.meta && typeof b.meta === "object" && ("testCount" in b.meta || "hasRubric" in b.meta)) {
+      return c.json({ message: "This copy of the question is incomplete. Reload the page and edit again." }, 409);
+    }
     const patch: Record<string, unknown> = {};
     for (const k of ["type", "prompt", "options", "correct", "meta", "points", "difficulty", "topic", "isGlobal", "categoryId"]) {
       if (k in b) patch[k] = b[k];
@@ -3751,6 +3864,8 @@ const app = new Hono<{ Variables: Vars }>()
           geminiKey: mask(s.geminiKey),
           openaiKey: mask(s.openaiKey),
           proctoring: { ...schema.DEFAULT_PROCTORING, ...(s.proctoring ?? {}) },
+          // Last Safe Exam Browser request this server saw, for the lab test.
+          seb: sebMonitor.status(),
         },
       },
       200,
@@ -3775,7 +3890,10 @@ const app = new Hono<{ Variables: Vars }>()
     }
     if (b.proctoring !== undefined) {
       const cur = await getGlobalSettings();
-      patch.proctoring = { ...schema.DEFAULT_PROCTORING, ...(cur.proctoring ?? {}), ...b.proctoring };
+      const next = { ...schema.DEFAULT_PROCTORING, ...(cur.proctoring ?? {}), ...b.proctoring };
+      next.sebConfigKeys = normaliseConfigKeys(next.sebConfigKeys);
+      next.requireSeb = next.requireSeb === true;
+      patch.proctoring = next;
     }
     await getGlobalSettings(); // ensure row exists
     const [s] = await db.update(schema.settings).set(patch).where(eq(schema.settings.id, GLOBAL_SETTINGS)).returning();
