@@ -313,7 +313,7 @@ function CategoryView({ cat, onBack, onDelete }: { cat: Cat; onBack: () => void;
                     {qn.ownedByOther ? <Pill label={qn.ownerName ? `Shared · ${qn.ownerName}` : "Shared"} color="#7c3aed" /> : null}
                     {qn.aiGenerated ? <Sparkles size={14} className="text-[var(--brand)]" /> : null}
                   </div>
-                  <div className="text-[var(--color-ink)]">{qn.prompt}</div>
+                  <div className="text-[var(--color-ink)] line-clamp-4" style={{ whiteSpace: "pre-line" }}>{qn.prompt}</div>
                   {Array.isArray(qn.options) && qn.options.length > 0 && (
                     <div className="mt-2 grid sm:grid-cols-2 gap-1.5">
                       {qn.options.map((o, i) => {

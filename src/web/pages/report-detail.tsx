@@ -9,6 +9,7 @@ import { PageHeader } from "../components/shell";
 import { Loader, Pill, Drawer, usePagination, Pager } from "../components/ui";
 import { safeName, fmtFileDate, type Brand } from "../lib/pdf/theme";
 import type { StudentAnswer } from "../lib/pdf/student-report";
+import { PromptText } from "../student/components/prompt-text";
 
 type Row = { attemptId: string; studentId: string; name: string; rollNo: string; email: string | null; section: string; score: number | null; status: string; submittedAt: string | number | null; absent?: boolean; disconnected?: boolean; answeredCount?: number; frames?: number; snapshotFailures?: number };
 
@@ -1016,7 +1017,7 @@ function AnswerCard({ a, index }: { a: AnswerRow; index: number }) {
     <div className="card p-4 sm:p-5">
       <div className="flex items-start justify-between gap-3 mb-3">
         <div className="min-w-0">
-          <div className="text-sm font-medium text-[var(--color-ink)] leading-relaxed">{index + 1}. {a.prompt}</div>
+          <PromptText className="text-sm font-medium text-[var(--color-ink)] leading-relaxed" text={`${index + 1}. ${a.prompt ?? ""}`} />
           <div className="mono-label mt-1 uppercase">{a.type}{a.topic ? ` · ${a.topic}` : ""}</div>
         </div>
         <span className="stat-num text-sm shrink-0 whitespace-nowrap" style={{ color: scoreColor }}>

@@ -17,6 +17,7 @@ const NOT_ICONS = new Set([
   "camera", "copy", "delete", "ellipsis", "filter", "focus", "grid", "import",
   "italic", "list", "map", "package", "pill", "pointer", "text",
   "form", // a registration step name, not an icon
+  "code", // a prompt part kind in prompt-text.tsx, not an icon
 ]);
 
 const root = join(import.meta.dir, "..");
