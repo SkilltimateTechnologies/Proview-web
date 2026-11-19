@@ -8,6 +8,7 @@ import { classifyCameraError, cameraLostFailure, escalateFailure, type CameraFai
 import { freshEpisode, onLoss, onCameraSeen } from "../lib/camera-episode";
 import { Icon, NetBadge, useOnline } from "../components/ui";
 import { PromptText } from "../components/prompt-text";
+import { clockOffsetMs, serverNowMs, syncClock } from "../lib/server-clock";
 
 type Phase = "brief" | "preflight" | "resume" | "running" | "validating" | "done";
 
@@ -25,15 +26,16 @@ type RunSession = {
   integrityEvents: ProctorEvent[];
 };
 
-/** Server "submit available at" in this computer's clock (null = no minimum). */
+
+/** Earliest Submit, in server time (null = no minimum). Also syncs the clock. */
 function localSubmitAt(info: { submitAvailableAt?: string | null; serverNow?: string | null }): number | undefined {
-  if (!info.submitAvailableAt || !info.serverNow) return undefined;
-  const skew = Date.now() - new Date(info.serverNow).getTime();
-  const at = new Date(info.submitAvailableAt).getTime() + skew;
+  syncClock(info.serverNow);
+  if (!info.submitAvailableAt) return undefined;
+  const at = new Date(info.submitAvailableAt).getTime();
   return Number.isFinite(at) ? at : undefined;
 }
 
-/** Minimum writing time: Submit stays locked until then, unless the exam is nearly over. */
+/** Minimum writing time: Submit stays locked until then, unless the exam is nearly over. nowMs is server time. */
 const SUBMIT_UNLOCK_MARGIN_MS = 2_000;
 function submitLockedFor(s: { submitAvailableAt?: number; endAt: number } | null, nowMs: number): number {
   if (!s?.submitAvailableAt) return 0;
@@ -74,7 +76,7 @@ const AUTO_SUBMIT_SPREAD_MS = 15_000;
 // endAt on reconnect and corrects any drift (admin hold / extra time).
 type SavedProgress = { answers: Record<string, unknown>; flags: Record<string, boolean>; cur?: number; attemptId?: string; endAt?: number; submitAvailableAt?: number };
 function progressKey(examId: string) { return `examly:progress:${examId}`; }
-function saveProgress(examId: string, p: SavedProgress) {
+function saveProgress(examId: string, p: Partial<SavedProgress>) {
   try {
     // Merge so a partial save (e.g. answers only) never wipes attemptId/endAt.
     const prev = loadProgress(examId) ?? {};
@@ -962,6 +964,7 @@ export function ExamRunner() {
       void api.heartbeat(examId)
         .then((info) => {
           if (stopped) return;
+          syncClock(info.serverNow);
           setHeld(!!info.held);
           const newEnd = new Date(info.endAt).getTime();
           if (Number.isFinite(newEnd)) {
@@ -1221,7 +1224,8 @@ export function ExamRunner() {
   }, [phase, pushAlert]);
 
   // Live server-anchored countdown.
-  const remaining = session ? session.endAt - now : 0;
+  // endAt is server time: compare it with the server clock, not this PC's clock.
+  const remaining = session ? session.endAt - (now + clockOffsetMs()) : 0;
 
   // ---- Timed "minutes left" warnings (10 min + 5 min) ----
   // A big blinking banner appears below the question when the countdown crosses
@@ -1260,7 +1264,7 @@ export function ExamRunner() {
     if (!s || submittedRef.current || !bundle) return;
     // A manual Submit before the minimum writing time never leaves the exam: the
     // camera and fullscreen stay on. (The timer's own submit passes spreadMs.)
-    if (!opts?.spreadMs && submitLockedFor(s, Date.now()) > 0) return;
+    if (!opts?.spreadMs && submitLockedFor(s, serverNowMs()) > 0) return;
     // Push any queued violations before we flip the submitted flag (after which
     // recording stops). They also ride along in the payload as a backstop.
     flushEventsRef.current();
@@ -1323,8 +1327,40 @@ export function ExamRunner() {
     // was the submit↔reopen loop. A genuine end-of-exam timeout still fires once
     // this short settle window passes.
     const settled = Date.now() - runningSinceRef.current > 5_000;
-    if (phase === "running" && session && online && !held && remaining <= 0 && settled && proctoringRef.current.autoSubmitOnTimeout) void doSubmit({ spreadMs: AUTO_SUBMIT_SPREAD_MS });
+    if (phase === "running" && session && online && !held && remaining <= 0 && settled && proctoringRef.current.autoSubmitOnTimeout) {
+      void confirmTimeUpThenSubmit();
+    }
   }, [phase, session, remaining, online, held, doSubmit]);
+
+  // Before the timer submits on its own, ask the server whether the exam is
+  // really over. The answer carries the authoritative deadline and the server's
+  // clock: if time is in fact left (a wrong PC clock, a stale deadline, extra
+  // time just granted), the countdown corrects itself and the student keeps
+  // writing; the submit never starts, so the camera and fullscreen stay on. If
+  // the server cannot be reached, the submit goes ahead as before (it retries).
+  const confirmingTimeUpRef = useRef(false);
+  async function confirmTimeUpThenSubmit() {
+    if (confirmingTimeUpRef.current || submittedRef.current || !examId) return;
+    confirmingTimeUpRef.current = true;
+    try {
+      const info = await api.heartbeat(examId);
+      syncClock(info.serverNow);
+      setHeld(!!info.held);
+      if (info.held) return;
+      const end = new Date(info.endAt).getTime();
+      const nowServer = new Date(info.serverNow).getTime();
+      if (Number.isFinite(end) && Number.isFinite(nowServer) && end - nowServer > 5_000) {
+        setSession((prev) => (prev ? { ...prev, endAt: end } : prev));
+        saveProgress(examId, { endAt: end });
+        return;
+      }
+    } catch {
+      /* server unreachable: fall through to the normal submit path */
+    } finally {
+      confirmingTimeUpRef.current = false;
+    }
+    void doSubmitRef.current?.({ spreadMs: AUTO_SUBMIT_SPREAD_MS });
+  }
 
   // Persist answers/flags locally on every change while running, so a forced
   // logout (internet drop) never loses work.
@@ -1379,7 +1415,7 @@ export function ExamRunner() {
   // student gets a chance to unflag/revisit before finishing. Auto-submit on
   // timeout never runs through here (it calls doSubmit directly, silently).
   function handleSubmitClick() {
-    if (submitLockedFor(session, Date.now()) > 0) return;
+    if (submitLockedFor(session, serverNowMs()) > 0) return;
     if (flagCount > 0) {
       const ok = window.confirm(
         `You still have ${flagCount} question${flagCount > 1 ? "s" : ""} flagged for review.\n\n` +
@@ -1807,8 +1843,8 @@ export function ExamRunner() {
                   <span><strong>{answeredCount}</strong> of {questions.length} answered</span>
                   {flagCount > 0 && <span style={{ color: "var(--color-warn)" }}><Icon name="flag" size={13} /> {flagCount} flagged for review</span>}
                 </div>
-                <button className="btn btn-primary" style={{ padding: 14, fontSize: 15 }} onClick={handleSubmitClick} disabled={submitting || submitLockedFor(session, now) > 0} title={submitLockedFor(session, now) > 0 ? "Submit unlocks after the minimum writing time" : undefined}>
-                  {submitting ? <Icon name="loader-circle" className="animate-spin" /> : <Icon name="send" />} {submitLockedFor(session, now) > 0 ? `Submit in ${fmtClock(submitLockedFor(session, now))}` : "Submit exam"}
+                <button className="btn btn-primary" style={{ padding: 14, fontSize: 15 }} onClick={handleSubmitClick} disabled={submitting || submitLockedFor(session, now + clockOffsetMs()) > 0} title={submitLockedFor(session, now + clockOffsetMs()) > 0 ? "Submit unlocks after the minimum writing time" : undefined}>
+                  {submitting ? <Icon name="loader-circle" className="animate-spin" /> : <Icon name="send" />} {submitLockedFor(session, now + clockOffsetMs()) > 0 ? `Submit in ${fmtClock(submitLockedFor(session, now + clockOffsetMs()))}` : "Submit exam"}
                 </button>
               </div>
             )}

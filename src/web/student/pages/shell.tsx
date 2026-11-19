@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useParams, Link } from "wouter";
 import { api, ApiError, type ExamListItem, type Review as ReviewData } from "../lib/api";
+import { serverNowMs, syncClock } from "../lib/server-clock";
 import { useSession } from "../lib/session";
 import { ChangePasswordForm } from "./change-password";
 import { ReviewBody } from "./review";
@@ -19,7 +20,7 @@ function fmtDate(d: string | null) {
 }
 function countdown(startAt: string | null): string {
   if (!startAt) return "";
-  const diff = new Date(startAt).getTime() - Date.now();
+  const diff = new Date(startAt).getTime() - serverNowMs();
   if (diff <= 0) return "Starting now";
   const h = Math.floor(diff / 3_600_000);
   const m = Math.floor((diff % 3_600_000) / 60_000);
@@ -56,6 +57,7 @@ export function Shell() {
   loadRef.current = async () => {
     try {
       const res = await api.exams();
+      syncClock(res.serverNow);
       setExams(res.exams);
       setErr("");
     } catch (e) {
@@ -90,7 +92,7 @@ export function Shell() {
   // Precise refresh right when the soonest upcoming exam is due to start.
   useEffect(() => {
     if (!exams) return;
-    const now = Date.now();
+    const now = serverNowMs();
     const nextStart = exams
       .filter((e) => e.phase === "upcoming" && e.startAt)
       .map((e) => new Date(e.startAt as string).getTime())
@@ -111,7 +113,7 @@ export function Shell() {
   // waits for the Start button to unlock — no manual refresh needed. Far-future
   // exams stay on the dashboard as cards.
   const waiting = useMemo(() => {
-    const now = Date.now();
+    const now = serverNowMs();
     return (exams || [])
       .filter((e) => e.phase === "upcoming" && e.startAt)
       .map((e) => ({ e, t: new Date(e.startAt as string).getTime() }))
@@ -313,12 +315,12 @@ function FinishedList({ exams, onOpen }: { exams: ExamListItem[]; onOpen: (attem
 function ExamGate({ exam, onStart, onElapsed }: { exam: ExamListItem; onStart: (id: string) => void; onElapsed: () => void }) {
   const started = exam.phase === "available" || exam.phase === "in_progress";
   const startMs = exam.startAt ? new Date(exam.startAt).getTime() : null;
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(serverNowMs());
 
   // Tick every second only while we're waiting on a future start time.
   useEffect(() => {
     if (started || startMs == null) return;
-    const id = setInterval(() => setNow(Date.now()), 1000);
+    const id = setInterval(() => setNow(serverNowMs()), 1000);
     return () => clearInterval(id);
   }, [started, startMs]);
 
