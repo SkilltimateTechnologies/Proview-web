@@ -233,7 +233,7 @@ export function EditExam() {
   const save = useMutation({
     mutationFn: async () => {
       const startAt = combineIST(date, slot);
-      return (await api.exams[":id"].$patch({
+      const res = await api.exams[":id"].$patch({
         param: { id: examId },
         // A start time means the assessment is scheduled; no start time keeps it a draft.
         json: {
@@ -250,7 +250,12 @@ export function EditExam() {
           questionIds: picked,
           status: startAt ? "scheduled" : "draft",
         },
-      })).json();
+      });
+      // A refused save (e.g. it would delete students' results) must not look like
+      // success: this used to navigate away whatever the server answered.
+      const body = (await res.json()) as { message?: string };
+      if (!res.ok) throw new Error(body?.message || `Save failed (${res.status})`);
+      return body;
     },
     onSuccess: done,
   });
@@ -362,6 +367,11 @@ export function EditExam() {
           </button>
           <button className="btn btn-ghost" onClick={() => navigate("/exams")}>Cancel</button>
         </div>
+        {save.error ? (
+          <div role="alert" className="mt-3 rounded-lg border border-[#f3c4bd] bg-[#fdf0ee] px-3 py-2 text-sm text-[#a33a2f]">
+            {(save.error as Error).message}
+          </div>
+        ) : null}
 
         {!isDraft && (
           <div className="mt-5 pt-4 border-t border-[var(--color-line)]">
