@@ -207,9 +207,11 @@ export const api = {
   pause: (examId: string) =>
     req<{ ok: boolean }>(`/student/attempts/${examId}/pause`, { method: "POST", body: JSON.stringify({}) }),
   heartbeat: (examId: string) =>
-    // Pure keepalive, no side effect worth protecting: retry freely so one blip
-    // does not surface as a scary "connection lost" to a student mid-exam.
-    req<HeartbeatInfo>(`/student/heartbeat/${examId}`, { method: "POST" }, { retries: 2, timeoutMs: 10000 }),
+    // Pure keepalive, and the caller ignores a failure (the next beat is 15s
+    // away). No retries: when the server is overloaded, retrying every heartbeat
+    // two more times tripled this, the highest-volume call, exactly when the
+    // server could least absorb it (measured: 2,326 retries in 90 s at 50 ms DB).
+    req<HeartbeatInfo>(`/student/heartbeat/${examId}`, { method: "POST" }, { retries: 0, timeoutMs: 10000 }),
   exams: () => req<{ exams: ExamListItem[]; student: { id: string; name: string; rollNo: string; email: string | null } }>("/student/exams"),
   // Read-only, and the paper is what the student came for: retry hard. A failed
   // bundle fetch falls back to the localStorage cache, so this only has to win

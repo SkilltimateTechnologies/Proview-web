@@ -1,6 +1,9 @@
 import { drizzle } from "drizzle-orm/libsql";
 import { createClient } from "@libsql/client";
 import * as schema from "./schema";
+import { createLaneRouter, deadlineFetch, envInt, freshLaneStats, type DbLane, type LaneStats } from "./lanes";
+
+export { runInLane, currentLane, type DbLane } from "./lanes";
 
 // Fail fast with a clear message instead of the cryptic libsql
 // "URL_INVALID: The URL '' is not in a valid format" crash at import time.
@@ -13,25 +16,64 @@ if (!process.env.DATABASE_URL) {
 
 // Bun's global fetch handles gzip streaming correctly; the bundled node-fetch
 // used by @libsql/client under Vite/Node throws ERR_STREAM_PREMATURE_CLOSE on
-// larger gzipped pipeline responses. Force the platform fetch.
-const client = createClient({
-  url: process.env.DATABASE_URL,
-  authToken: process.env.DATABASE_AUTH_TOKEN,
-  fetch: ((input: RequestInfo | URL, init?: RequestInit) => {
-    // libsql may hand us a Request-like object; normalize to url + init so the
-    // platform fetch can parse it (avoids "Failed to parse URL from [object Request]").
-    if (input && typeof input === "object" && "url" in input && typeof (input as Request).url === "string") {
-      const r = input as Request;
-      return fetch(r.url, {
-        method: r.method,
-        headers: r.headers,
-        body: (r as unknown as { body?: BodyInit }).body ?? init?.body,
-        ...init,
-      });
-    }
-    return fetch(input as RequestInfo | URL, init);
-  }) as unknown as typeof fetch,
-});
+// larger gzipped pipeline responses. Force the platform fetch — now with a
+// deadline on every request (see lanes.ts for why that matters).
+const DATABASE_URL: string = process.env.DATABASE_URL;
+
+/** Abort any single database request after this long. 0 disables (not recommended). */
+const STATEMENT_TIMEOUT_MS = envInt("DB_STATEMENT_TIMEOUT_MS", 15_000, true);
+/**
+ * Statements each lane may run at once against a REMOTE database. The library
+ * default was 20 for the whole process; these are per lane. Tunable per deploy.
+ */
+const LANE_CONCURRENCY: Record<DbLane, number> = {
+  student: envInt("DB_CONCURRENCY_STUDENT", 48),
+  admin: envInt("DB_CONCURRENCY_ADMIN", 16),
+  background: envInt("DB_CONCURRENCY_BACKGROUND", 8),
+};
+/** Used when lanes are off (DB_LANES=off) or the database is a local file. */
+const SINGLE_CONCURRENCY = envInt("DB_CONCURRENCY", 64);
+
+const isLocalFile = /^file:/i.test(DATABASE_URL) || DATABASE_URL === ":memory:";
+const lanesOn = !isLocalFile && (process.env.DB_LANES ?? "on").toLowerCase() !== "off";
+const timedFetch = deadlineFetch(STATEMENT_TIMEOUT_MS);
+
+function makeClient(concurrency: number) {
+  return createClient({
+    url: DATABASE_URL,
+    authToken: process.env.DATABASE_AUTH_TOKEN,
+    concurrency,
+    fetch: timedFetch,
+  });
+}
+
+export const laneStats: Record<DbLane, LaneStats> = {
+  student: freshLaneStats(),
+  admin: freshLaneStats(),
+  background: freshLaneStats(),
+};
+
+const client = lanesOn
+  ? createLaneRouter(
+      {
+        student: makeClient(LANE_CONCURRENCY.student),
+        admin: makeClient(LANE_CONCURRENCY.admin),
+        background: makeClient(LANE_CONCURRENCY.background),
+      },
+      laneStats,
+    )
+  : (() => {
+      const single = makeClient(SINGLE_CONCURRENCY);
+      // One client, so every lane name maps to it; stats still split by lane.
+      return createLaneRouter({ student: single, admin: single, background: single }, laneStats);
+    })();
+
+/** What the connection layer is configured as — reported on /api/health. */
+export const dbConfig = {
+  lanes: lanesOn,
+  statementTimeoutMs: STATEMENT_TIMEOUT_MS,
+  concurrency: lanesOn ? LANE_CONCURRENCY : { single: isLocalFile ? null : SINGLE_CONCURRENCY },
+};
 
 /**
  * LOAD TESTING ONLY — off unless DB_FAKE_LATENCY_MS is set, and never set in prod.
@@ -79,6 +121,9 @@ let queryCount = 0;
 export const dbStats = {
   get queries() {
     return queryCount;
+  },
+  get lanes() {
+    return laneStats;
   },
 };
 

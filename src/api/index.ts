@@ -1,17 +1,18 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { compress } from "hono/compress";
 import { eq, ne, and, or, desc, gte, inArray, like, sql as dsql } from "drizzle-orm";
 import { auth } from "./auth";
 import { hashPassword, verifyPassword } from "better-auth/crypto";
-import { db, dbStats } from "./database";
+import { db, dbConfig, dbStats, runInLane } from "./database";
 import * as schema from "./database/schema";
 import { INDEX_STATE, REQUIRED_COLUMNS, REQUIRED_PERF_INDEXES, REQUIRED_UNIQUE_INDEXES } from "./database/invariants";
-import { authMiddleware, requireAuth, requireSuperAdmin, requirePermission } from "./middleware/auth";
+import { authCache, authMiddleware, requireAuth, requireSuperAdmin, requirePermission } from "./middleware/auth";
 import type { SessionUser, ProfileCtx } from "./middleware/auth";
 import { id, displayId, computeYear, effectiveEndMs } from "./lib/util";
 import { generateQuestions, gradeSubjective } from "./lib/ai";
 import { finalizeAttempt, hasContent } from "./lib/grade-queue";
-import { presignPut, presignGet, presignGetCached, getObject } from "./lib/s3";
+import { presignPut, presignGetCached, getObject } from "./lib/s3";
 import { signStudentToken, verifyStudentToken } from "./lib/student-token";
 import { normalizeRoll, rollNoProblem, isDuplicateRollError } from "./lib/students";
 import { recordMonitorBuild, monitorTiming, recentExamChecks, failingExamChecks, checkExamData, MONITOR_POLL_MS, MONITOR_BUDGET_MS } from "./lib/watchdog";
@@ -119,6 +120,7 @@ async function getExamForPolling(eid: string): Promise<ExamRow | null> {
 /** Call whenever an exam row changes (hold, resume, extra time, edit, delete). */
 function invalidateExam(eid: string) {
   examCache.invalidate(eid);
+  invalidateStudentExamLists();
 }
 
 /**
@@ -146,7 +148,72 @@ async function getExamQuestionSet(examId: string) {
 /** Call when an exam's question set or a question's options change. */
 function invalidateExamQuestions(examId: string) {
   examQuestionsCache.invalidate(examId);
+  examPaperCache.invalidate(examId);
 }
+
+/**
+ * The full paper for one exam: its exam_questions rows in order plus the question
+ * rows. Identical for every student, and read by /bundle (every student at the
+ * start bell) and by submit (every student at the final bell) — 2 statements each,
+ * ~2,200 times inside a couple of minutes, for data that does not change during an
+ * exam. Server-side only: it contains the answer key and is never sent as-is.
+ * Same 30s TTL and invalidation as the question-set cache above.
+ */
+type ExamQuestionRow = typeof schema.examQuestions.$inferSelect;
+type QuestionRow = typeof schema.questions.$inferSelect;
+const examPaperCache = new TtlCache<{ eqs: ExamQuestionRow[]; qs: QuestionRow[] }>(EXAM_QUESTIONS_CACHE_MS);
+async function getExamPaper(examId: string) {
+  return examPaperCache.load(examId, async () => {
+    const eqs = await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, examId)).orderBy(schema.examQuestions.order);
+    const qids = eqs.map((q) => q.questionId);
+    const qs = qids.length ? await db.select().from(schema.questions).where(inArray(schema.questions.id, qids)) : [];
+    return { eqs, qs };
+  });
+}
+
+/**
+ * Tenant-wide half of the student dashboard (/student/exams): the tenant's exams,
+ * their roster overrides and question counts. Every waiting student polls this
+ * every 15s and ALL of them refetch at the exam's start time, and it is identical
+ * for everyone in the college — 3 of the endpoint's 5 statements. Cached 5s;
+ * dropped on any exam or roster write so an admin change still shows at once.
+ */
+const STUDENT_EXAM_LIST_CACHE_MS = 5_000;
+type ExamListBase = { exams: ExamRow[]; rosters: Map<string, import("./lib/roster").Roster>; questionCounts: Map<string, number> };
+const studentExamListCache = new TtlCache<ExamListBase>(STUDENT_EXAM_LIST_CACHE_MS);
+async function getStudentExamListBase(tenantId: string): Promise<ExamListBase> {
+  return studentExamListCache.load(tenantId, async () => {
+    const exams = await db
+      .select()
+      .from(schema.exams)
+      .where(and(eq(schema.exams.tenantId, tenantId), inArray(schema.exams.status, ["scheduled", "live", "finished"])))
+      .orderBy(desc(schema.exams.createdAt));
+    const ids = exams.map((e) => e.id);
+    const rosters = await loadRosters(ids);
+    const counts = ids.length
+      ? await db
+          .select({ examId: schema.examQuestions.examId, n: dsql<number>`count(*)` })
+          .from(schema.examQuestions)
+          .where(inArray(schema.examQuestions.examId, ids))
+          .groupBy(schema.examQuestions.examId)
+      : [];
+    return { exams, rosters, questionCounts: new Map(counts.map((r) => [r.examId, Number(r.n)])) };
+  });
+}
+/** Call after any write to exams or exam_roster. Rare, so it simply drops all tenants. */
+function invalidateStudentExamLists() {
+  studentExamListCache.clear();
+}
+
+/**
+ * One finalize per attempt at a time in this process. When the database is slow
+ * the client's 20s timeout fires while the server is still grading, and the client
+ * retries — so a single student could have two or three identical finalizes
+ * running, each paying the full statement cost, exactly when the database can
+ * least afford it. A repeat now waits for the one already running and returns its
+ * answer. (Across processes the existing idempotent upserts still apply.)
+ */
+const submitsInFlight = new Map<string, Promise<{ score: number; status: "submitted" | "graded"; gradeAt: number | null }>>();
 
 // Resolve the tenant for the public registration page from a URL code.
 // Accepts (case-insensitive) the college short code (shortName), the slug, or the raw tenant id.
@@ -406,7 +473,21 @@ async function buildMonitorSnapshot(tid: string) {
 
   const out = await Promise.all(
     liveExams.map(async (ex) => {
-      const atts = await db.select().from(schema.attempts).where(eq(schema.attempts.examId, ex.id));
+      // Only the columns this view uses. A full attempt row carries the 300-char
+      // user agent and more; at 1,100 students on a 5s poll that was ~0.5 MB read
+      // from the database per build for nothing.
+      const atts = await db
+        .select({
+          id: schema.attempts.id,
+          studentId: schema.attempts.studentId,
+          status: schema.attempts.status,
+          lastSeenAt: schema.attempts.lastSeenAt,
+          startedAt: schema.attempts.startedAt,
+          submittedAt: schema.attempts.submittedAt,
+          score: schema.attempts.score,
+        })
+        .from(schema.attempts)
+        .where(eq(schema.attempts.examId, ex.id));
       // Everyone who has engaged with the exam (in progress or already submitted/graded).
       const engaged = atts.filter((a) => a.status !== "not_started");
       // Proctoring evidence per attempt: violation count + newest snapshot key.
@@ -439,14 +520,13 @@ async function buildMonitorSnapshot(tid: string) {
             pendingSeen ?? 0,
           );
           const online = a.status === "in_progress" && lastSeenMs > 0 && now - lastSeenMs < 40_000;
-          // Latest violation snapshot, as a short-lived presigned URL.
           const agg = evAgg.get(a.id);
-          let snapshot: string | null = null;
-          if (agg?.lastKey) {
-            // Cached: the same key is re-signed on every 5s poll otherwise, and
-            // the URL is valid for 24h regardless.
-            try { snapshot = await presignGetCached(agg.lastKey); } catch { snapshot = null; }
-          }
+          // `snapshot` is kept in the payload for compatibility but no longer
+          // signed: the Live Monitor page never displays it (the drawer loads
+          // evidence from the reports endpoint), and signing a fresh URL for every
+          // student's newest frame cost ~0.35 ms of CPU each — on the single
+          // thread that also answers students — plus ~460 bytes per row.
+          const snapshot: string | null = null;
           return {
             attemptId: a.id,
             examId: ex.id,
@@ -547,11 +627,38 @@ const bulkStudentPasswords = createBulkStudentPasswords({
   invalidate: (tenantId) => directory.invalidateStudents(tenantId),
 });
 
+/**
+ * Which database lane a request runs on (see database/lanes.ts). The exam client's
+ * own calls, student login and public self-registration ride the student lane;
+ * everything else is the staff console. Background work (grading, sweeps, the
+ * heartbeat flusher) runs outside any request and lands on the background lane.
+ */
+const STUDENT_LANE_PATH = /^\/api\/(student\/|students\/verify-login$|register\/)/;
+
 const app = new Hono<{ Variables: Vars }>()
+  .use((c, next) => runInLane(STUDENT_LANE_PATH.test(c.req.path) ? "student" : "admin", next))
   .use(cors({ origin: (origin) => origin ?? "*", credentials: true, exposeHeaders: ["set-auth-token"] }))
-  .on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw))
+  // gzip JSON responses over 1 KB. The Live Monitor answered every 5s poll with
+  // ~294 KB of uncompressed JSON per open tab (~22 KB gzipped), and the student
+  // list ~281 KB (~25 KB). Small student calls stay under the threshold untouched.
+  .use(compress({ encoding: "gzip" }))
+  .on(["GET", "POST"], "/api/auth/*", (c) => {
+    // A sign-out must not stay honoured by the identity cache for its TTL.
+    if (/sign-out|revoke/.test(c.req.path)) authCache.invalidate();
+    return auth.handler(c.req.raw);
+  })
   .basePath("api")
   .use("*", authMiddleware)
+  // Any write to an exam, its roster or a registration can change what a student's
+  // dashboard should show; drop the short exam-list cache after every such write
+  // (see getStudentExamListBase). One rule here instead of a call in each handler,
+  // so a future roster endpoint cannot forget it.
+  .use("*", async (c, next) => {
+    await next();
+    if (c.req.method !== "GET" && /^\/api\/(exams|reports\/[^/]+\/roster|register\/)/.test(c.req.path)) {
+      invalidateStudentExamLists();
+    }
+  })
   .all("/rpc/*", requireAuth, requirePermission("users"), async (c) => {
     const result = await bulkResetHandler.handle(c.req.raw, {
       prefix: "/api/rpc",
@@ -587,6 +694,12 @@ const app = new Hono<{ Variables: Vars }>()
         // served and you have the cost per request.
         db: {
           queries: dbStats.queries,
+          // Connection layer: per-lane statements in flight (running + queued),
+          // the peak since boot, statements that hit the deadline, and the slowest
+          // statement in the last minute. A lane whose `pending` keeps climbing is
+          // the database falling behind; `timeouts` rising means it stopped answering.
+          lanes: dbStats.lanes,
+          config: dbConfig,
           cached: {
             settings: settingsCache.size,
             exams: examCache.size,
@@ -709,7 +822,9 @@ const app = new Hono<{ Variables: Vars }>()
   })
 
   // ---- TEMP diagnostic: verify DB connectivity + env presence ----
-  .get("/__diag", async (c) => {
+  // Super-admin only: it reports which secrets are set and the start of the
+  // database URL, which must not be readable by anyone on the internet.
+  .get("/__diag", requireAuth, requireSuperAdmin, async (c) => {
     const env = {
       DATABASE_URL: process.env.DATABASE_URL
         ? `${process.env.DATABASE_URL.slice(0, 14)}… (len ${process.env.DATABASE_URL.length})`
@@ -988,6 +1103,7 @@ const app = new Hono<{ Variables: Vars }>()
         logoUrl: b.logoUrl ?? null,
       })
       .returning();
+    authCache.invalidate();
     return c.json({ tenant: t }, 201);
   })
   .patch("/tenants/:id", requireAuth, requireSuperAdmin, async (c) => {
@@ -1091,6 +1207,7 @@ const app = new Hono<{ Variables: Vars }>()
       userPatch.updatedAt = new Date();
       await db.update(schema.user).set(userPatch).where(eq(schema.user.id, uid));
     }
+    authCache.invalidate();
     const [prof] = await db.select().from(schema.profiles).where(eq(schema.profiles.userId, uid));
     return c.json({ user: prof }, 200);
   })
@@ -1101,6 +1218,7 @@ const app = new Hono<{ Variables: Vars }>()
     const hash = await hashPassword(newPassword);
     const [acc] = await db.select().from(schema.account).where(and(eq(schema.account.userId, uid), eq(schema.account.providerId, "credential")));
     if (!acc) return c.json({ message: "No credential account" }, 404);
+    authCache.invalidate();
     await db.update(schema.account).set({ password: hash, updatedAt: new Date() }).where(eq(schema.account.id, acc.id));
     return c.json({ ok: true, password: newPassword }, 200);
   })
@@ -1118,6 +1236,7 @@ const app = new Hono<{ Variables: Vars }>()
     await db.delete(schema.session).where(eq(schema.session.userId, uid));
     await db.delete(schema.account).where(eq(schema.account.userId, uid));
     await db.delete(schema.profiles).where(eq(schema.profiles.userId, uid));
+    authCache.invalidate();
     await db.delete(schema.user).where(eq(schema.user.id, uid));
     return c.json({ ok: true }, 200);
   })
@@ -1614,26 +1733,23 @@ const app = new Hono<{ Variables: Vars }>()
     const [stu] = await db.select().from(schema.students).where(eq(schema.students.id, sid)).limit(1);
     if (!stu || !stu.enabled) return c.json({ message: "Unauthorized" }, 401);
 
-    const allExams = await db
-      .select()
-      .from(schema.exams)
-      .where(and(eq(schema.exams.tenantId, stu.tenantId), inArray(schema.exams.status, ["scheduled", "live", "finished"])))
-      .orderBy(desc(schema.exams.createdAt));
+    // Tenant-wide half (exams, roster overrides, question counts) from a 5s cache:
+    // see getStudentExamListBase. Only the per-student reads below are live.
+    const base = await getStudentExamListBase(stu.tenantId);
+    // The cached list is shared; make sure the opt-in-only (ELITE) set is loaded
+    // before eligibility, as loadRosters would have done on a cold path.
+    await ensureOptInOnlyLoaded();
 
     // Only exams targeting the student's class (or all-class exams), matching
     // section if scoped, honouring any ad-hoc roster add/remove overrides.
-    const rosters = await loadRosters(allExams.map((e) => e.id));
-    const visible = allExams.filter((e) => isEligible(e, stu, rosters.get(e.id)));
+    const visible = base.exams.filter((e) => isEligible(e, stu, base.rosters.get(e.id)));
 
     const exIds = visible.map((e) => e.id);
     const myAttempts = exIds.length
       ? await db.select().from(schema.attempts).where(and(inArray(schema.attempts.examId, exIds), eq(schema.attempts.studentId, sid)))
       : [];
     const aMap = new Map(myAttempts.map((a) => [a.examId, a]));
-    const qCounts = exIds.length
-      ? await db.select({ examId: schema.examQuestions.examId, n: dsql<number>`count(*)` }).from(schema.examQuestions).where(inArray(schema.examQuestions.examId, exIds)).groupBy(schema.examQuestions.examId)
-      : [];
-    const qMap = new Map(qCounts.map((r) => [r.examId, Number(r.n)]));
+    const qMap = base.questionCounts;
 
     const now = Date.now();
     const exams = visible.map((e) => {
@@ -1682,9 +1798,8 @@ const app = new Hono<{ Variables: Vars }>()
     const [exam] = await db.select().from(schema.exams).where(and(eq(schema.exams.id, eid), eq(schema.exams.tenantId, stu.tenantId))).limit(1);
     if (!exam) return c.json({ message: "Not found" }, 404);
 
-    const eqs = await db.select().from(schema.examQuestions).where(eq(schema.examQuestions.examId, eid)).orderBy(schema.examQuestions.order);
-    const qids = eqs.map((q) => q.questionId);
-    const qs = qids.length ? await db.select().from(schema.questions).where(inArray(schema.questions.id, qids)) : [];
+    // Cached per exam (see getExamPaper): identical for every student.
+    const { eqs, qs } = await getExamPaper(eid);
     const qById = new Map(qs.map((q) => [q.id, q]));
     // Shuffle each question's OPTIONS for this student too. Question order alone
     // left the answer key identical for everyone, so a paper keyed "B" on 55% of
@@ -2182,7 +2297,15 @@ const app = new Hono<{ Variables: Vars }>()
     // Persist + grade through the shared path. Objective graded inline; subjective
     // + coding deferred to the background queue. The same path is reused by the
     // server-side auto-submit sweep for abandoned attempts.
-    const { score, status, gradeAt } = await finalizeAttempt(attempt, respArr, provider);
+    let run = submitsInFlight.get(aid);
+    if (!run) {
+      run = (async () => {
+        const paper = await getExamPaper(attempt.examId);
+        return finalizeAttempt(attempt, respArr, provider, undefined, paper);
+      })().finally(() => submitsInFlight.delete(aid));
+      submitsInFlight.set(aid, run);
+    }
+    const { score, status, gradeAt } = await run;
 
     // `gradeAt` is when the deferred grading batch becomes due (null = nothing to
     // wait for, i.e. graded already or grading now). The client uses it to decide
@@ -2410,11 +2533,13 @@ const app = new Hono<{ Variables: Vars }>()
     // Option-order translation is derived from the option list, so a cached copy of
     // this question must not outlive the edit. Cheap: exams are few.
     examQuestionsCache.clear();
+    examPaperCache.clear();
     return c.json({ question: row }, 200);
   })
   .delete("/questions/:id", requireAuth, requirePermission("questionBank"), async (c) => {
     await db.delete(schema.questions).where(eq(schema.questions.id, c.req.param("id")));
     examQuestionsCache.clear();
+    examPaperCache.clear();
     return c.json({ ok: true }, 200);
   })
   // AI question generation (preview, not saved)
@@ -3240,7 +3365,10 @@ const app = new Hono<{ Variables: Vars }>()
     // student sat there alone). Mixing them buries the real flags in noise.
     const sign = async (ev: typeof evRows[number]) => {
       let photo: string | null = null;
-      if (ev.photoUrl) { try { photo = await presignGet(ev.photoUrl); } catch { photo = null; } }
+      // Cached: the drawer re-polls every 10s while an attempt is live, and this
+      // signs up to 900 URLs per open. The URL is valid 24h; the cache hands out
+      // ones with at least 12h left.
+      if (ev.photoUrl) { try { photo = await presignGetCached(ev.photoUrl); } catch { photo = null; } }
       // Same-origin proxy path for the same object. The presigned URL above is
       // fine for <img>, but a cross-origin fetch() to Tigris is blocked unless
       // the bucket carries a CORS policy — so bulk download (ZIP) reads through

@@ -4,7 +4,7 @@ import { brotliCompress, constants as zlibConstants, gzip } from "node:zlib";
 import app from "./api";
 import { startAutoSubmitSweep, startGradeQueue } from "./api/lib/grade-queue";
 import { heartbeats } from "./api/lib/heartbeat-queue";
-import { db } from "./api/database";
+import { db, runInLane } from "./api/database";
 import { ensureDatabaseInvariants, ensureRequiredColumns } from "./api/database/invariants";
 import {
 	CompressedAssets,
@@ -260,7 +260,9 @@ if (runsBackgroundWork) {
 // land in lives in that process — so a ROLE=web replica that skipped this would
 // accumulate presence and never write it. It is not background work; it is the
 // second half of an endpoint. Unref'd, so it never holds the process open.
-heartbeats.start(db);
+// Runs on the STUDENT lane: these writes are what keeps the Live Monitor's online
+// dots true, so they must not queue behind AI grading on the background lane.
+runInLane("student", () => heartbeats.start(db));
 
 // Best effort on the way out: a deploy or a Railway restart otherwise drops up to
 // one flush window of presence. Nothing waits on this beyond the signal handler.

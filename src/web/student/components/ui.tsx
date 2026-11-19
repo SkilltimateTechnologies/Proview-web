@@ -1,10 +1,107 @@
 import { useEffect, useState, type ReactNode } from "react";
-import * as Lucide from "lucide-react";
+import {
+  AlarmClockIcon,
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  CheckIcon,
+  CircleCheckBigIcon,
+  ClockIcon,
+  CloudOffIcon,
+  EyeIcon,
+  EyeOffIcon,
+  FileSearchIcon,
+  FlagIcon,
+  InboxIcon,
+  InfoIcon,
+  KeyRoundIcon,
+  LayoutDashboardIcon,
+  LightbulbIcon,
+  LoaderCircleIcon,
+  LockIcon,
+  LogInIcon,
+  LogOutIcon,
+  MonitorIcon,
+  MonitorXIcon,
+  PauseIcon,
+  PencilIcon,
+  PlayIcon,
+  RotateCcwIcon,
+  SendIcon,
+  ShieldAlertIcon,
+  ShieldCheckIcon,
+  SparklesIcon,
+  TargetIcon,
+  TerminalIcon,
+  TimerIcon,
+  TriangleAlertIcon,
+  UserRoundIcon,
+  UserXIcon,
+  VideoIcon,
+  VideoOffIcon,
+  WifiIcon,
+  WifiOffIcon,
+  XIcon,
+  type LucideIcon,
+} from "lucide-react";
+
+/**
+ * Every icon the student app renders, by kebab-case name.
+ *
+ * This used to be `import * as Lucide from "lucide-react"` plus a lookup by name,
+ * which defeats tree-shaking: the whole icon library (~1,600 icons, ~940 KB of
+ * source) went into the entry bundle EVERY student downloads,
+ * served by the same process answering their heartbeats. Listing the icons cuts
+ * that chunk to about a third. A name missing from this map renders nothing, as
+ * an unknown name always did; `ui.test.ts` fails the build if the student app
+ * uses a name that is not listed here.
+ */
+export const STUDENT_ICONS: Record<string, LucideIcon> = {
+  "alarm-clock": AlarmClockIcon,
+  "arrow-left": ArrowLeftIcon,
+  "arrow-right": ArrowRightIcon,
+  "check": CheckIcon,
+  "circle-check-big": CircleCheckBigIcon,
+  "clock": ClockIcon,
+  "cloud-off": CloudOffIcon,
+  "eye": EyeIcon,
+  "eye-off": EyeOffIcon,
+  "file-search": FileSearchIcon,
+  "flag": FlagIcon,
+  "inbox": InboxIcon,
+  "info": InfoIcon,
+  "key-round": KeyRoundIcon,
+  "layout-dashboard": LayoutDashboardIcon,
+  "lightbulb": LightbulbIcon,
+  "loader-circle": LoaderCircleIcon,
+  "lock": LockIcon,
+  "log-in": LogInIcon,
+  "log-out": LogOutIcon,
+  "monitor": MonitorIcon,
+  "monitor-x": MonitorXIcon,
+  "pause": PauseIcon,
+  "pencil": PencilIcon,
+  "play": PlayIcon,
+  "rotate-ccw": RotateCcwIcon,
+  "send": SendIcon,
+  "shield-alert": ShieldAlertIcon,
+  "shield-check": ShieldCheckIcon,
+  "sparkles": SparklesIcon,
+  "target": TargetIcon,
+  "terminal": TerminalIcon,
+  "timer": TimerIcon,
+  "triangle-alert": TriangleAlertIcon,
+  "user-round": UserRoundIcon,
+  "user-x": UserXIcon,
+  "video": VideoIcon,
+  "video-off": VideoOffIcon,
+  "wifi": WifiIcon,
+  "wifi-off": WifiOffIcon,
+  "x": XIcon,
+};
 
 // Kebab-case name -> Lucide component wrapper (matches web app convention).
 export function Icon({ name, size = 16, className }: { name: string; size?: number; className?: string }) {
-  const pascal = name.split("-").map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join("");
-  const Cmp = (Lucide as unknown as Record<string, React.ComponentType<{ size?: number; className?: string }>>)[pascal];
+  const Cmp = STUDENT_ICONS[name];
   if (!Cmp) return null;
   return <Cmp size={size} className={className} />;
 }
