@@ -252,7 +252,7 @@ export const api = {
   snapshotUrl: (attemptId: string) =>
     req<{ ok: boolean; url: string | null; key: string | null }>(`/student/attempts/${attemptId}/snapshot-url`, { method: "POST", body: JSON.stringify({}) }),
   submit: (attemptId: string, payload: { answers: { questionId: string; response: unknown }[]; integrityEvents: { type: string; detail?: string; at?: number; photoKey?: string | null }[]; optionOrder?: string }) =>
-    req<{ ok: boolean; score: number; integrityScore: number }>(`/student/attempts/${attemptId}/submit`, {
+    req<{ ok: boolean; score: number; integrityScore: number; gradeAt?: number | null }>(`/student/attempts/${attemptId}/submit`, {
       method: "POST",
       body: JSON.stringify(payload),
     },

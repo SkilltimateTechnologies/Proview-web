@@ -202,6 +202,11 @@ try {
   check("resume (/start) returns the indices the student actually clicked", resumeOk2);
 
   // ---- 6. submit and grade -------------------------------------------------
+  // The server refuses Submit until "Minimum time before Submit" (default 20 min)
+  // has passed since the attempt started. Move this throwaway attempt's start
+  // back 30 minutes so the check can submit now (the exam runs 60, so it is
+  // still well inside its time).
+  await q("update attempts set started_at = ? where id = ?", [Date.now() - 30 * 60_000, attemptId]);
   const sub = await api(`/student/attempts/${attemptId}/submit`, {
     method: "POST",
     body: JSON.stringify({

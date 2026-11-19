@@ -3,7 +3,7 @@ import type { Dispatch, SetStateAction } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Plus, Lock, BarChart3, Clock, CalendarClock, ArrowLeft, Pencil, Ban, Search, UserPlus, UserX, Undo2, Users, X } from "lucide-react";
 import { useLocation, useParams } from "wouter";
-import { api } from "../lib/api";
+import { api, data, withBody, withQuery } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Field, usePagination, Pager, Drawer } from "../components/ui";
 
@@ -28,14 +28,6 @@ function fmtDate(ts: number | string | null | undefined): string {
   const ms = toMs(ts);
   if (!ms) return "—";
   return new Date(ms).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" });
-}
-// Timestamp -> value for <input type="datetime-local"> (local wall-clock, no seconds).
-function toLocalInput(ts: number | string | null | undefined): string {
-  const ms = toMs(ts);
-  if (!ms) return "";
-  const d = new Date(ms);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 // Combine a date (YYYY-MM-DD) + slot (HH:mm) into an IST wall-clock ISO string
@@ -98,7 +90,7 @@ export default function Exams() {
 
   const exams = useQuery({
     queryKey: ["exams"],
-    queryFn: async () => (await api.exams.$get()).json(),
+    queryFn: async () => data(await api.exams.$get()),
   });
 
   const examList = exams.data?.exams ?? [];
@@ -186,8 +178,8 @@ export function EditExam() {
     queryKey: ["exam", examId],
     queryFn: async () => (await api.exams[":id"].$get({ param: { id: examId } })).json(),
   });
-  const classes = useQuery({ queryKey: ["classes"], queryFn: async () => (await api.classes.$get()).json() });
-  const questions = useQuery({ queryKey: ["questions-pick"], queryFn: async () => (await api.questions.$get()).json() });
+  const classes = useQuery({ queryKey: ["classes"], queryFn: async () => data(await api.classes.$get()) });
+  const questions = useQuery({ queryKey: ["questions-pick"], queryFn: async () => data(await api.questions.$get()) });
   const sections = (classes.data?.classes ?? []) as Array<{ id: string; code: string }>;
   const qList = (questions.data?.questions ?? []) as PickQ[];
 
@@ -233,10 +225,10 @@ export function EditExam() {
   const save = useMutation({
     mutationFn: async () => {
       const startAt = combineIST(date, slot);
-      const res = await api.exams[":id"].$patch({
+      const res = await api.exams[":id"].$patch(withBody({
         param: { id: examId },
+      }, {
         // A start time means the assessment is scheduled; no start time keeps it a draft.
-        json: {
           title,
           durationMin,
           startAt,
@@ -249,8 +241,7 @@ export function EditExam() {
           studentIds: scope === "students" ? studentIds : undefined,
           questionIds: picked,
           status: startAt ? "scheduled" : "draft",
-        },
-      });
+      }));
       // A refused save (e.g. it would delete students' results) must not look like
       // success: this used to navigate away whatever the server answered.
       const body = (await res.json()) as { message?: string };
@@ -262,10 +253,7 @@ export function EditExam() {
 
   const cancelExam = useMutation({
     mutationFn: async () =>
-      (await api.exams[":id"].$patch({
-        param: { id: examId },
-        json: { status: "draft", startAt: null },
-      })).json(),
+      (await api.exams[":id"].$patch(withBody({ param: { id: examId } }, { status: "draft", startAt: null }))).json(),
     onSuccess: done,
   });
 
@@ -421,7 +409,7 @@ function RosterPanel({ examId }: { examId: string }) {
 
   const reset = useMutation({
     mutationFn: async (studentId: string) => {
-      const res = await api.exams[":examId"].roster.reset.$post({ param: { examId }, json: { studentId } });
+      const res = await api.exams[":examId"].roster.reset.$post(withBody({ param: { examId } }, { studentId }));
       if (!res.ok) throw new Error("failed");
       return res.json();
     },
@@ -513,8 +501,8 @@ function RosterPickDrawer({ examId, mode, onClose, onDone }: { examId: string; m
     queryKey: ["roster-pick", examId, mode, debounced],
     queryFn: async () => {
       const res = mode === "add"
-        ? await api.exams[":examId"].roster.candidates.$get({ param: { examId }, query: { q: debounced } })
-        : await api.exams[":examId"].roster.eligible.$get({ param: { examId }, query: { q: debounced } });
+        ? await api.exams[":examId"].roster.candidates.$get(withQuery({ param: { examId } }, { q: debounced }))
+        : await api.exams[":examId"].roster.eligible.$get(withQuery({ param: { examId } }, { q: debounced }));
       if (!res.ok) throw new Error("failed");
       return res.json();
     },
@@ -527,8 +515,8 @@ function RosterPickDrawer({ examId, mode, onClose, onDone }: { examId: string; m
     mutationFn: async (studentId: string) => {
       setBusyId(studentId);
       const res = mode === "add"
-        ? await api.exams[":examId"].roster.add.$post({ param: { examId }, json: { studentId } })
-        : await api.exams[":examId"].roster.remove.$post({ param: { examId }, json: { studentId } });
+        ? await api.exams[":examId"].roster.add.$post(withBody({ param: { examId } }, { studentId }))
+        : await api.exams[":examId"].roster.remove.$post(withBody({ param: { examId } }, { studentId }));
       if (!res.ok) throw new Error("failed");
       return res.json();
     },
@@ -696,8 +684,8 @@ export function NewExam() {
   const qc = useQueryClient();
   const [, navigate] = useLocation();
 
-  const classes = useQuery({ queryKey: ["classes"], queryFn: async () => (await api.classes.$get()).json() });
-  const questions = useQuery({ queryKey: ["questions-pick"], queryFn: async () => (await api.questions.$get()).json() });
+  const classes = useQuery({ queryKey: ["classes"], queryFn: async () => data(await api.classes.$get()) });
+  const questions = useQuery({ queryKey: ["questions-pick"], queryFn: async () => data(await api.questions.$get()) });
   const sections = (classes.data?.classes ?? []) as Array<{ id: string; code: string }>;
   const qList = (questions.data?.questions ?? []) as PickQ[];
 

@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { reportClientError } from "../lib/error-reporter";
 
 /**
  * Catches render-time exceptions so a crash shows a message instead of a blank page.
@@ -24,13 +25,13 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    // Console only, on purpose. Shipping these to the server would mean a new
-    // unauthenticated write endpoint (the student token is not always present
-    // when the crash is in the login/boot path), which is an abuse surface not
-    // worth opening for this fix. The message is rendered on screen below so an
-    // invigilator can read it off the student's machine, and it stays in the
-    // console for a support screen-share.
+    // Reported to the server (lib/error-reporter.ts → POST /api/client-errors).
+    // That endpoint is unauthenticated because a crash can happen before sign-in;
+    // it stores nothing but a log line, trims every field, takes at most 64 KB and
+    // at most 120 reports a minute across everyone. The message is still rendered
+    // below so an invigilator can read it off the student's machine.
     console.error("[error-boundary] render failed:", error, info.componentStack);
+    reportClientError(Object.assign(new Error(error.message), { name: error.name, stack: `${error.stack ?? ""}\n${info.componentStack ?? ""}`.slice(0, 4000) }), "render");
   }
 
   render() {
