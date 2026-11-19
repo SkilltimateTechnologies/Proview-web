@@ -121,7 +121,10 @@ describe("attempts_status_idx is declared where production will create it", () =
       expect(spec.name).toMatch(/^[a-z0-9_]+$/);
       expect(spec.table).toMatch(/^[a-z0-9_]+$/);
       expect(spec.columns.length).toBeGreaterThan(0);
-      for (const c of spec.columns) expect(c).toMatch(/^[a-z0-9_]+$/);
+      // A plain column, or the one expression shape the student-login indexes use:
+      // upper/lower of a trimmed column. Anything else is refused, since the spec is
+      // spliced into CREATE INDEX unquoted.
+      for (const c of spec.columns) expect(c).toMatch(/^(?:[a-z0-9_]+|(?:upper|lower)\(trim\([a-z0-9_]+\)\))$/);
     }
   });
 
@@ -215,6 +218,34 @@ describe("the sweep queries stop scanning once the index exists", () => {
       "attempts_status_idx",
     ]) {
       expect(names).toContain(n);
+    }
+  });
+});
+
+
+describe("student login lookup indexes", () => {
+  test("the login query is served by the two expression indexes, not a table scan", async () => {
+    const client = createClient({ url: ":memory:" });
+    try {
+      await client.execute(
+        `CREATE TABLE students (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, roll_no TEXT NOT NULL, email TEXT, name TEXT, password TEXT, enabled INTEGER)`,
+      );
+      for (const name of ["students_roll_lookup_idx", "students_email_lookup_idx"]) {
+        const spec = REQUIRED_PERF_INDEXES.find((s) => s.name === name)!;
+        expect(spec).toBeDefined();
+        await client.execute(`CREATE INDEX IF NOT EXISTS ${spec.name} ON ${spec.table} (${spec.columns.join(", ")})`);
+      }
+      // Same shape as POST /students/verify-login.
+      const plan = await client.execute({
+        sql: `EXPLAIN QUERY PLAN SELECT * FROM students WHERE upper(trim(roll_no)) IN (?, ?) OR lower(trim(email)) = ? LIMIT 5`,
+        args: ["23K91A0501", "23K91A0501 ", "23k91a0501"],
+      });
+      const detail = plan.rows.map((r) => String(r.detail ?? r[3])).join(" | ");
+      expect(detail).toContain("students_roll_lookup_idx");
+      expect(detail).toContain("students_email_lookup_idx");
+      expect(detail).not.toMatch(/SCAN students(?! USING)/);
+    } finally {
+      client.close();
     }
   });
 });

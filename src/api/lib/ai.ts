@@ -1,5 +1,6 @@
 import { generateText } from "ai";
 import { gateway, modelFor } from "./gateway";
+import { UNGRADED_NOTE } from "./grade-cache";
 
 /**
  * Hard ceiling on a single AI call. Grading runs behind a small global
@@ -121,7 +122,7 @@ Return ONLY JSON: { "score": <number 0-${maxPoints}>, "notes": "<2-3 sentence fe
     abortSignal: AbortSignal.timeout(AI_TIMEOUT_MS),
     maxRetries: AI_RETRIES,
   });
-  const res = extractJson<{ score: number; notes: string }>(text, { score: 0, notes: "Could not grade automatically." });
+  const res = extractJson<{ score: number; notes: string }>(text, { score: 0, notes: UNGRADED_NOTE });
   const score = Math.max(0, Math.min(maxPoints, Number(res.score) || 0));
   return { score, notes: res.notes || "" };
 }

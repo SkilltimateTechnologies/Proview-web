@@ -13,6 +13,7 @@ import { and, eq, inArray, notInArray, sql as dsql } from "drizzle-orm";
 import { db, runInLane } from "../database";
 import * as schema from "../database/schema";
 import { gradeSubjective } from "./ai";
+import { gradeCache } from "./grade-cache";
 import {
   MAX_GRADE_TRIES,
   backfillGradeJobs,
@@ -282,7 +283,7 @@ export async function gradeAttemptOnce(
           const maxScore = a.maxScore ?? q.points ?? 1;
           try {
             const meta = (q.meta ?? {}) as Record<string, unknown>;
-            const res = await gradeSubjective({
+            const input = {
               question: q.prompt,
               rubric: (meta.rubric as string) || (meta.solution as string) || undefined,
               studentAnswer: String(typeof a.response === "string" ? a.response : JSON.stringify(a.response)),
@@ -290,7 +291,9 @@ export async function gradeAttemptOnce(
               isCode: q.type === "coding",
               language: meta.language as string | undefined,
               provider,
-            });
+            };
+            // Identical answers to the same question are graded once (lib/grade-cache.ts).
+            const res = await gradeCache.grade({ ...input, questionId: q.id }, () => gradeSubjective(input));
             await db.update(schema.answers).set({ score: res.score, aiNotes: res.notes, autoGraded: true }).where(eq(schema.answers.id, a.id));
           } catch (e) {
             console.error(`[grade-queue] grade answer ${a.id} failed:`, e);

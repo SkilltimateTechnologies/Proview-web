@@ -137,6 +137,22 @@ export const REQUIRED_PERF_INDEXES: IndexSpec[] = [
       "filters status='submitted', so the cost grew with exam history rather than with " +
       "load (at ~58k stored attempts one 60s scan alone consumes a 2.5B-row monthly plan)",
   },
+  {
+    name: "students_roll_lookup_idx",
+    table: "students",
+    // Expression index: student login matches `upper(trim(roll_no))` WITHOUT a
+    // college, so the (tenant_id, ...) unique index cannot serve it.
+    columns: ["upper(trim(roll_no))"],
+    guards:
+      "student login scanning every student record of every college for each sign-in — " +
+      "a whole exam hall signing in at once multiplies that by the roster",
+  },
+  {
+    name: "students_email_lookup_idx",
+    table: "students",
+    columns: ["lower(trim(email))"],
+    guards: "student login by email scanning every student record for each sign-in",
+  },
 ];
 
 type TableSpec = {

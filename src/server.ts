@@ -4,6 +4,7 @@ import { brotliCompress, constants as zlibConstants, gzip } from "node:zlib";
 import app from "./api";
 import { startAutoSubmitSweep, startGradeQueue } from "./api/lib/grade-queue";
 import { heartbeats } from "./api/lib/heartbeat-queue";
+import { backups } from "./api/lib/backups-runtime";
 import { db, runInLane } from "./api/database";
 import { ensureDatabaseInvariants, ensureRequiredColumns } from "./api/database/invariants";
 import {
@@ -253,6 +254,11 @@ if (runsBackgroundWork) {
   // `in_progress` attempts (student closed the browser / lost connection at the
   // cutoff) so they never stay stuck in-progress. Runs every 60s.
   startAutoSubmitSweep(60_000);
+
+  // Exam-anchored backups (lib/backups.ts): a gzipped database dump into the bucket
+  // 12h after each exam closes, never while an exam is live. Background work, so
+  // ROLE=web replicas never dump. No-op when disabled or on a local file database.
+  backups.start();
 }
 
 // The heartbeat flusher is deliberately OUTSIDE the ROLE gate above. Heartbeats

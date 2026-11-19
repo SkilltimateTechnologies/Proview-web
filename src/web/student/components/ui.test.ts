@@ -16,9 +16,13 @@ import { STUDENT_ICONS } from "./ui";
 const NOT_ICONS = new Set([
   "camera", "copy", "delete", "ellipsis", "filter", "focus", "grid", "import",
   "italic", "list", "map", "package", "pill", "pointer", "text",
+  "form", // a registration step name, not an icon
 ]);
 
 const root = join(import.meta.dir, "..");
+// The public registration page imports this Icon too. It was missed the first time
+// round, and its "badge-check" icon silently rendered nothing in production.
+const extraRoots = [join(import.meta.dir, "..", "..", "register")];
 const walk = (d: string): string[] =>
   readdirSync(d).flatMap((f) => {
     const p = join(d, f);
@@ -30,10 +34,10 @@ const isLucide = (n: string) => typeof (Lucide as Record<string, unknown>)[pasca
 describe("student icon map", () => {
   test("every icon name used in the student app is in the map", () => {
     const missing = new Set<string>();
-    for (const file of walk(root).filter((f) => /\.tsx?$/.test(f) && !/\.test\./.test(f))) {
+    for (const file of [root, ...extraRoots].flatMap(walk).filter((f) => /\.tsx?$/.test(f) && !/\.test\./.test(f))) {
       for (const m of readFileSync(file, "utf8").matchAll(/["'`]([a-z][a-z0-9]*(?:-[a-z0-9]+)*)["'`]/g)) {
         const name = m[1];
-        if (isLucide(name) && !NOT_ICONS.has(name) && !STUDENT_ICONS[name]) missing.add(`${name} (${file.slice(root.length + 1)})`);
+        if (isLucide(name) && !NOT_ICONS.has(name) && !STUDENT_ICONS[name]) missing.add(`${name} (${file})`);
       }
     }
     expect([...missing]).toEqual([]);

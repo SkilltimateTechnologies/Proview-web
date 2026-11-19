@@ -27,12 +27,14 @@ import { sql } from "drizzle-orm";
 /* -------------------------------------------------------------------------- */
 
 /** Client poll interval in monitor.tsx. Keep in sync if that changes. */
-export const MONITOR_POLL_MS = 5000;
+export const MONITOR_POLL_MS = 15_000;
 /**
- * A build slower than this is a warning: at half the poll interval there is
- * still headroom, but the trend that caused the freeze has started.
+ * A build slower than this is a warning. It was half the poll interval when the
+ * page polled every 5s; the poll is now 15s (2026-11-19) but the alarm stays at
+ * 2.5s on purpose — a build that slow is the trend that caused the freeze, however
+ * often the page asks.
  */
-export const MONITOR_BUDGET_MS = MONITOR_POLL_MS / 2;
+export const MONITOR_BUDGET_MS = 2_500;
 /** Consecutive over-budget builds before we call the monitor degraded. */
 const DEGRADED_STREAK = 3;
 

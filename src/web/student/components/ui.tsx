@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import {
   AlarmClockIcon,
+  BadgeCheckIcon,
   ArrowLeftIcon,
   ArrowRightIcon,
   CheckIcon,
@@ -45,7 +46,8 @@ import {
 } from "lucide-react";
 
 /**
- * Every icon the student app renders, by kebab-case name.
+ * Every icon the student app AND the public registration page (which imports this
+ * component) render, by kebab-case name.
  *
  * This used to be `import * as Lucide from "lucide-react"` plus a lookup by name,
  * which defeats tree-shaking: the whole icon library (~1,600 icons, ~940 KB of
@@ -57,6 +59,7 @@ import {
  */
 export const STUDENT_ICONS: Record<string, LucideIcon> = {
   "alarm-clock": AlarmClockIcon,
+  "badge-check": BadgeCheckIcon,
   "arrow-left": ArrowLeftIcon,
   "arrow-right": ArrowRightIcon,
   "check": CheckIcon,

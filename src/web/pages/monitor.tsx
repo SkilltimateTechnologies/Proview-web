@@ -122,6 +122,13 @@ function ExamControls({ examId, held, extraMin }: { examId: string; held: boolea
   );
 }
 
+/**
+ * Rows drawn per exam until the invigilator asks for all. A full exam is ~1,100
+ * rows, re-rendered on every refresh; drawing them all made the invigilator's
+ * own browser the slow part of the Live Monitor. Filters still count every student.
+ */
+const MONITOR_ROW_LIMIT = 200;
+
 type MonitorHealth = { degraded: boolean; lastBuildMs: number | null; worstBuildMs: number | null; budgetMs: number; pollMs: number };
 
 /**
@@ -135,7 +142,8 @@ function LagWarning({ dataUpdatedAt, health }: { dataUpdatedAt: number; health: 
     return () => clearInterval(t);
   }, []);
   const staleMs = dataUpdatedAt ? now - dataUpdatedAt : 0;
-  const stale = !!dataUpdatedAt && staleMs > 15_000;
+  // Three missed refreshes at the 15s poll, as it was three at the old 5s poll.
+  const stale = !!dataUpdatedAt && staleMs > 45_000;
   if (!health?.degraded && !stale) return null;
   return (
     <div className="card mb-4 flex items-start gap-3 border-l-4 border-l-[#c2410c] bg-[#fff7ed] p-4">
@@ -157,9 +165,14 @@ function LagWarning({ dataUpdatedAt, health }: { dataUpdatedAt: number; health: 
 export default function Monitor() {
   const [active, setActive] = useState<LiveStudent | null>(null);
   const [filter, setFilter] = useState<FilterKey>("all");
+  // Exams whose full list the invigilator asked to see (see MONITOR_ROW_LIMIT).
+  const [showAll, setShowAll] = useState<Record<string, boolean>>({});
   const q = useQuery({
     queryKey: ["monitor"],
-    refetchInterval: 5000,
+    // 15s (was 5s): an invigilator does not need sub-15s freshness, and each open
+    // tab polled the server three times as often for it. Keep MONITOR_POLL_MS in
+    // api/lib/watchdog.ts in sync.
+    refetchInterval: 15_000,
     queryFn: async () => {
       const res = await api.monitor.$get();
       if (!res.ok) throw new Error("failed");
@@ -189,7 +202,7 @@ export default function Monitor() {
 
   return (
     <div className="rise">
-      <PageHeader eyebrow="Proctoring" title="Live Monitor" action={<Pill label="AUTO-REFRESH 5s" color="#2e7d5b" />} />
+      <PageHeader eyebrow="Proctoring" title="Live Monitor" action={<Pill label="AUTO-REFRESH 15s" color="#2e7d5b" />} />
 
       {/* Its own component: the 2s staleness clock used to live in this page, so
           every tick re-rendered the whole table (~1,100 rows during a full exam). */}
@@ -215,7 +228,12 @@ export default function Monitor() {
       ) : (
         <div className="space-y-6">
           {q.data.live.map((ex) => {
-            const students = (ex.students as LiveStudent[]).filter(matchFilter);
+            // Students who need attention come first, so the row limit can never
+            // hide them: flagged ones, then in-progress students who went offline.
+            // Otherwise the server's order is kept (stable sort).
+            const attention = (st: LiveStudent) =>
+              (st.violations ?? 0) > 0 ? 0 : st.status === "in_progress" && !st.online ? 1 : 2;
+            const students = (ex.students as LiveStudent[]).filter(matchFilter).sort((a, b) => attention(a) - attention(b));
             const total = ex.students.length;
             const inProg = (ex.students as LiveStudent[]).filter((s) => s.status === "in_progress").length;
             const done = (ex.students as LiveStudent[]).filter((s) => s.status === "finished").length;
@@ -276,7 +294,7 @@ export default function Monitor() {
                           </tr>
                         </thead>
                         <tbody>
-                          {students.map((s) => (
+                          {(showAll[ex.examId] ? students : students.slice(0, MONITOR_ROW_LIMIT)).map((s) => (
                             <tr
                               key={s.attemptId}
                               className="cursor-pointer"
@@ -333,6 +351,14 @@ export default function Monitor() {
                         </tbody>
                       </table>
                     </div>
+                    {students.length > MONITOR_ROW_LIMIT && !showAll[ex.examId] ? (
+                      <div className="flex items-center justify-between gap-3 border-t border-[var(--color-line)] px-4 py-3 text-sm text-[var(--color-ink2)]">
+                        <span>Showing {MONITOR_ROW_LIMIT} of {students.length}. Use the filters above to narrow the list.</span>
+                        <button className="btn btn-ghost btn-sm" onClick={() => setShowAll((m) => ({ ...m, [ex.examId]: true }))}>
+                          Show all {students.length}
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
                 )}
               </div>

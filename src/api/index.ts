@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { gzipJson } from "./lib/gzip-json";
-import { eq, ne, and, or, desc, gte, inArray, like, sql as dsql } from "drizzle-orm";
+import { eq, ne, and, or, desc, gte, inArray, sql as dsql } from "drizzle-orm";
 import { auth } from "./auth";
 import { hashPassword, verifyPassword } from "better-auth/crypto";
 import { db, dbConfig, dbStats, runInLane } from "./database";
@@ -27,6 +27,8 @@ import { attemptTenants, concurrencyGate, evidenceMeter, resolveLimit, tenantQuo
 import { EMPTY_ROLLUP, loadAttemptRollups, rollupAvg } from "./lib/report-rollup";
 import { TenantDirectory } from "./lib/tenant-directory";
 import { assignableRoles, canChangeRole, canManageStaff, inCollege } from "./lib/staff-policy";
+import { studentLoginThrottle } from "./lib/login-throttle";
+import { backups } from "./lib/backups-runtime";
 import { createBulkStudentPasswords } from "./lib/bulk-student-passwords";
 import { bulkResetHandler } from "./routes/bulk-student-passwords";
 import { examEffStatus, isConcluded, isReportable, resultsUnlocked, toMs, type StatusExam } from "./lib/exam-status";
@@ -644,7 +646,10 @@ const NOT_FOUND = { message: "Not found" } as const;
 const bulkStudentPasswords = createBulkStudentPasswords({
   db,
   secret: () => process.env.BETTER_AUTH_SECRET ?? "",
-  invalidate: (tenantId) => directory.invalidateStudents(tenantId),
+  invalidate: (tenantId) => {
+    directory.invalidateStudents(tenantId);
+    studentLoginThrottle.clear();
+  },
 });
 
 /**
@@ -712,6 +717,11 @@ const app = new Hono<{ Variables: Vars }>()
         // caches are holding. The scale incident was a round-trip problem, so this
         // is the number to watch during an exam: divide the delta by the requests
         // served and you have the cost per request.
+        // Production (Railway/Nixpacks) runs an older Bun than development, which is
+        // what broke logins on 2026-11-19. Reported so the version is never a guess.
+        runtime: { bun: typeof Bun !== "undefined" ? Bun.version : null },
+        // Advisory only: a failed or stale backup never turns health red (rule 3).
+        backups: backups.status(),
         db: {
           queries: dbStats.queries,
           // Connection layer: per-lane statements in flight (running + queued),
@@ -900,6 +910,9 @@ const app = new Hono<{ Variables: Vars }>()
     if (!key) return c.text("Not found", 404);
     // Reject traversal / absolute keys before they reach storage.
     if (key.includes("..") || key.startsWith("/")) return c.text("Not found", 404);
+    // Database backups contain every college's data and every password hash. They
+    // are never served through the app, to anyone: restore from the bucket itself.
+    if (key.startsWith("backups/")) return c.text("Not found", 404);
 
     if (key.startsWith("integrity/")) {
       const profile = c.get("profile");
@@ -968,25 +981,35 @@ const app = new Hono<{ Variables: Vars }>()
     // A query containing a digit is treated as a roll number; otherwise a name.
     const looksLikeRoll = /\d/.test(raw);
 
-    const rows = await db
+    // PUBLIC endpoint (no login). It used to answer any partial name with up to six
+    // full names and roll numbers, so anyone holding the registration link could
+    // list the whole college a few letters at a time. Now: a roll number must match
+    // exactly; a name must match the WHOLE name (case and spacing ignored); and
+    // the answer carries only the first name, plus the roll number only when the
+    // asker already typed it.
+    const rollKey = normalizeRoll(raw);
+    const nameKey = nameQ.toLowerCase();
+    const [hit] = await db
       .select({ name: schema.students.name, rollNo: schema.students.rollNo })
       .from(schema.students)
       .where(
         and(
           eq(schema.students.tenantId, tid),
-          or(eq(schema.students.rollNo, roll), like(schema.students.name, `%${nameQ}%`)),
+          looksLikeRoll
+            ? dsql`upper(trim(${schema.students.rollNo})) = ${rollKey}`
+            : dsql`lower(trim(${schema.students.name})) = ${nameKey}`,
         ),
       )
-      .limit(6);
+      .limit(1);
+    const firstName = hit ? (String(hit.name ?? "").trim().split(/\s+/)[0] ?? "") : null;
 
     return c.json(
       {
         query: raw,
         looksLikeRoll,
-        exists: rows.length > 0,
-        matches: rows,
-        name: rows[0]?.name ?? null,
-        rollNo: looksLikeRoll ? roll : (rows[0]?.rollNo ?? ""),
+        exists: !!hit,
+        name: firstName || null,
+        rollNo: looksLikeRoll ? roll : "",
       },
       200,
     );
@@ -1686,6 +1709,7 @@ const app = new Hono<{ Variables: Vars }>()
     const b = await c.req.json();
     const newPassword: string = b.password && String(b.password).length >= 6 ? String(b.password) : "Welcome@123";
     await db.update(schema.students).set({ password: await hashPassword(newPassword), mustChangePassword: true }).where(eq(schema.students.id, sid));
+    studentLoginThrottle.clear();
     // Only a studentId is in scope, so clear every tenant. Rare enough to be free.
     directory.invalidateStudents();
     // Return the plaintext ONCE so the admin can hand it to the student; never stored/readable after.
@@ -1728,14 +1752,44 @@ const app = new Hono<{ Variables: Vars }>()
     const identifier = String(b.identifier ?? "").trim();
     const password = String(b.password ?? "");
     if (!identifier || !password) return c.json({ ok: false, message: "Enter your roll number / email and password." }, 400);
-    const [stu] = await db
+    // Password guessing is slowed per account (lib/login-throttle.ts) — never per IP,
+    // because a whole exam hall shares one college IP.
+    const waitMs = studentLoginThrottle.retryAfterMs(identifier);
+    if (waitMs > 0) {
+      const minutes = Math.ceil(waitMs / 60_000);
+      return c.json({ ok: false, message: `Too many incorrect attempts. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}, or ask your invigilator to reset your password.` }, 429);
+    }
+    // Matched the way rolls and emails are STORED (upper-cased roll, any case of
+    // email), so "23k91a0501" now logs in like "23K91A0501". Both lookups ride an
+    // expression index (REQUIRED_PERF_INDEXES), where this used to scan every
+    // student. Up to 5 candidates: two colleges may share a roll number, and the
+    // password decides which account is meant instead of whichever row came first.
+    const rollKey = normalizeRoll(identifier);
+    const emailKey = identifier.toLowerCase();
+    const candidates = await db
       .select()
       .from(schema.students)
-      .where(or(eq(schema.students.rollNo, identifier), eq(schema.students.email, identifier)))
-      .limit(1);
-    if (!stu || !stu.enabled) return c.json({ ok: false, message: "No account found for this roll number / email." }, 401);
-    const valid = await verifyPassword({ hash: stu.password, password });
-    if (!valid) return c.json({ ok: false, message: "Incorrect password. Please try again." }, 401);
+      .where(
+        or(
+          inArray(dsql`upper(trim(${schema.students.rollNo}))`, [...new Set([rollKey, identifier.toUpperCase()])]),
+          eq(dsql`lower(trim(${schema.students.email}))`, emailKey),
+        ),
+      )
+      .limit(5);
+    const enabled = candidates.filter((s) => s.enabled);
+    if (!enabled.length) return c.json({ ok: false, message: "No account found for this roll number / email." }, 401);
+    let stu: (typeof enabled)[number] | null = null;
+    for (const candidate of enabled) {
+      if (await verifyPassword({ hash: candidate.password, password })) {
+        stu = candidate;
+        break;
+      }
+    }
+    if (!stu) {
+      studentLoginThrottle.recordFailure(identifier);
+      return c.json({ ok: false, message: "Incorrect password. Please try again." }, 401);
+    }
+    studentLoginThrottle.recordSuccess(identifier);
     const token = await signStudentToken(stu.id);
     const [tenant] = await db.select().from(schema.tenants).where(eq(schema.tenants.id, stu.tenantId)).limit(1);
     return c.json({
@@ -1982,8 +2036,9 @@ const app = new Hono<{ Variables: Vars }>()
       // a later section change (e.g. promotion into ELITE) never rewrites history.
       let sectionSnapshot: string | null = null;
       if (startStu.classId) {
-        const [snapCls] = await db.select({ code: schema.classes.code }).from(schema.classes).where(eq(schema.classes.id, startStu.classId)).limit(1);
-        sectionSnapshot = snapCls?.code ?? null;
+        // From the tenant's cached section list (15s TTL, dropped on any section
+        // edit) instead of one more query per student at the start bell.
+        sectionSnapshot = (await directory.classIndex(startStu.tenantId)).codeById.get(startStu.classId) ?? null;
       }
       // RACE-SAFE CREATE. A student clicking Start twice, a flaky network retry, or
       // SEB reloading the page fires several /start calls at once. Select-then-insert
@@ -2717,6 +2772,38 @@ const app = new Hono<{ Variables: Vars }>()
     const eid = c.req.param("id");
     if (!inCollege(c.get("profile"), await tenantOf("exam", eid))) return c.json(NOT_FOUND, 404);
     const b = await c.req.json();
+    // GUARD, checked before ANY write. In "students" mode the save below reconciles
+    // the roster to exactly `studentIds`, deleting the attempts, answers and
+    // proctoring evidence of anyone left off the list. Saving the edit form on an
+    // exam that has already been sat could therefore erase real results, with no
+    // backup to restore from. Refuse unless the caller explicitly confirms
+    // (`forceRemoveAttempts: true`); removing one student on purpose is still
+    // possible through the roster "Remove" action, which is explicit by design.
+    if (Array.isArray(b.studentIds) && b.forceRemoveAttempts !== true) {
+      const [cur] = await db.select({ assignMode: schema.exams.assignMode }).from(schema.exams).where(eq(schema.exams.id, eid)).limit(1);
+      const mode = b.assignMode !== undefined ? (b.assignMode === "students" ? "students" : "cohort") : cur?.assignMode;
+      if (mode === "students") {
+        const keep = new Set(b.studentIds.map((x: unknown) => String(x)));
+        const adds = await db
+          .select({ studentId: schema.examRoster.studentId })
+          .from(schema.examRoster)
+          .where(and(eq(schema.examRoster.examId, eid), eq(schema.examRoster.mode, "add")));
+        const dropping = adds.map((r) => r.studentId).filter((id) => !keep.has(id));
+        if (dropping.length) {
+          const sat = await db
+            .select({ studentId: schema.attempts.studentId })
+            .from(schema.attempts)
+            .where(and(eq(schema.attempts.examId, eid), inArray(schema.attempts.studentId, dropping), ne(schema.attempts.status, "not_started")));
+          if (sat.length) {
+            return c.json({
+              message: `${sat.length} student${sat.length === 1 ? " has" : "s have"} already taken this exam and would lose their answers if removed from the list. Nothing was saved. Add them back, or remove them one at a time from the exam's roster if you really mean to delete their results.`,
+              code: "would_delete_attempts",
+              studentIds: sat.map((r) => r.studentId),
+            }, 409);
+          }
+        }
+      }
+    }
     const patch: Record<string, unknown> = {};
     for (const k of ["title", "status", "durationMin"]) if (b[k] !== undefined) patch[k] = b[k];
     if (b.assignMode !== undefined) patch.assignMode = b.assignMode === "students" ? "students" : "cohort";
@@ -3083,7 +3170,7 @@ const app = new Hono<{ Variables: Vars }>()
     const tid = p.tenantId;
     if (!tid) return c.json({ live: [], nextScheduled: null, health: null }, 200);
 
-    // Every open Live Monitor tab polls this endpoint every 5s, and during an exam
+    // Every open Live Monitor tab polls this endpoint (every 15s), and during an exam
     // several invigilators watch at once. The payload is identical for everyone in
     // the tenant, so build it ONCE and share it: concurrent callers join the
     // in-flight promise, and callers within the cache window get the last result.
