@@ -87,10 +87,10 @@ export type Bundle = {
   optionOrder?: string;
 };
 
-export type StartInfo = { attemptId: string; startedAt: string; endAt: string; serverNow: string; durationMin: number; pausedMs?: number; held?: boolean; answers?: Record<string, unknown> };
+export type StartInfo = { attemptId: string; startedAt: string; endAt: string; submitAvailableAt?: string | null; serverNow: string; durationMin: number; pausedMs?: number; held?: boolean; answers?: Record<string, unknown> };
 export type ResumeInfo = { attemptId: string; endAt: string; serverNow: string; pausedMs: number };
 export type HeartbeatInfo = { held: boolean; endAt: string; serverNow: string };
-export type StatusInfo = { status: "not_started" | "in_progress" | "submitted" | "graded"; attemptId: string | null; startedAt: string | null; endAt: string | null; serverNow: string; held: boolean; score?: number | null; answers?: Record<string, unknown> };
+export type StatusInfo = { status: "not_started" | "in_progress" | "submitted" | "graded"; attemptId: string | null; startedAt: string | null; endAt: string | null; submitAvailableAt?: string | null; serverNow: string; held: boolean; score?: number | null; answers?: Record<string, unknown> };
 
 export type ReviewQuestion = {
   id: string;

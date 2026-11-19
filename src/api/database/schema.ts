@@ -429,6 +429,9 @@ export type ProctorConfig = {
   // comes from Safe Exam Browser running one of these configs (lib/seb.ts).
   requireSeb?: boolean;
   sebConfigKeys?: string[];        // SEB Config Keys (64 hex), never sent to students
+  // Optional (JSON field, no migration): minutes a student must write before the
+  // Submit button works. The exam's own deadline still ends the attempt.
+  minSubmitMinutes?: number;
 };
 
 export const DEFAULT_PROCTORING: ProctorConfig = {
@@ -448,4 +451,5 @@ export const DEFAULT_PROCTORING: ProctorConfig = {
   autoSubmitOnTimeout: true,
   requireSeb: false,
   sebConfigKeys: [],
+  minSubmitMinutes: 20,
 };

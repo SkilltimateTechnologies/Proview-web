@@ -62,6 +62,24 @@ export function effectiveEndMs(
   return base + extra;
 }
 
+/**
+ * The earliest moment a student may press Submit: their own start time plus the
+ * minimum writing time (Settings → Proctoring, default 20 minutes), shifted by
+ * any time the attempt was paused for a network drop. Capped at the exam length,
+ * so a short quiz is never unsubmittable. The deadline always wins: the guard on
+ * the submit route lets everything through once the exam's own time is up.
+ */
+export function submitAvailableAtMs(
+  exam: { durationMin: number },
+  attempt: { startedAt: Date | number | string | null; pausedMs?: number | null },
+  minSubmitMinutes: number,
+  now: number,
+): number {
+  const startedMs = attempt.startedAt ? new Date(attempt.startedAt).getTime() : now;
+  const minutes = Math.max(0, Math.min(Number(minSubmitMinutes) || 0, exam.durationMin));
+  return startedMs + minutes * 60_000 + (attempt.pausedMs ?? 0);
+}
+
 export function computeYear(batchStartYear: number): number {
   const now = new Date();
   // Academic year rolls in June/July.
