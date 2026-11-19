@@ -19,7 +19,13 @@ type ProctorConfig = {
   requireSingleScreen: boolean;
   blockScreenshots: boolean;
   autoSubmitOnTimeout: boolean;
+  requireSeb?: boolean;
+  sebConfigKeys?: string[];
 };
+
+type SebStatus = { lastSeenAt: string | null; lastMatched: boolean | null; lastUserAgent: string | null };
+
+const HEX64 = /^[0-9a-f]{64}$/i;
 
 type S = {
   aiProvider: string;
@@ -36,6 +42,7 @@ type S = {
   // null = unlimited, which is the shipped default. See api/lib/tenant-quota.ts.
   maxConcurrentAttempts: number | null;
   maxEvidencePerAttempt: number | null;
+  seb?: SebStatus;
 };
 
 function Toggle({ label, sub, checked, onChange }: { label: string; sub?: string; checked: boolean; onChange: (v: boolean) => void }) {
@@ -181,6 +188,16 @@ export default function Settings() {
         <div className="text-[11px] font-semibold tracking-wide uppercase text-[var(--color-ink2)] mt-5 mb-1">Timer</div>
         <Toggle label="Auto-submit when timer hits zero" sub="Force-submit the exam the moment the countdown reaches 0. Turn off to let students keep the screen open past time." checked={pc.autoSubmitOnTimeout} onChange={(v) => setPc({ autoSubmitOnTimeout: v })} />
 
+        {/* --- Safe Exam Browser --- */}
+        <div className="text-[11px] font-semibold tracking-wide uppercase text-[var(--color-ink2)] mt-5 mb-1">Safe Exam Browser</div>
+        <SebSettings
+          keys={pc.sebConfigKeys ?? []}
+          required={!!pc.requireSeb}
+          status={s?.seb}
+          onKeys={(sebConfigKeys) => setPc({ sebConfigKeys })}
+          onRequired={(requireSeb) => setPc({ requireSeb })}
+        />
+
         <div className="pt-4">
           <button className="btn btn-primary" disabled={save.isPending} onClick={() => save.mutate()}>
             {save.isPending ? "Saving…" : "Save proctoring rules"}
@@ -248,3 +265,60 @@ export default function Settings() {
 }
 
 // usage meters removed
+
+/**
+ * The optional "Require Safe Exam Browser" switch (api/lib/seb.ts). Keys are
+ * entered first and tested in the lab while the switch is off: the status line
+ * shows whether the last SEB request this server saw matched one of them.
+ */
+function SebSettings({ keys, required, status, onKeys, onRequired }: {
+  keys: string[];
+  required: boolean;
+  status?: SebStatus;
+  onKeys: (keys: string[]) => void;
+  onRequired: (v: boolean) => void;
+}) {
+  const [text, setText] = useState(keys.join("\n"));
+  const tokens = text.split(/[\s,;]+/).filter(Boolean);
+  const valid = tokens.filter((t) => HEX64.test(t));
+  const invalid = tokens.length - valid.length;
+  return (
+    <div className="py-3">
+      <Toggle
+        label="Require Safe Exam Browser"
+        sub="Students can sign in and write exams only inside the Proview SEB client running one of the configs below. Ordinary browsers are refused. Has no effect until at least one Config Key is saved."
+        checked={required}
+        onChange={onRequired}
+      />
+      <Field label="SEB Config Keys (one per line)">
+        <textarea
+          className="input font-mono text-[12px]"
+          rows={3}
+          value={text}
+          spellCheck={false}
+          placeholder="64-character Config Key from SEB's Config Tool (Exam tab)"
+          onChange={(e) => {
+            setText(e.target.value);
+            onKeys(e.target.value.split(/[\s,;]+/).filter((t) => HEX64.test(t)));
+          }}
+        />
+      </Field>
+      <div className="text-xs text-[var(--color-ink2)] mt-1.5 space-y-1">
+        <div>{valid.length} valid key{valid.length === 1 ? "" : "s"}{invalid ? ` · ${invalid} entr${invalid === 1 ? "y is" : "ies are"} not a 64-character key and will be ignored` : ""}. Keep the old key here while a new .seb is being rolled out.</div>
+        <div>
+          Last SEB request:{" "}
+          {status?.lastSeenAt ? (
+            <>
+              {new Date(status.lastSeenAt).toLocaleString()} ·{" "}
+              {status.lastMatched ? <b className="text-[var(--color-success,#2e7d5b)]">config recognised</b> : <b className="text-[var(--color-danger)]">config NOT recognised</b>}
+            </>
+          ) : (
+            "none since the server started"
+          )}
+        </div>
+        {required && !valid.length && <div className="text-[var(--color-danger)]">The switch is on but no key is saved, so nothing is enforced yet.</div>}
+        <div>To test: save the key with the switch off, open the Proview Exam app on a lab PC and sign in as a student, then reload this page. Turn the switch on only when it says “config recognised”.</div>
+      </div>
+    </div>
+  );
+}

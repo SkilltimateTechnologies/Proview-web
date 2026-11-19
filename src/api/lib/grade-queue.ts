@@ -14,6 +14,8 @@ import { db, runInLane } from "../database";
 import * as schema from "../database/schema";
 import { gradeSubjective } from "./ai";
 import { gradeCache } from "./grade-cache";
+import { judge0Queue, resolveJudge0Config } from "./judge0-queue";
+import { gradeWithTests, testsFingerprint, testsOf, timeLimitOf } from "./test-grading";
 import {
   MAX_GRADE_TRIES,
   backfillGradeJobs,
@@ -128,6 +130,17 @@ async function getProvider(): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/** Judge0 key: Settings first, then the JUDGE0_KEY env var (same order as the Run code route). */
+async function getJudge0Key(): Promise<string | null> {
+  try {
+    const [s] = await db.select({ k: schema.settings.judge0Key }).from(schema.settings).where(eq(schema.settings.id, "global")).limit(1);
+    if (s?.k) return s.k;
+  } catch {
+    /* fall back to env */
+  }
+  return process.env.JUDGE0_KEY || null;
 }
 
 export function hasContent(response: unknown): boolean {
@@ -274,6 +287,8 @@ export async function gradeAttemptOnce(
     const qids = [...new Set(pending.map((a) => a.questionId))];
     const qs = qids.length ? await db.select().from(schema.questions).where(inArray(schema.questions.id, qids)) : [];
     const qById = new Map(qs.map((q) => [q.id, q]));
+    // Resolved once per pass, and only if some answer needs the code runner.
+    let judge0Key: Promise<string | null> | null = null;
 
     await Promise.all(
       pending.map((a) =>
@@ -283,6 +298,52 @@ export async function gradeAttemptOnce(
           const maxScore = a.maxScore ?? q.points ?? 1;
           try {
             const meta = (q.meta ?? {}) as Record<string, unknown>;
+
+            // A coding question with test cases is graded by running them (see
+            // lib/test-grading.ts). Without a configured runner it falls back to AI.
+            const tests = q.type === "coding" ? testsOf(meta) : [];
+            if (tests.length) {
+              judge0Key ??= getJudge0Key();
+              const cfg = resolveJudge0Config(await judge0Key);
+              if (cfg) {
+                const source = String(typeof a.response === "string" ? a.response : JSON.stringify(a.response));
+                const languageId = Number(meta.languageId) || 71;
+                const timeLimitSec = timeLimitOf(meta);
+                const res = await gradeCache.grade(
+                  {
+                    provider: "tests",
+                    questionId: q.id,
+                    question: "",
+                    rubric: testsFingerprint(tests, timeLimitSec),
+                    maxPoints: maxScore,
+                    studentAnswer: source,
+                    isCode: true,
+                    language: String(languageId),
+                  },
+                  async () => {
+                    const r = await gradeWithTests({
+                      source,
+                      languageId,
+                      tests,
+                      timeLimitSec,
+                      maxPoints: maxScore,
+                      // Background priority: never ahead of a student's "Run code".
+                      run: (job) => judge0Queue.run({ ...job, priority: "background" }, () => cfg),
+                    });
+                    // Same usage counter the Run code route keeps, one per execution.
+                    await db
+                      .update(schema.settings)
+                      .set({ judge0Used: dsql`${schema.settings.judge0Used} + ${tests.length}` })
+                      .where(eq(schema.settings.id, "global"))
+                      .catch(() => {});
+                    return { score: r.score, notes: r.notes };
+                  },
+                );
+                await db.update(schema.answers).set({ score: res.score, aiNotes: res.notes, autoGraded: true }).where(eq(schema.answers.id, a.id));
+                return;
+              }
+            }
+
             const input = {
               question: q.prompt,
               rubric: (meta.rubric as string) || (meta.solution as string) || undefined,

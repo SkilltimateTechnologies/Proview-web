@@ -114,7 +114,7 @@ describe("cacheControlFor", () => {
 	});
 
 	test("no static response is ever left without a cache directive", () => {
-		for (const route of ["/", "/index.html", "/sw.js", "/runable.js", "/assets/x-abcd1234.js"]) {
+		for (const route of ["/", "/index.html", "/sw.js", "/favicon.ico", "/assets/x-abcd1234.js"]) {
 			expect(cacheControlFor(route).length).toBeGreaterThan(0);
 		}
 	});

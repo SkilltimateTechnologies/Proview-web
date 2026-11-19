@@ -28,6 +28,17 @@ export type Judge0Job = {
   source: string;
   languageId: number;
   stdin: string;
+  /** Optional Judge0 limits (seconds / KB). Omitted = the runner's defaults. */
+  cpuTimeLimit?: number;
+  wallTimeLimit?: number;
+  memoryLimitKb?: number;
+  /**
+   * "background" (test-case grading after an exam) only uses spare capacity: it
+   * is dispatched when no student run is waiting, with at most
+   * MAX_BG_INFLIGHT_BATCHES in flight, so grading one college's exam never slows
+   * "Run code" for students writing another exam. Default: interactive.
+   */
+  priority?: "interactive" | "background";
 };
 
 type Waiter = {
@@ -50,6 +61,9 @@ const MAX_INFLIGHT_BATCHES = Math.max(1, Number(process.env.JUDGE0_MAX_INFLIGHT 
 const POLL_INTERVAL_MS = 700;
 const POLL_MAX_TRIES = 25;
 const MAX_RETRIES = 4; // backoff attempts on 429 / 5xx
+const MAX_BG_INFLIGHT_BATCHES = Math.max(1, Number(process.env.JUDGE0_MAX_BG_INFLIGHT || 2));
+// Background jobs wait behind students; they give up much later than a student run.
+const BG_MAX_WAIT_MS = Number(process.env.JUDGE0_BG_MAX_WAIT_MS || 15 * 60_000);
 
 // ---- base64 helpers ---------------------------------------------------------
 const enc = (s: string) => Buffer.from(s, "utf8").toString("base64");
@@ -115,8 +129,10 @@ async function fetchWithBackoff(url: string, init: RequestInit): Promise<Respons
 // =============================================================================
 class Judge0Queue {
   private waiters: Waiter[] = [];
+  private bgWaiters: Waiter[] = [];
   private draining = false;
   private inFlight = 0; // batches currently submitting/polling
+  private bgInFlight = 0; // of which background batches
   private tokens = THROTTLE_RPS; // token bucket
   private lastRefill = Date.now();
 
@@ -124,7 +140,7 @@ class Judge0Queue {
   run(job: Judge0Job, cfgProvider: () => Judge0Config | null): Promise<Judge0Result> {
     return new Promise<Judge0Result>((resolve) => {
       const waiter: Waiter = { job, enqueuedAt: Date.now(), resolve };
-      this.waiters.push(waiter);
+      (job.priority === "background" ? this.bgWaiters : this.waiters).push(waiter);
       this.drain(cfgProvider);
     });
   }
@@ -158,8 +174,10 @@ class Judge0Queue {
     this.draining = true;
     void this.dispatchLoop(cfgProvider).finally(() => {
       this.draining = false;
-      // a late arrival (or a freed in-flight slot) may need another pass
-      if (this.waiters.length > 0) this.drain(cfgProvider);
+      // a late arrival (or a freed in-flight slot) may need another pass. Background
+      // work only re-wakes the dispatcher when it could actually start a batch;
+      // otherwise the batch that frees a slot re-wakes it (no busy loop).
+      if (this.waiters.length > 0 || this.canStartBackground()) this.drain(cfgProvider);
     });
   }
 
@@ -170,9 +188,21 @@ class Judge0Queue {
    * burst of clicks actually drains instead of piling up until MAX_WAIT_MS.
    */
   private async dispatchLoop(cfgProvider: () => Judge0Config | null) {
-    while (this.waiters.length > 0) {
-      // hold off until an in-flight slot frees up
-      if (this.inFlight >= MAX_INFLIGHT_BATCHES) { await sleep(20); continue; }
+    while (this.waiters.length > 0 || this.bgWaiters.length > 0) {
+      // hold off until an in-flight slot frees up (background work just waits for
+      // a finishing batch to re-wake the dispatcher)
+      if (this.inFlight >= MAX_INFLIGHT_BATCHES) {
+        if (this.waiters.length === 0) break;
+        await sleep(20);
+        continue;
+      }
+
+      // No student is waiting: let background work use spare capacity.
+      if (this.waiters.length === 0) {
+        if (this.dispatchBackground(cfgProvider)) continue;
+        // Background slots full: the freed slot re-wakes the dispatcher.
+        break;
+      }
 
       // small collect window so bursts group into a full batch
       if (this.waiters.length < BATCH_SIZE) await sleep(BATCH_WINDOW_MS);
@@ -204,6 +234,37 @@ class Judge0Queue {
     }
   }
 
+  private canStartBackground(): boolean {
+    return this.bgWaiters.length > 0 && this.bgInFlight < MAX_BG_INFLIGHT_BATCHES && this.inFlight < MAX_INFLIGHT_BATCHES;
+  }
+
+  /** Start one background batch if a background slot is free. Returns whether one was started. */
+  private dispatchBackground(cfgProvider: () => Judge0Config | null): boolean {
+    const now = Date.now();
+    this.bgWaiters = this.bgWaiters.filter((w) => {
+      if (now - w.enqueuedAt >= BG_MAX_WAIT_MS) {
+        this.failWaiter(w, "Code runner busy; grading will retry.", 503);
+        return false;
+      }
+      return true;
+    });
+    if (this.bgWaiters.length === 0 || this.bgInFlight >= MAX_BG_INFLIGHT_BATCHES) return false;
+    const cfg = cfgProvider();
+    const batch = this.bgWaiters.splice(0, BATCH_SIZE);
+    if (!cfg) {
+      for (const w of batch) this.failWaiter(w, "Code execution is not configured.", 503);
+      return true;
+    }
+    this.inFlight++;
+    this.bgInFlight++;
+    void this.processBatch(batch, cfg).finally(() => {
+      this.inFlight--;
+      this.bgInFlight--;
+      this.drain(cfgProvider);
+    });
+    return true;
+  }
+
   private async processBatch(batch: Waiter[], cfg: Judge0Config) {
     // 1 token per submission in the batch (the batch POST executes N runs).
     await this.takeTokens(batch.length);
@@ -213,6 +274,9 @@ class Judge0Queue {
         source_code: enc(w.job.source),
         language_id: w.job.languageId,
         stdin: enc(w.job.stdin),
+        ...(w.job.cpuTimeLimit ? { cpu_time_limit: w.job.cpuTimeLimit } : {}),
+        ...(w.job.wallTimeLimit ? { wall_time_limit: w.job.wallTimeLimit } : {}),
+        ...(w.job.memoryLimitKb ? { memory_limit: w.job.memoryLimitKb } : {}),
       }));
 
       const createRes = await fetchWithBackoff(
@@ -280,7 +344,7 @@ class Judge0Queue {
 
   /** For observability / admin health. */
   stats() {
-    return { queued: this.waiters.length, inFlight: this.inFlight, draining: this.draining, tokens: Math.floor(this.tokens) };
+    return { queued: this.waiters.length, queuedBackground: this.bgWaiters.length, inFlight: this.inFlight, inFlightBackground: this.bgInFlight, draining: this.draining, tokens: Math.floor(this.tokens) };
   }
 }
 

@@ -8,6 +8,8 @@
  * shell so the SPA always loads offline; the app then restores exam state.
  */
 const CACHE = "proview-shell-v2";
+// How long a page load waits for the network before falling back to the saved app shell.
+const NAV_TIMEOUT_MS = 6000;
 
 self.addEventListener("install", (event) => {
   // Pre-cache the app shell so the very first offline refresh has index.html.
@@ -59,19 +61,41 @@ self.addEventListener("fetch", (event) => {
   // Navigation requests (a page load / refresh): network-first so the student
   // gets fresh HTML online, but fall back to the cached app shell offline so
   // the SPA still boots and can resume the exam from localStorage.
+  //
+  // A network that STALLS (lab wifi, a firewall dropping packets) never fails, it
+  // just never answers, and the browser waits minutes before giving up: the page
+  // stayed blank. So if the network has not answered within NAV_TIMEOUT_MS and we
+  // have a saved shell, show the saved shell; the network fetch keeps going in the
+  // background and refreshes the cache when it lands. With no saved shell we keep
+  // waiting for the network, exactly as before.
   if (req.mode === "navigate") {
     event.respondWith(
       (async () => {
-        try {
-          const fresh = await fetch(req);
-          const cache = await caches.open(CACHE);
-          cache.put("/index.html", fresh.clone()).catch(() => {});
+        const cache = await caches.open(CACHE);
+        const network = fetch(req).then((fresh) => {
+          // Only a real page refreshes the saved shell; never an error page.
+          if (fresh && fresh.ok && (fresh.headers.get("content-type") || "").includes("text/html")) {
+            cache.put("/index.html", fresh.clone()).catch(() => {});
+          }
           return fresh;
+        });
+        event.waitUntil(network.catch(() => {}));
+        const savedShell = async () => (await cache.match("/index.html")) || (await cache.match(req));
+        let timer;
+        const timedOut = new Promise((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), NAV_TIMEOUT_MS);
+        });
+        try {
+          const winner = await Promise.race([network, timedOut]);
+          if (winner !== "timeout") return winner;
+          const cached = await savedShell();
+          return cached || (await network);
         } catch {
-          const cache = await caches.open(CACHE);
-          const cached = (await cache.match("/index.html")) || (await cache.match(req));
+          const cached = await savedShell();
           if (cached) return cached;
           throw new Error("offline and no cached app shell");
+        } finally {
+          clearTimeout(timer);
         }
       })(),
     );

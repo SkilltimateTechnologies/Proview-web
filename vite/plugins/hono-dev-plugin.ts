@@ -43,11 +43,12 @@ function toWebRequest(req: import("http").IncomingMessage): Request {
   }
 
   const hasBody = req.method !== "GET" && req.method !== "HEAD";
-  return new Request(url, {
+  // duplex is needed for streaming request bodies; older DOM typings lack it.
+  const init: RequestInit & { duplex?: "half" } = {
     method: req.method,
     headers,
     body: hasBody ? (req as unknown as ReadableStream) : undefined,
-    // @ts-expect-error duplex needed for streaming request bodies
     duplex: hasBody ? "half" : undefined,
-  });
+  };
+  return new Request(url, init);
 }

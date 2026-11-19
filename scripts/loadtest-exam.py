@@ -473,7 +473,7 @@ def main():
             print(f"  monitor build ms: n={len(builds)} p50={statistics.median(builds):.0f} "
                   f"max={max(builds):.0f}  degraded_reports={sum(1 for v in verdicts if v[1])}")
 
-    health = urllib.request.urlopen(args.base + "/api/health").read()
+    health = urllib.request.urlopen(urllib.request.Request(args.base + "/api/health", headers={"x-health-token": os.environ.get("HEALTH_TOKEN", "")})).read()
     payload = json.loads(health)
     print(f"  server db counter: {json.dumps(payload.get('db'))}")
     print(f"  monitor: {json.dumps(payload.get('monitor'))}")

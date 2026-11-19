@@ -27,6 +27,7 @@ starts a real attempt and writes answers:
     export DATABASE_URL="file:$PWD/.tmp-verify.db"; unset DATABASE_AUTH_TOKEN
     bun run db:push --force && bun run seed
     bun run build
+    export HEALTH_TOKEN=local-check
     PORT=3100 bun src/server.ts &
     python3 scripts/verify-scale.py
 """
@@ -97,6 +98,11 @@ class Http:
         return self.request("POST", path, body or {}, headers)
 
 
+# /api/health shows its internals (db.queries) only to a super admin or a caller
+# holding HEALTH_TOKEN. Start the server with HEALTH_TOKEN set and export the same
+# value here.
+HEALTH_HEADERS = {"x-health-token": os.environ.get("HEALTH_TOKEN", "")}
+
 http = Http()
 admin = Http()
 root = Http()
@@ -104,7 +110,7 @@ root = Http()
 
 def db_queries():
     """Statements this server process has sent to the database since boot."""
-    status, payload = http.get("/api/health")
+    status, payload = http.get("/api/health", HEALTH_HEADERS)
     if status not in (200, 503):
         return None
     return ((payload.get("db") or {}).get("queries"))
@@ -128,7 +134,7 @@ def measure(label, fn, budget):
 
 def main():
     print("\n=== Phase 0: server reachable and reporting its query cost ===")
-    status, health = http.get("/api/health")
+    status, health = http.get("/api/health", HEALTH_HEADERS)
     check("/api/health answers", status in (200, 503), f"status {status}")
     check("/api/health exposes db.queries", isinstance((health.get("db") or {}).get("queries"), int),
           json.dumps(health.get("db")))
