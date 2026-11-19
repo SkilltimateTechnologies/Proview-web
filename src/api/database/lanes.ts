@@ -133,6 +133,25 @@ export function createLaneRouter<C extends AnyClient>(
 }
 
 /**
+ * Abort when either signal aborts. AbortSignal.any is missing from older Bun
+ * releases (production runs an older Bun than development), so fall back to a
+ * hand-rolled combination there.
+ */
+function anySignal(a: AbortSignal, b: AbortSignal): AbortSignal {
+  const native = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
+  if (typeof native === "function") return native([a, b]);
+  const ctl = new AbortController();
+  for (const s of [a, b]) {
+    if (s.aborted) {
+      ctl.abort(s.reason);
+      break;
+    }
+    s.addEventListener("abort", () => ctl.abort(s.reason), { once: true });
+  }
+  return ctl.signal;
+}
+
+/**
  * Wrap a fetch so every request carries a deadline. Also normalises a Request-like
  * input to url + init, which the previous inline wrapper did for libsql's sake.
  * `timeoutMs` 0 disables the deadline.
@@ -140,9 +159,15 @@ export function createLaneRouter<C extends AnyClient>(
 export function deadlineFetch(timeoutMs: number, baseFetch: typeof fetch = fetch): typeof fetch {
   const withDeadline = (init?: RequestInit): RequestInit | undefined => {
     if (!(timeoutMs > 0)) return init;
-    const timeout = AbortSignal.timeout(timeoutMs);
-    const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
-    return { ...init, signal };
+    // A plain timer rather than AbortSignal.timeout: identical behaviour, and it
+    // also fires under the test runner of the older Bun production runs. The timer
+    // is unref'd so it never holds the process open; firing after the request has
+    // finished is a no-op.
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(new DOMException("The operation timed out.", "TimeoutError")), timeoutMs);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    const timeout = ctl.signal;
+    return { ...init, signal: init?.signal ? anySignal(init.signal, timeout) : timeout };
   };
   return ((input: RequestInfo | URL, init?: RequestInit) => {
     if (input && typeof input === "object" && "url" in input && typeof (input as Request).url === "string") {

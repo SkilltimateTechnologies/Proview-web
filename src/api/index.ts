@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { compress } from "hono/compress";
+import { gzipJson } from "./lib/gzip-json";
 import { eq, ne, and, or, desc, gte, inArray, like, sql as dsql } from "drizzle-orm";
 import { auth } from "./auth";
 import { hashPassword, verifyPassword } from "better-auth/crypto";
@@ -638,10 +638,10 @@ const STUDENT_LANE_PATH = /^\/api\/(student\/|students\/verify-login$|register\/
 const app = new Hono<{ Variables: Vars }>()
   .use((c, next) => runInLane(STUDENT_LANE_PATH.test(c.req.path) ? "student" : "admin", next))
   .use(cors({ origin: (origin) => origin ?? "*", credentials: true, exposeHeaders: ["set-auth-token"] }))
-  // gzip JSON responses over 1 KB. The Live Monitor answered every 5s poll with
-  // ~294 KB of uncompressed JSON per open tab (~22 KB gzipped), and the student
-  // list ~281 KB (~25 KB). Small student calls stay under the threshold untouched.
-  .use(compress({ encoding: "gzip" }))
+  // gzip large JSON reads (GET only). NOT hono/compress: it needs the web
+  // CompressionStream, which production's older Bun lacks — it 500'd every API
+  // call. See lib/gzip-json.ts.
+  .use(gzipJson())
   .on(["GET", "POST"], "/api/auth/*", (c) => {
     // A sign-out must not stay honoured by the identity cache for its TTL.
     if (/sign-out|revoke/.test(c.req.path)) authCache.invalidate();

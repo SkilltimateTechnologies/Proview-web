@@ -87,7 +87,13 @@ describe("AuthCache", () => {
   test("a failed load is not cached", async () => {
     const cache = new AuthCache<U, P>();
     const key = AuthCache.keyOf("Bearer x", "");
-    await expect(cache.resolve(key, async () => { throw new Error("db down"); })).rejects.toThrow("db down");
+    let caught: unknown = null;
+    try {
+      await cache.resolve(key, async () => { throw new Error("db down"); });
+    } catch (e) {
+      caught = e;
+    }
+    expect(String(caught)).toContain("db down");
     const ok = await cache.resolve(key, async () => ident());
     expect(ok.user!.id).toBe("u1");
   });
