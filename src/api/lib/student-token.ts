@@ -4,6 +4,13 @@
 
 const enc = new TextEncoder();
 
+/** How long a student login stays valid. Default 30 days; override with STUDENT_TOKEN_MAX_AGE_MS. */
+export const STUDENT_TOKEN_DEFAULT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+function studentTokenMaxAgeMs(): number {
+  const n = Number(process.env.STUDENT_TOKEN_MAX_AGE_MS);
+  return Number.isFinite(n) && n > 0 ? n : STUDENT_TOKEN_DEFAULT_MAX_AGE_MS;
+}
+
 function secret(): string {
   return process.env.BETTER_AUTH_SECRET || "examly-dev-secret-please-change";
 }
@@ -67,7 +74,14 @@ export async function verifyStudentToken(token: string | undefined | null): Prom
     const ok = await crypto.subtle.verify("HMAC", key, fromB64url(sigB64) as unknown as BufferSource, payloadBytes as unknown as BufferSource);
     if (!ok) return null;
     const payload = new TextDecoder().decode(payloadBytes);
-    const [studentId] = payload.split(".");
+    const [studentId, issuedRaw] = payload.split(".");
+    // Tokens used to be valid forever: one copied off a lab PC (it sits in
+    // localStorage) worked indefinitely. Now they expire; the dashboard signs the
+    // student out cleanly on the resulting 401. Generous on purpose: an exam is
+    // hours long, and a student must never be cut off mid-paper by expiry.
+    const issuedAt = Number(issuedRaw);
+    if (!Number.isFinite(issuedAt) || issuedAt <= 0) return null;
+    if (Date.now() - issuedAt > studentTokenMaxAgeMs()) return null;
     return studentId || null;
   } catch {
     return null;

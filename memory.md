@@ -360,3 +360,22 @@ smoke on Bun 1.1.38, 1.2.0, 1.2.20 and 1.4.4, file and remote-style databases.
 **Rule from this:** development runs a newer Bun than production — test any runtime
 API (web streams, AbortSignal helpers, Bun.* additions) against an old Bun before
 shipping.
+
+## 13. Full-code review fixes (2026-11-19, branch `review/after-exam`, NOT yet merged)
+
+Merge after the exam. Review write-up: Claude Docs "Proview — full code review (Nov 2026)".
+
+- **Critical, confirmed on live code:** a TPO with the `users` permission could create a
+  super admin, promote any account (own included) to super admin, and reset the super admin's
+  password (returned in the response). Fixed with `lib/staff-policy.ts` (role ranks, own
+  college only, no self-promotion), unit-tested and attack-tested against a running server.
+- 12 edit/delete routes (exams incl. hold/extra time, students, sections, categories,
+  questions) now check the record's college; another college's id answers 404.
+- Results/answer key now unlock only after end + extra time + holds (`resultsUnlocked`).
+- Student tokens expire after 30 days (`STUDENT_TOKEN_MAX_AGE_MS`); the dashboard signs out on 401.
+- `PATCH /tenants/:id` writes known fields only.
+- Live Monitor's 2s clock moved into its own banner (no full-table re-render); static icon
+  instead of ~1,100 spinners. Dashboard/report read only the columns they use. Code editor
+  highlight memoized.
+- Rejected on review: an AI output-token cap (reasoning models count hidden thinking against
+  it and could return nothing — grading 0). A faster highlighter (no measurable gain).

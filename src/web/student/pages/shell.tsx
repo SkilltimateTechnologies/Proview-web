@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useParams, Link } from "wouter";
-import { api, type ExamListItem, type Review as ReviewData } from "../lib/api";
+import { api, ApiError, type ExamListItem, type Review as ReviewData } from "../lib/api";
 import { useSession } from "../lib/session";
 import { ChangePasswordForm } from "./change-password";
 import { ReviewBody } from "./review";
@@ -59,6 +59,12 @@ export function Shell() {
       setExams(res.exams);
       setErr("");
     } catch (e) {
+      // The server no longer recognises this login (it expired, or the account was
+      // disabled): go back to the sign-in screen instead of an endless error card.
+      if (e instanceof ApiError && e.status === 401) {
+        logout();
+        return;
+      }
       setErr(e instanceof Error ? e.message : "Failed to load exams");
       setExams((prev) => prev ?? []);
     }

@@ -86,3 +86,20 @@ export function isReportable(e: StatusExam, now: number = Date.now()): boolean {
   const s = examEffStatus(e, now);
   return s === "finished" || s === "ended" || s === "live";
 }
+
+/**
+ * Whether a finished student may see results — including the answer key — yet.
+ *
+ * Results used to unlock at the RAW end time, ignoring admin extra time and holds.
+ * So whenever an invigilator granted extra minutes (or held the exam), students
+ * who had already submitted could open their review, with every correct answer,
+ * while classmates were still writing in the extra time. Now: the admin marked it
+ * finished, or the whole window — end + extra time + holds — has closed and the
+ * exam is not held right now.
+ */
+export function resultsUnlocked(e: StatusExam, now: number = Date.now()): boolean {
+  if (e.status === "finished") return true;
+  if (e.heldAt) return false;
+  const closes = closesAtMs(e);
+  return closes !== null && now > closes;
+}

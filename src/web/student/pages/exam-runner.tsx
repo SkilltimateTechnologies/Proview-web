@@ -1930,6 +1930,10 @@ function highlightCode(code: string, lang: string): string {
 }
 
 function CodeEditor({ code, language, onChange }: { code: string; language: string; onChange: (v: string) => void }) {
+  // Re-highlight only when the code or language changes: the exam screen re-renders
+  // every second for its countdown, and this re-coloured the whole program on every
+  // tick even when nothing was typed.
+  const highlighted = useMemo(() => highlightCode(code, language), [code, language]);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const preRef = useRef<HTMLPreElement>(null);
   const gutRef = useRef<HTMLDivElement>(null);
@@ -1980,7 +1984,7 @@ function CodeEditor({ code, language, onChange }: { code: string; language: stri
         {Array.from({ length: lineCount }, (_, i) => <div key={i}>{i + 1}</div>)}
       </div>
       <div className="ide-code">
-        <pre className="ide-hl" ref={preRef} aria-hidden="true"><code dangerouslySetInnerHTML={{ __html: highlightCode(code, language) }} /></pre>
+        <pre className="ide-hl" ref={preRef} aria-hidden="true"><code dangerouslySetInnerHTML={{ __html: highlighted }} /></pre>
         <textarea
           ref={taRef}
           className="ide-input"

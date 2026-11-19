@@ -113,3 +113,31 @@ describe("isReportable — the Reports list filter", () => {
     expect(isReportable({ ...lapsed, startAt: new Date(NOW + 60 * MIN), endAt: new Date(NOW + 120 * MIN) }, NOW)).toBe(false);
   });
 });
+
+import { resultsUnlocked } from "./exam-status";
+
+describe("resultsUnlocked (answer key release)", () => {
+  const end = Date.UTC(2026, 10, 19, 12, 0, 0);
+  const base = { status: "scheduled", startAt: end - 90 * 60_000, endAt: end };
+
+  it("opens after the end when there was no extra time", () => {
+    expect(resultsUnlocked(base, end - 1)).toBe(false);
+    expect(resultsUnlocked(base, end + 1)).toBe(true);
+  });
+
+  it("stays locked through admin extra time (it used to unlock at the raw end)", () => {
+    const e = { ...base, extraMin: 10 };
+    expect(resultsUnlocked(e, end + 5 * 60_000)).toBe(false);
+    expect(resultsUnlocked(e, end + 10 * 60_000 + 1)).toBe(true);
+  });
+
+  it("stays locked through accumulated and current holds", () => {
+    expect(resultsUnlocked({ ...base, holdMs: 120_000 }, end + 60_000)).toBe(false);
+    expect(resultsUnlocked({ ...base, heldAt: end - 1000 }, end + 60 * 60_000)).toBe(false);
+  });
+
+  it("an admin-finished exam is always open; no end time means never by clock", () => {
+    expect(resultsUnlocked({ ...base, status: "finished" }, end - 3600_000)).toBe(true);
+    expect(resultsUnlocked({ status: "scheduled", startAt: null, endAt: null }, end)).toBe(false);
+  });
+});
