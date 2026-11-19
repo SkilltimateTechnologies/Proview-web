@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Plus, X, Building2, Pencil } from "lucide-react";
-import { api } from "../lib/api";
+import { api, withBody } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Field, ColorPicker, usePagination, Pager } from "../components/ui";
 
@@ -33,7 +33,7 @@ export default function Tenants() {
   const q = useQuery({ queryKey: ["tenants"], queryFn: async () => (await api.tenants.$get()).json() as Promise<{ tenants: Tenant[] }> });
 
   const toggle = useMutation({
-    mutationFn: async ({ id, enabled }: { id: string; enabled: boolean }) => api.tenants[":id"].$patch({ param: { id }, json: { enabled } }),
+    mutationFn: async ({ id, enabled }: { id: string; enabled: boolean }) => api.tenants[":id"].$patch(withBody({ param: { id } }, { enabled })),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["tenants"] }),
   });
 
@@ -98,17 +98,14 @@ function TenantForm({ tenant, onClose }: { tenant?: Tenant; onClose: () => void 
   const save = useMutation({
     mutationFn: async () => {
       if (editing)
-        return api.tenants[":id"].$patch({
-          param: { id: tenant!.id },
-          json: {
+        return api.tenants[":id"].$patch(withBody({ param: { id: tenant!.id } }, {
             name,
             shortName,
             primaryColor,
             logoUrl: null,
             maxConcurrentAttempts: quotaValue(maxLive),
             maxEvidencePerAttempt: quotaValue(maxEvidence),
-          },
-        });
+          }));
       return api.tenants.$post({ json: { name, shortName, primaryColor, logoUrl: null } });
     },
     onSuccess: () => {

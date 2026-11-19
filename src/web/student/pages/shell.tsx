@@ -18,16 +18,6 @@ function fmtDate(d: string | null) {
   if (!d) return "—";
   return new Date(d).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" });
 }
-function countdown(startAt: string | null): string {
-  if (!startAt) return "";
-  const diff = new Date(startAt).getTime() - serverNowMs();
-  if (diff <= 0) return "Starting now";
-  const h = Math.floor(diff / 3_600_000);
-  const m = Math.floor((diff % 3_600_000) / 60_000);
-  if (h >= 24) return `in ${Math.floor(h / 24)}d ${h % 24}h`;
-  if (h > 0) return `in ${h}h ${m}m`;
-  return `in ${m}m`;
-}
 // A ticking HH:MM:SS clock for the waiting-room gate (prefixes days when >= 24h).
 function clock(ms: number): string {
   if (ms <= 0) return "00:00:00";
@@ -229,23 +219,6 @@ export function Shell() {
       </div>
       <ReviewDrawer attemptId={reviewId} onClose={() => setReviewId(null)} />
     </div>
-  );
-}
-
-function StartButton({ e, onStart }: { e: ExamListItem; onStart: (id: string) => void }) {
-  if (e.phase === "upcoming") {
-    return e.startAt
-      ? <Pill tone="warn"><Icon name="clock" size={13} /> Starts {countdown(e.startAt)}</Pill>
-      : <Pill tone="default"><Icon name="clock" size={13} /> Not yet scheduled</Pill>;
-  }
-  if (e.phase === "absent") {
-    return <Pill tone="danger"><Icon name="user-x" size={13} /> Absent</Pill>;
-  }
-  return (
-    <button className="btn btn-primary" onClick={() => onStart(e.id)}>
-      <Icon name="play" />
-      {e.phase === "in_progress" ? "Resume exam" : "Start exam"}
-    </button>
   );
 }
 

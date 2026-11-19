@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useLocation } from "wouter";
 import { Plus, X, Layers, Pencil, Trash2, Users as UsersIcon, ArrowLeft } from "lucide-react";
-import { api } from "../lib/api";
+import { api, withBody } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Field, Pill, usePagination, Pager } from "../components/ui";
 
@@ -146,7 +146,7 @@ function SectionForm({ initial, onClose }: { initial: ClassRow | null; onClose: 
     mutationFn: async () => {
       const json = { branch, section, batchStartYear };
       const res = initial
-        ? await api.classes[":id"].$patch({ param: { id: initial.id }, json })
+        ? await api.classes[":id"].$patch(withBody({ param: { id: initial.id } }, json))
         : await api.classes.$post({ json });
       if (!res.ok) throw new Error((await res.json() as { message?: string }).message ?? "Failed");
       return res.json();

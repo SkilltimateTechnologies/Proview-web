@@ -15,6 +15,7 @@ import "./styles.css";
 import { StudentApp } from "./student";
 import { ErrorBoundary } from "./components/error-boundary";
 import { importWithRetry, installChunkErrorRecovery } from "./lib/lazy-chunk";
+import { installErrorReporting } from "./lib/error-reporter";
 
 /* Only one of these three roots ever renders — the URL decides, below, before
  * anything mounts. They used to be three static imports, which put all three in
@@ -39,6 +40,8 @@ const RegisterPage = lazy(() =>
 // A chunk that never arrives is the other way to get a blank page, and the
 // error boundary cannot catch it because nothing ever renders. Recover once.
 installChunkErrorRecovery();
+// Uncaught errors and rejected promises reach the server (lib/error-reporter.ts).
+installErrorReporting();
 
 /** Shown only while a lazy admin/register chunk is in flight. Inline-styled so
  *  it cannot itself depend on a chunk that has not arrived yet. */

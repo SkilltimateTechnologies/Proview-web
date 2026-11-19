@@ -61,6 +61,16 @@ const MAX_INFLIGHT_BATCHES = Math.max(1, Number(process.env.JUDGE0_MAX_INFLIGHT 
 const POLL_INTERVAL_MS = 700;
 const POLL_MAX_TRIES = 25;
 const MAX_RETRIES = 4; // backoff attempts on 429 / 5xx
+// Every call to Judge0 gets its own timeout, and a Retry-After is never honoured
+// beyond a few seconds. On 19 Nov 2026 the RapidAPI key ran out of quota during a
+// live exam; its 429s and a call that never answered held batches open, the queue
+// stopped dispatching, and every "Run code" hung until the edge cut it with a bare
+// 502. Nothing in here may wait without a bound.
+const FETCH_TIMEOUT_MS = Number(process.env.JUDGE0_FETCH_TIMEOUT_MS || 15_000);
+const MAX_RETRY_AFTER_MS = 5_000;
+// A student's request always gets an answer within this, whatever Judge0 does.
+// Below Cloudflare's 100 s origin timeout.
+const HARD_DEADLINE_MS = Number(process.env.JUDGE0_HARD_DEADLINE_MS || 75_000);
 const MAX_BG_INFLIGHT_BATCHES = Math.max(1, Number(process.env.JUDGE0_MAX_BG_INFLIGHT || 2));
 // Background jobs wait behind students; they give up much later than a student run.
 const BG_MAX_WAIT_MS = Number(process.env.JUDGE0_BG_MAX_WAIT_MS || 15 * 60_000);
@@ -99,17 +109,35 @@ export function resolveJudge0Config(key: string | null): Judge0Config | null {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** fetch with exponential backoff on 429 / 5xx (respects Retry-After). */
+/** A 429 that waiting will not fix: the plan's daily/monthly quota is used up. */
+export function isQuotaExhausted(status: number, body: string): boolean {
+  return status === 429 && /quota|upgrade your plan/i.test(body);
+}
+
+/** What a student is told when Judge0 refuses the call outright. */
+export function runnerRefusalMessage(status: number, body: string): string {
+  if (isQuotaExhausted(status, body)) return "The code runner's usage limit has been reached. Please tell your invigilator. Your code is saved and will still be graded.";
+  if (status === 401 || status === 403) return "The code runner is not set up correctly (key rejected). Please tell your invigilator. Your code is saved and will still be graded.";
+  if (status === 429) return "The code runner is busy. Wait a few seconds and press Run again.";
+  return `Runner error (${status}). Try again in a moment.`;
+}
+
+/**
+ * fetch with a per-call timeout and exponential backoff on 429 / 5xx. Retry-After
+ * is honoured only up to MAX_RETRY_AFTER_MS, and a quota-exhausted 429 is
+ * returned at once: retrying it cannot succeed.
+ */
 async function fetchWithBackoff(url: string, init: RequestInit): Promise<Response> {
   let lastErr: unknown = null;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const res = await fetch(url, init);
+      const res = await fetch(url, { ...init, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
       if (res.status === 429 || res.status >= 500) {
         if (attempt === MAX_RETRIES) return res;
+        if (res.status === 429 && isQuotaExhausted(429, await res.clone().text().catch(() => ""))) return res;
         const retryAfter = Number(res.headers.get("retry-after"));
         const wait = Number.isFinite(retryAfter) && retryAfter > 0
-          ? retryAfter * 1000
+          ? Math.min(retryAfter * 1000, MAX_RETRY_AFTER_MS)
           : Math.min(8000, 400 * 2 ** attempt) + Math.random() * 200; // jitter
         await sleep(wait);
         continue;
@@ -138,7 +166,23 @@ class Judge0Queue {
 
   /** Enqueue one run and resolve when Judge0 returns (or on timeout). */
   run(job: Judge0Job, cfgProvider: () => Judge0Config | null): Promise<Judge0Result> {
-    return new Promise<Judge0Result>((resolve) => {
+    return new Promise<Judge0Result>((outerResolve) => {
+      // Resolve exactly once: by Judge0, by the queue's own give-up, or by the
+      // hard deadline below, whichever comes first.
+      let done = false;
+      const deadlineMs = job.priority === "background" ? BG_MAX_WAIT_MS + HARD_DEADLINE_MS : HARD_DEADLINE_MS;
+      const timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        outerResolve({ ok: false, stdout: "", stderr: "", compileOutput: "", status: "Error", time: null, memory: null, message: "Code execution timed out. Press Run again in a moment.", httpStatus: 503 });
+      }, deadlineMs);
+      (timer as { unref?: () => void }).unref?.();
+      const resolve = (r: Judge0Result) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        outerResolve(r);
+      };
       const waiter: Waiter = { job, enqueuedAt: Date.now(), resolve };
       (job.priority === "background" ? this.bgWaiters : this.waiters).push(waiter);
       this.drain(cfgProvider);
@@ -165,7 +209,10 @@ class Judge0Queue {
     }
   }
 
-  private failWaiter(w: Waiter, message: string, httpStatus = 502) {
+  // Failures are 503, never 502/504: Cloudflare in front of the site can swap an
+  // origin 502/504 for its own page, and the student then sees a bare
+  // "Request failed (502)" instead of the message.
+  private failWaiter(w: Waiter, message: string, httpStatus = 503) {
     w.resolve({ ok: false, stdout: "", stderr: "", compileOutput: "", status: "Error", time: null, memory: null, message, httpStatus });
   }
 
@@ -189,6 +236,11 @@ class Judge0Queue {
    */
   private async dispatchLoop(cfgProvider: () => Judge0Config | null) {
     while (this.waiters.length > 0 || this.bgWaiters.length > 0) {
+      // Give up on students who have waited too long BEFORE waiting for a slot:
+      // with every slot held by a slow batch this loop only sleeps, and the old
+      // order meant nobody was ever released.
+      this.dropExpiredWaiters();
+      if (this.waiters.length === 0 && this.bgWaiters.length === 0) break;
       // hold off until an in-flight slot frees up (background work just waits for
       // a finishing batch to re-wake the dispatcher)
       if (this.inFlight >= MAX_INFLIGHT_BATCHES) {
@@ -208,14 +260,7 @@ class Judge0Queue {
       if (this.waiters.length < BATCH_SIZE) await sleep(BATCH_WINDOW_MS);
 
       // drop anyone who already waited too long
-      const now = Date.now();
-      this.waiters = this.waiters.filter((w) => {
-        if (now - w.enqueuedAt >= MAX_WAIT_MS) {
-          this.failWaiter(w, "Server is busy — please press Run again in a moment.", 503);
-          return false;
-        }
-        return true;
-      });
+      this.dropExpiredWaiters();
       if (this.waiters.length === 0) break;
 
       const cfg = cfgProvider();
@@ -232,6 +277,17 @@ class Judge0Queue {
         this.drain(cfgProvider);
       });
     }
+  }
+
+  private dropExpiredWaiters() {
+    const now = Date.now();
+    this.waiters = this.waiters.filter((w) => {
+      if (now - w.enqueuedAt >= MAX_WAIT_MS) {
+        this.failWaiter(w, "Server is busy — please press Run again in a moment.", 503);
+        return false;
+      }
+      return true;
+    });
   }
 
   private canStartBackground(): boolean {
@@ -286,8 +342,9 @@ class Judge0Queue {
 
       if (!createRes.ok) {
         const t = await createRes.text().catch(() => "");
-        for (const w of batch) this.failWaiter(w, `Runner error (${createRes.status}). Try again in a moment.`, 502);
-        void t;
+        const refused = isQuotaExhausted(createRes.status, t) || createRes.status === 401 || createRes.status === 403;
+        if (refused) console.error(`[judge0] refused ${createRes.status}: ${t.slice(0, 200)}`);
+        for (const w of batch) this.failWaiter(w, runnerRefusalMessage(createRes.status, t), 503);
         return;
       }
 
@@ -301,7 +358,7 @@ class Judge0Queue {
         const w = batch[i];
         if (!w) return;
         if (!sub) {
-          this.failWaiter(w, "Code execution timed out. Try again.", 504);
+          this.failWaiter(w, "Code execution timed out. Try again.", 503);
           return;
         }
         w.resolve({
@@ -315,7 +372,8 @@ class Judge0Queue {
         });
       });
     } catch {
-      for (const w of batch) this.failWaiter(w, "Couldn't reach the code runner. Check your connection and try again.", 502);
+      console.error("[judge0] call failed or timed out");
+      for (const w of batch) this.failWaiter(w, "Couldn't reach the code runner. Press Run again in a moment.", 503);
     }
   }
 

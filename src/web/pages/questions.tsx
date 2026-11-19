@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Plus, Sparkles, Trash2, Check, FolderOpen, ArrowLeft, Pencil, Library, X } from "lucide-react";
-import { api } from "../lib/api";
+import { api, withBody } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Field, Drawer, RadioBox, usePagination, Pager } from "../components/ui";
 
@@ -194,7 +194,7 @@ function CategoryForm({ initial, onClose }: { initial?: Cat; onClose: () => void
 
   const save = useMutation({
     mutationFn: async () => {
-      if (initial) return api.categories[":id"].$patch({ param: { id: initial.id }, json: { name, description } });
+      if (initial) return api.categories[":id"].$patch(withBody({ param: { id: initial.id } }, { name, description }));
       return api.categories.$post({ json: { name, description } });
     },
     onSuccess: () => {
@@ -450,7 +450,7 @@ function ManualForm({ categoryId, initial, onClose }: { categoryId: string; init
         },
       };
       const res = initial
-        ? await api.questions[":id"].$patch({ param: { id: initial.id }, json })
+        ? await api.questions[":id"].$patch(withBody({ param: { id: initial.id } }, json))
         : await api.questions.$post({ json });
       // A refused save used to close the drawer as if it had worked.
       if (!res.ok) {

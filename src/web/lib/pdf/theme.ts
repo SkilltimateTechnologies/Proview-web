@@ -166,7 +166,7 @@ export function safeName(s: string): string {
 }
 
 /** Compact date for file names, e.g. "Jan 10-2026" (IST). */
-export function fmtFileDate(t: string | number | null | undefined): string {
+export function fmtFileDate(t?: string | number | null): string {
   const d = t ? new Date(t) : new Date();
   const mon = d.toLocaleString("en-IN", { month: "short", timeZone: "Asia/Kolkata" });
   const day = d.toLocaleString("en-IN", { day: "2-digit", timeZone: "Asia/Kolkata" });

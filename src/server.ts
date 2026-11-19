@@ -7,6 +7,9 @@ import { heartbeats } from "./api/lib/heartbeat-queue";
 import { backups } from "./api/lib/backups-runtime";
 import { db, runInLane } from "./api/database";
 import { BODY_LIMITS } from "./api/lib/http-guard";
+import { alertOps, reportError } from "./api/lib/observe";
+import { INDEX_STATE } from "./api/database/invariants";
+import { failingExamChecks, monitorTiming } from "./api/lib/watchdog";
 import { ensureDatabaseInvariants, ensureRequiredColumns } from "./api/database/invariants";
 import {
 	CompressedAssets,
@@ -22,10 +25,10 @@ import {
 // ECONNRESET during a background grading/auto-submit sweep) take down the whole
 // exam server. Log and keep serving; the recurring sweeps retry on their next tick.
 process.on("unhandledRejection", (reason) => {
-  console.error("[unhandledRejection]", reason);
+  reportError(reason, { source: "process", extra: { kind: "unhandledRejection" } });
 });
 process.on("uncaughtException", (err) => {
-  console.error("[uncaughtException]", err);
+  reportError(err, { source: "process", extra: { kind: "uncaughtException" } });
 });
 
 // Additive schema repair has to happen BEFORE the first request is served, unlike
@@ -273,6 +276,20 @@ if (runsBackgroundWork) {
 // Runs on the STUDENT lane: these writes are what keeps the Live Monitor's online
 // dots true, so they must not queue behind AI grading on the background lane.
 runInLane("student", () => heartbeats.start(db));
+
+// Health watcher: the same three signals /api/health reports, checked every
+// minute and sent to ALERT_WEBHOOK_URL when they turn bad (lib/observe.ts rate-
+// limits per signal). Unref'd, so it never holds the process open.
+setInterval(() => {
+  try {
+    if (INDEX_STATE.checkedAt && !INDEX_STATE.ok) alertOps("invariants", "database safety checks failed at boot (/api/health is 503). Duplicate answers could corrupt scores.");
+    if (monitorTiming().degraded) alertOps("monitor", "Live Monitor is slow (over its time budget). The database may be struggling.");
+    const bad = failingExamChecks();
+    if (bad.length) alertOps("exam-checks", `${bad.length} finished exam(s) failed their data check. See /api/health as super admin.`);
+  } catch {
+    /* never let the watcher throw */
+  }
+}, 60_000).unref?.();
 
 // Best effort on the way out: a deploy or a Railway restart otherwise drops up to
 // one flush window of presence. Nothing waits on this beyond the signal handler.

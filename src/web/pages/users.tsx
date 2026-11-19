@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useLocation } from "wouter";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Plus, Upload, X, Search, GraduationCap, UserCog, Mail, Sliders, KeyRound, Layers, Copy, Check, Pencil, Trash2, AlertTriangle, Star, Undo2 } from "lucide-react";
-import { api } from "../lib/api";
+import { api, withBody } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Field, Drawer, usePagination, Pager } from "../components/ui";
 import { BulkPasswordReset } from "../components/bulk-password-reset";
@@ -93,11 +93,11 @@ export default function Users() {
   });
 
   const toggle = useMutation({
-    mutationFn: async ({ id, enabled }: { id: string; enabled: boolean }) => api.users[":id"].$patch({ param: { id }, json: { enabled } }),
+    mutationFn: async ({ id, enabled }: { id: string; enabled: boolean }) => api.users[":id"].$patch(withBody({ param: { id } }, { enabled })),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["users"] }),
   });
   const toggleStudent = useMutation({
-    mutationFn: async ({ id, enabled }: { id: string; enabled: boolean }) => api.students[":id"].$patch({ param: { id }, json: { enabled } }),
+    mutationFn: async ({ id, enabled }: { id: string; enabled: boolean }) => api.students[":id"].$patch(withBody({ param: { id } }, { enabled })),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["students"] }),
   });
   const removeUser = useMutation({
@@ -634,7 +634,7 @@ function AddUser({ role, initial, onClose }: { role: "tpo" | "college_admin"; in
   const create = useMutation({
     mutationFn: async () => {
       if (editing) {
-        const res = await api.users[":id"].$patch({ param: { id: initial!.userId }, json: { name, email, phone, permissions: isAdmin ? undefined : perms } });
+        const res = await api.users[":id"].$patch(withBody({ param: { id: initial!.userId } }, { name, email, phone, permissions: isAdmin ? undefined : perms }));
         if (!res.ok) throw new Error((await res.json() as { message?: string }).message ?? "Failed");
         return res.json();
       }
@@ -697,7 +697,7 @@ function AddStudent({ classes, initial, onClose }: { classes: ClassRow[]; initia
   const create = useMutation({
     mutationFn: async () => {
       if (editing) {
-        const res = await api.students[":id"].$patch({ param: { id: initial!.id }, json: { name, rollNo, email, classId: classId || null } });
+        const res = await api.students[":id"].$patch(withBody({ param: { id: initial!.id } }, { name, rollNo, email, classId: classId || null }));
         if (!res.ok) throw new Error((await res.json() as { message?: string }).message ?? "Failed");
         return res.json();
       }
@@ -738,7 +738,7 @@ function PermissionDrawer({ user, onClose }: { user: UserRow; onClose: () => voi
   const qc = useQueryClient();
   const [perms, setPerms] = useState<Record<string, boolean>>(user.permissions ?? {});
   const save = useMutation({
-    mutationFn: async () => api.users[":id"].$patch({ param: { id: user.userId }, json: { permissions: perms } }),
+    mutationFn: async () => api.users[":id"].$patch(withBody({ param: { id: user.userId } }, { permissions: perms })),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] });
       onClose();
@@ -916,8 +916,8 @@ function ResetPasswordDrawer({ target, onClose }: { target: { kind: "staff" | "s
     mutationFn: async () => {
       const json = { password: mode === "custom" ? password : undefined };
       const res = target.kind === "student"
-        ? await api.students[":id"]["reset-password"].$post({ param: { id: target.id }, json })
-        : await api.users[":id"]["reset-password"].$post({ param: { id: target.id }, json });
+        ? await api.students[":id"]["reset-password"].$post(withBody({ param: { id: target.id } }, json))
+        : await api.users[":id"]["reset-password"].$post(withBody({ param: { id: target.id } }, json));
       if (!res.ok) throw new Error((await res.json() as { message?: string }).message ?? "Failed");
       return res.json() as Promise<{ password: string }>;
     },

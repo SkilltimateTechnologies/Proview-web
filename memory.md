@@ -415,3 +415,48 @@ Merge after the exam. Review write-up: Claude Docs "Proview — full code review
   HTML pages refresh the saved shell.
 - Runable template leftovers removed (analytics script + plugin, runtime package, jsdom).
   `tsconfig.node.json` now declares the DOM lib itself (it used to arrive via `@types/jsdom`).
+
+## 15. API layout (2026-11-19)
+
+`src/api/index.ts` was one 3,960-line file. It is now:
+- `index.ts` (~90 lines): app-wide middleware in order (body limit, database lane, SEB check, CORS,
+  gzip, better-auth handler, `basePath("api")`, auth, student-list cache invalidation) and the route
+  modules mounted with `.route("/", …)` **in their original order**. Hono runs handlers in
+  registration order, so the mount order is behaviour: add new routes inside the right module, and
+  keep specific paths (e.g. `/students/bulk`) before parameterised ones (`/students/:id`).
+- `core.ts`: shared state and helpers (settings/exam/paper/student-list caches, monitor snapshot,
+  integrity events, tenant ownership, `Vars`).
+- `routes/`: `system` (health, me, uploads, files), `registration`, `staff` (colleges, branding,
+  users, classes), `students` (+ Elite cohort), `student-client` (the exam client's API),
+  `question-bank`, `exams` (+ hold, extra time, roster), `insights` (Live Monitor, dashboard,
+  reports), `settings`.
+The split was verified mechanically: the original and split apps register the same 232
+routes/middleware in the same order with byte-identical handler source.
+
+## 16. Error tracking, alerts, request ids (2026-11-19)
+
+- `lib/observe.ts`: every unexpected route error goes through `app.onError` → one JSON log line
+  (level, request id, method, path, user, stack, fingerprint) and a clean 500 quoting the request id.
+  Every response carries `X-Request-Id`. Process-level `unhandledRejection` / `uncaughtException`
+  go through the same reporter.
+- Browser errors (uncaught, unhandled rejections, React render crashes) are sent by
+  `web/lib/error-reporter.ts` to public `POST /api/client-errors` (64 KB max, 120/min across everyone,
+  trimmed, logged only).
+- Optional env: `SENTRY_DSN` (plain HTTP envelope API, no SDK) and `ALERT_WEBHOOK_URL` (Slack /
+  Discord / Google Chat incoming webhook; one message per distinct error per 10 min, 20/hour max).
+  A 60 s watcher in server.ts alerts when /api/health's signals turn bad (invariants, slow Live
+  Monitor, failed exam data checks).
+- `railway.json` has `healthcheckPath: /api/health`: Railway sends traffic to a new deploy only after
+  it answers, so a deploy that cannot boot never replaces the running one.
+- Exam timer, Submit unlock and waiting room run on server time (`web/student/lib/server-clock.ts`);
+  before the timer auto-submits it confirms with the server (heartbeat). Lab PCs with wrong clocks
+  were auto-submitting students early.
+
+## 17. End-to-end browser check (2026-11-19)
+- `bun run e2e` (`scripts/verify-exam-flow.py`) sits a whole exam in real Chromium against a local
+  throwaway server: sign-in, forced password change, dashboard, brief, system check, MCQ + short
+  answer, Submit, thank-you, admin report (submitted, 2 answers, MCQ scored), then the 82-minutes-fast
+  PC clock case (no auto-submit, Submit locked for the minimum time, API 409 too_early).
+  Refuses a non-local base. Run it before deploying changes to the student app, exam API or timer.
+- Student session is read from localStorage synchronously (`web/student/lib/session.tsx`); restoring
+  it in an effect bounced every reload through /login and lost deep links.

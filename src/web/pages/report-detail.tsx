@@ -1,12 +1,12 @@
 import { useState, useEffect, useRef, type CSSProperties } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, Link } from "wouter";
-import { ArrowLeft, Download, ChevronRight, Check, X, Sparkles, Lightbulb, MoreVertical, UserX, Trash2, FileText, FileSpreadsheet, Files, ChevronDown, Loader2, ShieldAlert, VideoOff, MonitorX, Maximize, Copy, EyeOff, Camera } from "lucide-react";
-import { api, getScope } from "../lib/api";
+import { ArrowLeft, Download, Check, X, Sparkles, Lightbulb, MoreVertical, UserX, Trash2, FileText, FileSpreadsheet, Files, ChevronDown, Loader2, ShieldAlert, VideoOff, MonitorX, Maximize, Copy, EyeOff, Camera } from "lucide-react";
+import { api, getScope, withBody } from "../lib/api";
 import { getBearer } from "../lib/auth";
 import { useSession } from "../lib/session";
 import { PageHeader } from "../components/shell";
-import { Loader, Pill, Drawer, usePagination, Pager } from "../components/ui";
+import { Loader, Pill, Drawer, Pager } from "../components/ui";
 import { safeName, fmtFileDate, type Brand } from "../lib/pdf/theme";
 import type { StudentAnswer } from "../lib/pdf/student-report";
 import { PromptText } from "../student/components/prompt-text";
@@ -74,7 +74,7 @@ export default function ReportDetail() {
   const refresh = () => qc.invalidateQueries({ queryKey: ["report", examId] });
   const markAbsent = useMutation({
     mutationFn: async (studentId: string) => {
-      const res = await api.reports[":examId"].roster["mark-absent"].$post({ param: { examId }, json: { studentId } });
+      const res = await api.reports[":examId"].roster["mark-absent"].$post(withBody({ param: { examId } }, { studentId }));
       if (!res.ok) throw new Error("failed");
       return res.json();
     },
@@ -82,7 +82,7 @@ export default function ReportDetail() {
   });
   const removeStudent = useMutation({
     mutationFn: async (studentId: string) => {
-      const res = await api.reports[":examId"].roster.remove.$post({ param: { examId }, json: { studentId } });
+      const res = await api.reports[":examId"].roster.remove.$post(withBody({ param: { examId } }, { studentId }));
       if (!res.ok) throw new Error("failed");
       return res.json();
     },
@@ -90,7 +90,7 @@ export default function ReportDetail() {
   });
   const bulkRemove = useMutation({
     mutationFn: async (studentIds: string[]) => {
-      const res = await api.reports[":examId"].roster["bulk-remove"].$post({ param: { examId }, json: { studentIds } });
+      const res = await api.reports[":examId"].roster["bulk-remove"].$post(withBody({ param: { examId } }, { studentIds }));
       if (!res.ok) throw new Error("failed");
       return res.json();
     },

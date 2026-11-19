@@ -11,18 +11,17 @@ type Ctx = {
 const SessionCtx = createContext<Ctx>({ student: null, login: () => {}, logout: () => {}, clearMustChange: () => {} });
 
 export function SessionProvider({ children }: { children: ReactNode }) {
-  const [student, setStudent] = useState<StudentProfile | null>(null);
-
-  useEffect(() => {
-    const raw = localStorage.getItem("examly:student");
-    if (raw) {
-      try {
-        setStudent(JSON.parse(raw) as StudentProfile);
-      } catch {
-        /* ignore */
-      }
+  // Read the saved session synchronously. Restoring it in an effect left the first
+  // render signed out, so the router bounced every reload through /login and a
+  // deep link (e.g. /exam/:id) was lost on the way back.
+  const [student, setStudent] = useState<StudentProfile | null>(() => {
+    try {
+      const raw = localStorage.getItem("examly:student");
+      return raw ? (JSON.parse(raw) as StudentProfile) : null;
+    } catch {
+      return null;
     }
-  }, []);
+  });
 
   const login = (s: StudentProfile, token: string) => {
     localStorage.setItem("examly:student", JSON.stringify(s));

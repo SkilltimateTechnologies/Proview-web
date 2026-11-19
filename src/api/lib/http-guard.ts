@@ -61,6 +61,7 @@ export const BODY_LIMITS = {
 } as const;
 
 export function bodyLimitFor(path: string): number {
+  if (path === "/api/client-errors") return 64 * 1024;
   if (/^\/api\/(students|questions)\/bulk$/.test(path)) return BODY_LIMITS.bulk;
   if (/^\/api\/(student\/|students\/verify-login$|register\/)/.test(path)) return BODY_LIMITS.student;
   return BODY_LIMITS.staff;

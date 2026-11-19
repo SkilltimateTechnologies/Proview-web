@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api } from "../lib/api";
+import { api, data } from "../lib/api";
 import { useSession } from "../lib/session";
 import { PageHeader } from "../components/shell";
 import { Loader, Field, ColorPicker } from "../components/ui";
@@ -8,7 +8,7 @@ import { Loader, Field, ColorPicker } from "../components/ui";
 export default function Branding() {
   const qc = useQueryClient();
   const { refresh } = useSession();
-  const q = useQuery({ queryKey: ["branding"], queryFn: async () => (await api.branding.$get()).json() });
+  const q = useQuery({ queryKey: ["branding"], queryFn: async () => data(await api.branding.$get()) });
   const [name, setName] = useState("");
   const [shortName, setShortName] = useState("");
   const [primaryColor, setPrimaryColor] = useState("#1e3a5f");

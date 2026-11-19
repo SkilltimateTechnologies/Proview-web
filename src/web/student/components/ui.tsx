@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode, type CSSProperties } from "react";
 import {
   AlarmClockIcon,
   BadgeCheckIcon,
@@ -103,10 +103,10 @@ export const STUDENT_ICONS: Record<string, LucideIcon> = {
 };
 
 // Kebab-case name -> Lucide component wrapper (matches web app convention).
-export function Icon({ name, size = 16, className }: { name: string; size?: number; className?: string }) {
+export function Icon({ name, size = 16, className, style }: { name: string; size?: number; className?: string; style?: CSSProperties }) {
   const Cmp = STUDENT_ICONS[name];
   if (!Cmp) return null;
-  return <Cmp size={size} className={className} />;
+  return <Cmp size={size} className={className} style={style} />;
 }
 
 export function Pill({ children, tone = "default" }: { children: ReactNode; tone?: "default" | "success" | "warn" | "danger" | "brand" }) {

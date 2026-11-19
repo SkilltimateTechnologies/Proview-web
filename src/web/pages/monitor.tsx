@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Activity, Clock, CheckCircle2, Loader2, CalendarClock, CircleDashed, UserX, Pause, Play, Plus, Wifi, WifiOff, RotateCcw, ShieldAlert, ShieldCheck, AlertTriangle } from "lucide-react";
-import { api } from "../lib/api";
+import { api, withBody } from "../lib/api";
 import { PageHeader } from "../components/shell";
 import { Loader, EmptyState, Pill, Drawer } from "../components/ui";
 import { PromptText } from "../student/components/prompt-text";
@@ -83,7 +83,7 @@ function ExamControls({ examId, held, extraMin }: { examId: string; held: boolea
     onSuccess: refresh,
   });
   const addTime = useMutation({
-    mutationFn: async () => api.exams[":id"]["extra-time"].$post({ param: { id: examId }, json: { minutes: mins } }),
+    mutationFn: async () => api.exams[":id"]["extra-time"].$post(withBody({ param: { id: examId } }, { minutes: mins })),
     onSuccess: refresh,
   });
 
@@ -507,10 +507,7 @@ function ReopenControl({ examId, attemptId, student, onDone }: { examId: string;
 
   const reopen = useMutation({
     mutationFn: async () => {
-      const res = await api.exams[":id"].attempts[":attemptId"].reopen.$post({
-        param: { id: examId, attemptId },
-        json: { addMinutes },
-      });
+      const res = await api.exams[":id"].attempts[":attemptId"].reopen.$post(withBody({ param: { id: examId, attemptId } }, { addMinutes }));
       const body = await res.json().catch(() => ({}) as any);
       if (!res.ok) throw new Error(("message" in body && body.message) || "Could not reopen the attempt.");
       return body;
