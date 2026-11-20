@@ -8,6 +8,10 @@ export type ReportRow = {
   rollNo: string;
   email: string | null;
   section: string;
+  /** The student's department; ELITE students count under their home branch. */
+  branch?: string;
+  /** Home section, only for a student who sat the exam in another cohort (ELITE). */
+  homeSection?: string | null;
   score: number | null;
   status: string;
   submittedAt: string | number | null;
@@ -172,4 +176,61 @@ export function fmtFileDate(t?: string | number | null): string {
   const day = d.toLocaleString("en-IN", { day: "2-digit", timeZone: "Asia/Kolkata" });
   const year = d.toLocaleString("en-IN", { year: "numeric", timeZone: "Asia/Kolkata" });
   return `${mon} ${day}-${year}`;
+}
+
+/** One branch's or section's attendance and results, for the report tables. */
+export type GroupStats = {
+  key: string;
+  total: number;
+  appeared: number;
+  absent: number;
+  /** appeared / total, as a whole percentage. */
+  attendancePct: number;
+  /** Of the appeared students whose score is in. */
+  scored: number;
+  average: number | null;
+  highest: number | null;
+  pass: number;
+  fail: number;
+  /** Section codes inside a branch group (empty for a section group). */
+  sections: string[];
+};
+
+export const UNASSIGNED = "Unassigned";
+
+export function groupKey(r: ReportRow, by: "branch" | "section"): string {
+  const v = (by === "branch" ? r.branch : r.section) ?? "";
+  return v.trim() || UNASSIGNED;
+}
+
+/**
+ * Attendance and results per branch or per section. Absent = assigned but never
+ * started; appeared = everyone else (including still-grading and disconnected).
+ * Pass/fail/average count only appeared students with a score, like summarize().
+ */
+export function breakdown(rows: ReportRow[], by: "branch" | "section", passMark = 40): GroupStats[] {
+  const groups = new Map<string, ReportRow[]>();
+  for (const r of rows) {
+    const k = groupKey(r, by);
+    (groups.get(k) ?? groups.set(k, []).get(k)!).push(r);
+  }
+  const out: GroupStats[] = [];
+  for (const [key, list] of groups) {
+    const appeared = list.filter((r) => !r.absent);
+    const scores = appeared.filter((r) => r.score != null).map((r) => r.score as number);
+    out.push({
+      key,
+      total: list.length,
+      appeared: appeared.length,
+      absent: list.length - appeared.length,
+      attendancePct: list.length ? Math.round((appeared.length / list.length) * 100) : 0,
+      scored: scores.length,
+      average: scores.length ? Math.round((scores.reduce((a, b) => a + b, 0) / scores.length) * 10) / 10 : null,
+      highest: scores.length ? Math.max(...scores) : null,
+      pass: scores.filter((x) => x >= passMark).length,
+      fail: scores.filter((x) => x < passMark).length,
+      sections: by === "branch" ? Array.from(new Set(list.map((r) => (r.section ?? "").trim()).filter(Boolean))).sort() : [],
+    });
+  }
+  return out.sort((a, b) => (a.key === UNASSIGNED ? 1 : 0) - (b.key === UNASSIGNED ? 1 : 0) || a.key.localeCompare(b.key, "en", { numeric: true }));
 }

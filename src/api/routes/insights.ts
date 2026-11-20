@@ -1,4 +1,5 @@
 /** Live Monitor, dashboard, reports and per-report roster. Split out of index.ts; behaviour unchanged. */
+import { labelRow } from "../lib/report-labels";
 import { Hono } from "hono";
 import { eq, ne, and, desc, inArray, sql as dsql } from "drizzle-orm";
 import { db } from "../database";
@@ -282,6 +283,10 @@ export const insightsRoutes = new Hono<{ Variables: Vars }>()
     };
     const sectionOfAttempt = (a: { studentId: string; sectionSnapshot?: string | null }) =>
       a.sectionSnapshot && a.sectionSnapshot.trim() ? a.sectionSnapshot : sectionOf(a.studentId);
+    // Branch + home section (lib/report-labels.ts) so staff can follow up by
+    // department; ELITE students count under their home branch.
+    const classByCode = new Map([...clmap.values()].map((cl) => [cl.code, cl]));
+    const labels = (sid: string, section: string) => labelRow(section, smap.get(sid), clmap, classByCode);
     // How many webcam frames does each attempt actually have?
     //
     // WHY IT IS ON THE ROSTER. A student sat four exams whose camera never produced a
@@ -314,7 +319,7 @@ export const insightsRoutes = new Hono<{ Variables: Vars }>()
       }
     }
     const attemptRows = atts
-      .map((a) => ({ attemptId: a.id, studentId: a.studentId, name: smap.get(a.studentId)?.name ?? "—", rollNo: smap.get(a.studentId)?.rollNo ?? "", email: smap.get(a.studentId)?.email ?? null, section: sectionOfAttempt(a), score: a.score, status: a.status, submittedAt: a.submittedAt, absent: false, disconnected: !!a.disconnected, answeredCount: a.answeredCount ?? 0, frames: frameCounts.get(a.id) ?? 0, snapshotFailures: failCounts.get(a.id) ?? 0 }))
+      .map((a) => ({ attemptId: a.id, studentId: a.studentId, name: smap.get(a.studentId)?.name ?? "—", rollNo: smap.get(a.studentId)?.rollNo ?? "", email: smap.get(a.studentId)?.email ?? null, section: sectionOfAttempt(a), ...labels(a.studentId, sectionOfAttempt(a)), score: a.score, status: a.status, submittedAt: a.submittedAt, absent: false, disconnected: !!a.disconnected, answeredCount: a.answeredCount ?? 0, frames: frameCounts.get(a.id) ?? 0, snapshotFailures: failCounts.get(a.id) ?? 0 }))
       .sort((x, y) => (y.score ?? -1) - (x.score ?? -1));
     // Assigned-but-absent students: enrolled in the exam's cohort yet no attempt row.
     // Only surface them once the exam window has closed (before that they may still
@@ -333,8 +338,10 @@ export const insightsRoutes = new Hono<{ Variables: Vars }>()
             if (attemptedIds.has(stu.id)) return false;
             return isEligible(ex, stu, exRoster);
           })
-          .map((stu) => ({ attemptId: `absent-${stu.id}`, studentId: stu.id, name: stu.name ?? "—", rollNo: stu.rollNo ?? "", email: stu.email ?? null, section: sectionOf(stu.id), score: null, status: "absent", submittedAt: null, absent: true, disconnected: false, answeredCount: 0, frames: 0, snapshotFailures: 0 }))
-          .sort((x, y) => x.rollNo.localeCompare(y.rollNo));
+          .map((stu) => ({ attemptId: `absent-${stu.id}`, studentId: stu.id, name: stu.name ?? "—", rollNo: stu.rollNo ?? "", email: stu.email ?? null, section: sectionOf(stu.id), ...labels(stu.id, sectionOf(stu.id)), score: null, status: "absent", submittedAt: null, absent: true, disconnected: false, answeredCount: 0, frames: 0, snapshotFailures: 0 }))
+          // Grouped by branch, then section, then roll number, so each department
+          // finds its own absentees together.
+          .sort((x, y) => x.branch.localeCompare(y.branch) || x.section.localeCompare(y.section) || x.rollNo.localeCompare(y.rollNo));
     // Attempts (scored, sorted high→low) first, absentees last.
     const rows = [...attemptRows, ...absentRows];
     // Whether snapshots are expected AT ALL right now. Proctoring is one global config
