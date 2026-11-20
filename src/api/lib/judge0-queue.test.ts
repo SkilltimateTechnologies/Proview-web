@@ -1,12 +1,12 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 
-// Short limits so the test runs in seconds. Set before the module is loaded.
-process.env.JUDGE0_FETCH_TIMEOUT_MS = "400";
-process.env.JUDGE0_MAX_WAIT_MS = "1500";
-process.env.JUDGE0_HARD_DEADLINE_MS = "3000";
-process.env.JUDGE0_BATCH_WINDOW_MS = "10";
+import { Judge0Queue, isQuotaExhausted, runnerRefusalMessage } from "./judge0-queue";
 
-const { judge0Queue, isQuotaExhausted, runnerRefusalMessage } = await import("./judge0-queue");
+// Its own queue with short limits. NOT environment variables: bun runs every test
+// file in one process, so when another file (scoring.test.ts loads grade-queue)
+// imports the shared queue first, env values set here are read too late. That
+// ordering differs between machines; it passed locally and failed on Railway.
+const judge0Queue = new Judge0Queue({ fetchTimeoutMs: 400, maxWaitMs: 1500, hardDeadlineMs: 3000, batchWindowMs: 10 });
 
 let mode: "hang" | "quota" | "ok" = "hang";
 let calls = 0;

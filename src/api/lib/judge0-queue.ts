@@ -127,11 +127,21 @@ export function runnerRefusalMessage(status: number, body: string): string {
  * is honoured only up to MAX_RETRY_AFTER_MS, and a quota-exhausted 429 is
  * returned at once: retrying it cannot succeed.
  */
-async function fetchWithBackoff(url: string, init: RequestInit): Promise<Response> {
+async function fetchWithBackoff(url: string, init: RequestInit, fetchTimeoutMs = FETCH_TIMEOUT_MS): Promise<Response> {
   let lastErr: unknown = null;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const res = await fetch(url, { ...init, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      // An ordinary timer, always cleared, rather than AbortSignal.timeout(): that
+      // one's timer does not keep the process awake, and on Railway's build
+      // machine it never fired, so a hung call was never aborted.
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), fetchTimeoutMs);
+      let res: Response;
+      try {
+        res = await fetch(url, { ...init, signal: ctl.signal });
+      } finally {
+        clearTimeout(timer);
+      }
       if (res.status === 429 || res.status >= 500) {
         if (attempt === MAX_RETRIES) return res;
         if (res.status === 429 && isQuotaExhausted(429, await res.clone().text().catch(() => ""))) return res;
@@ -155,7 +165,33 @@ async function fetchWithBackoff(url: string, init: RequestInit): Promise<Respons
 // =============================================================================
 // The singleton queue
 // =============================================================================
-class Judge0Queue {
+/**
+ * Timing limits of one queue. The shared queue uses the JUDGE0_* environment
+ * values read at start-up; a test builds its own queue with short limits, because
+ * every test file shares one process and the shared queue may already be loaded.
+ */
+export type Judge0QueueLimits = {
+  maxWaitMs: number;
+  batchWindowMs: number;
+  fetchTimeoutMs: number;
+  hardDeadlineMs: number;
+  bgMaxWaitMs: number;
+};
+
+export const DEFAULT_LIMITS: Judge0QueueLimits = {
+  maxWaitMs: MAX_WAIT_MS,
+  batchWindowMs: BATCH_WINDOW_MS,
+  fetchTimeoutMs: FETCH_TIMEOUT_MS,
+  hardDeadlineMs: HARD_DEADLINE_MS,
+  bgMaxWaitMs: BG_MAX_WAIT_MS,
+};
+
+export class Judge0Queue {
+  private readonly lim: Judge0QueueLimits;
+  constructor(limits: Partial<Judge0QueueLimits> = {}) {
+    this.lim = { ...DEFAULT_LIMITS, ...limits };
+  }
+
   private waiters: Waiter[] = [];
   private bgWaiters: Waiter[] = [];
   private draining = false;
@@ -170,13 +206,15 @@ class Judge0Queue {
       // Resolve exactly once: by Judge0, by the queue's own give-up, or by the
       // hard deadline below, whichever comes first.
       let done = false;
-      const deadlineMs = job.priority === "background" ? BG_MAX_WAIT_MS + HARD_DEADLINE_MS : HARD_DEADLINE_MS;
+      const deadlineMs = job.priority === "background" ? this.lim.bgMaxWaitMs + this.lim.hardDeadlineMs : this.lim.hardDeadlineMs;
       const timer = setTimeout(() => {
         if (done) return;
         done = true;
         outerResolve({ ok: false, stdout: "", stderr: "", compileOutput: "", status: "Error", time: null, memory: null, message: "Code execution timed out. Press Run again in a moment.", httpStatus: 503 });
       }, deadlineMs);
-      (timer as { unref?: () => void }).unref?.();
+      // Not unref()'d: an unreferenced timer may never fire (it did not on
+      // Railway's build machine). It is cleared as soon as the run is answered,
+      // so it never keeps the process alive longer than the run itself.
       const resolve = (r: Judge0Result) => {
         if (done) return;
         done = true;
@@ -257,7 +295,7 @@ class Judge0Queue {
       }
 
       // small collect window so bursts group into a full batch
-      if (this.waiters.length < BATCH_SIZE) await sleep(BATCH_WINDOW_MS);
+      if (this.waiters.length < BATCH_SIZE) await sleep(this.lim.batchWindowMs);
 
       // drop anyone who already waited too long
       this.dropExpiredWaiters();
@@ -282,7 +320,7 @@ class Judge0Queue {
   private dropExpiredWaiters() {
     const now = Date.now();
     this.waiters = this.waiters.filter((w) => {
-      if (now - w.enqueuedAt >= MAX_WAIT_MS) {
+      if (now - w.enqueuedAt >= this.lim.maxWaitMs) {
         this.failWaiter(w, "Server is busy — please press Run again in a moment.", 503);
         return false;
       }
@@ -298,7 +336,7 @@ class Judge0Queue {
   private dispatchBackground(cfgProvider: () => Judge0Config | null): boolean {
     const now = Date.now();
     this.bgWaiters = this.bgWaiters.filter((w) => {
-      if (now - w.enqueuedAt >= BG_MAX_WAIT_MS) {
+      if (now - w.enqueuedAt >= this.lim.bgMaxWaitMs) {
         this.failWaiter(w, "Code runner busy; grading will retry.", 503);
         return false;
       }
@@ -338,6 +376,7 @@ class Judge0Queue {
       const createRes = await fetchWithBackoff(
         `${cfg.baseUrl}/submissions/batch?base64_encoded=true`,
         { method: "POST", headers: cfg.headers, body: JSON.stringify({ submissions }) },
+        this.lim.fetchTimeoutMs,
       );
 
       if (!createRes.ok) {
@@ -389,7 +428,7 @@ class Judge0Queue {
       if (pending.length === 0) break;
 
       const url = `${cfg.baseUrl}/submissions/batch?tokens=${pending.join(",")}&base64_encoded=true&fields=stdout,stderr,compile_output,status,time,memory,token`;
-      const res = await fetchWithBackoff(url, { headers: cfg.headers });
+      const res = await fetchWithBackoff(url, { headers: cfg.headers }, this.lim.fetchTimeoutMs);
       if (!res.ok) continue;
       const body = (await res.json().catch(() => ({}))) as { submissions?: J0Sub[] };
       for (const sub of body.submissions ?? []) {
