@@ -460,3 +460,14 @@ routes/middleware in the same order with byte-identical handler source.
   Refuses a non-local base. Run it before deploying changes to the student app, exam API or timer.
 - Student session is read from localStorage synchronously (`web/student/lib/session.tsx`); restoring
   it in an effect bounced every reload through /login and lost deep links.
+
+## 18. Report and answer-sheet PDFs (2026-11-20)
+- Report rows carry `branch` and `homeSection` (`api/lib/report-labels.ts`). An ELITE student counts
+  under the branch of their home section (`originalClassId`); the section stays what they sat in.
+- Section report PDF: Section and Branch columns, "By branch" / "By section" attendance tables
+  (students, appeared, absent, attendance %, average, highest, pass, fail), absentees grouped by
+  branch, section and roll number (`web/lib/pdf/theme.ts` `breakdown()`).
+- Answer-sheet PDF (`web/lib/pdf/student-report.tsx`): question cards MAY break across pages. A
+  card marked unbreakable that is taller than a page makes react-pdf overlap all text on it.
+  Prompts render with headings and fenced sample boxes; code prints line by line with indentation
+  kept; `pdfSafe()` maps symbols the built-in fonts lack (<=, >=, ->).
