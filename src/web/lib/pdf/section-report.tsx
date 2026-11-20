@@ -12,6 +12,8 @@ import {
   bandCounts,
   summarize,
   fmtDate,
+  breakdown,
+  type GroupStats,
 } from "./theme";
 import { BarChart, Donut, BandBars } from "./charts";
 
@@ -55,10 +57,19 @@ const s = StyleSheet.create({
   td: { fontSize: 8.5, color: C.ink },
   cRank: { width: 34 },
   cName: { flex: 1 },
-  cRoll: { width: 92 },
-  cStatus: { width: 66 },
+  cRoll: { width: 78 },
+  cSection: { width: 52 },
+  cBranch: { width: 40 },
+  cStatus: { width: 62 },
   cScore: { width: 40, textAlign: "right" },
   cResult: { width: 44, textAlign: "right" },
+
+  gTh: { fontSize: 6.5, letterSpacing: 0.4, color: C.muted, fontFamily: "Helvetica-Bold", textTransform: "uppercase", textAlign: "right" },
+  gTd: { fontSize: 8, color: C.ink, textAlign: "right" },
+  gKey: { flex: 1, textAlign: "left" },
+  gNum: { width: 46 },
+  gPct: { width: 52 },
+  note: { fontSize: 7, color: C.muted, marginTop: 4 },
 
   footer: { position: "absolute", bottom: 18, left: 34, right: 34, flexDirection: "row", justifyContent: "space-between", borderTopWidth: 0.5, borderTopColor: C.line, paddingTop: 6 },
   footTxt: { fontSize: 7, color: C.muted },
@@ -79,6 +90,55 @@ const PODIUM = [
   { border: C.bronze, tint: "#F7EFE6", label: "3rd place", chip: C.bronze },
 ];
 
+/** Attendance and results per branch or section, one row each plus a total. */
+function GroupTable({ title, groups, label, passMark }: { title: string; groups: GroupStats[]; label: string; passMark: number }) {
+  const sum = (f: (g: GroupStats) => number) => groups.reduce((a, g) => a + f(g), 0);
+  const total = { total: sum((g) => g.total), appeared: sum((g) => g.appeared), absent: sum((g) => g.absent), pass: sum((g) => g.pass), fail: sum((g) => g.fail) };
+  const cells = (g: { total: number; appeared: number; absent: number; pass: number; fail: number }, extra: { pct: string; avg: string; hi: string }, bold = false) => {
+    const b = bold ? { fontFamily: "Helvetica-Bold" } : {};
+    return (
+      <>
+        <Text style={[s.gTd, s.gNum, b]}>{g.total}</Text>
+        <Text style={[s.gTd, s.gNum, b, { color: C.green }]}>{g.appeared}</Text>
+        <Text style={[s.gTd, s.gNum, b, { color: g.absent ? C.red : C.ink }]}>{g.absent}</Text>
+        <Text style={[s.gTd, s.gPct, b]}>{extra.pct}</Text>
+        <Text style={[s.gTd, s.gNum, b]}>{extra.avg}</Text>
+        <Text style={[s.gTd, s.gNum, b]}>{extra.hi}</Text>
+        <Text style={[s.gTd, s.gNum, b, { color: C.green }]}>{g.pass}</Text>
+        <Text style={[s.gTd, s.gNum, b, { color: g.fail ? C.red : C.ink }]}>{g.fail}</Text>
+      </>
+    );
+  };
+  return (
+    // A short table (the branches) stays on one page; a long one may break.
+    <View style={{ marginTop: 18 }} wrap={groups.length > 14}>
+      <Text style={s.sectionLabel}>{title}</Text>
+      <View style={s.tableHead}>
+        <Text style={[s.gTh, s.gKey]}>{label}</Text>
+        <Text style={[s.gTh, s.gNum]}>Students</Text>
+        <Text style={[s.gTh, s.gNum]}>Appeared</Text>
+        <Text style={[s.gTh, s.gNum]}>Absent</Text>
+        <Text style={[s.gTh, s.gPct]}>Attendance</Text>
+        <Text style={[s.gTh, s.gNum]}>Average</Text>
+        <Text style={[s.gTh, s.gNum]}>Highest</Text>
+        <Text style={[s.gTh, s.gNum]}>Pass</Text>
+        <Text style={[s.gTh, s.gNum]}>Fail</Text>
+      </View>
+      {groups.map((g, i) => (
+        <View key={g.key} style={[s.tr, i % 2 ? { backgroundColor: C.soft } : {}]} wrap={false}>
+          <Text style={[s.td, s.gKey, { fontFamily: "Helvetica-Bold" }]}>{g.key}{g.sections.length ? <Text style={{ fontSize: 6.5, color: C.muted, fontFamily: "Helvetica" }}>{"  "}{g.sections.join(", ")}</Text> : null}</Text>
+          {cells(g, { pct: `${g.attendancePct}%`, avg: g.average != null ? String(g.average) : "\u2014", hi: g.highest != null ? String(g.highest) : "\u2014" })}
+        </View>
+      ))}
+      <View style={[s.tr, { borderTopWidth: 1, borderTopColor: C.line }]} wrap={false}>
+        <Text style={[s.td, s.gKey, { fontFamily: "Helvetica-Bold" }]}>Total</Text>
+        {cells(total, { pct: total.total ? `${Math.round((total.appeared / total.total) * 100)}%` : "\u2014", avg: "", hi: "" }, true)}
+      </View>
+      <Text style={s.note}>Appeared includes students still being graded or who disconnected. Pass is {passMark}%+ of those with a score.</Text>
+    </View>
+  );
+}
+
 export type SectionReportData = {
   brand: Brand;
   examTitle: string;
@@ -97,11 +157,19 @@ export function SectionReportDoc({ brand, examTitle, section, rows }: SectionRep
   // group podium students by rank so ties render together
   const byRank = [1, 2, 3].map((rk) => top.filter((t) => t.rank === rk));
 
+  // Ranked students first; absentees after, grouped by branch, section and roll
+  // number so each department finds its own students together.
   const ordered = [...rows].sort((a, b) => {
     if (a.absent && !b.absent) return 1;
     if (!a.absent && b.absent) return -1;
+    if (a.absent && b.absent) {
+      return (a.branch ?? "").localeCompare(b.branch ?? "") || (a.section ?? "").localeCompare(b.section ?? "") || (a.rollNo ?? "").localeCompare(b.rollNo ?? "");
+    }
     return (b.score ?? -1) - (a.score ?? -1);
   });
+  const byBranch = breakdown(rows, "branch", stats.passMark);
+  const bySection = breakdown(rows, "section", stats.passMark);
+  const showBranchCol = byBranch.length > 1;
 
   return (
     <Document title={`${examTitle} — ${section} report`}>
@@ -187,13 +255,19 @@ export function SectionReportDoc({ brand, examTitle, section, rows }: SectionRep
           </View>
         </View>
 
+        {/* Attendance and results by branch and by section */}
+        {byBranch.length > 1 && <GroupTable title="By branch" label="Branch" groups={byBranch} passMark={stats.passMark} />}
+        {bySection.length > 1 && <GroupTable title="By section" label="Section" groups={bySection} passMark={stats.passMark} />}
+
         {/* Roster table */}
-        <View style={{ marginTop: 18 }}>
+        <View style={{ marginTop: 18 }} break={byBranch.length > 1 || bySection.length > 1}>
           <Text style={s.sectionLabel}>All students ({ordered.length})</Text>
           <View style={s.tableHead}>
             <Text style={[s.th, s.cRank]}>Rank</Text>
             <Text style={[s.th, s.cName]}>Student</Text>
             <Text style={[s.th, s.cRoll]}>Roll No</Text>
+            <Text style={[s.th, s.cSection]}>Section</Text>
+            {showBranchCol && <Text style={[s.th, s.cBranch]}>Branch</Text>}
             <Text style={[s.th, s.cStatus]}>Status</Text>
             <Text style={[s.th, s.cScore]}>Score</Text>
             <Text style={[s.th, s.cResult]}>Result</Text>
@@ -217,6 +291,8 @@ export function SectionReportDoc({ brand, examTitle, section, rows }: SectionRep
                 <Text style={[s.td, s.cRank, { color: C.muted }]}>{r.absent || rank == null ? "\u2014" : `#${rank}`}</Text>
                 <Text style={[s.td, s.cName]}>{r.name}</Text>
                 <Text style={[s.td, s.cRoll, { color: C.ink2 }]}>{r.rollNo || "\u2014"}</Text>
+                <Text style={[s.td, s.cSection, { color: C.ink2 }]}>{r.section || "\u2014"}{r.homeSection ? <Text style={{ fontSize: 6.5, color: C.muted }}>{`\n(${r.homeSection})`}</Text> : null}</Text>
+                {showBranchCol && <Text style={[s.td, s.cBranch, { color: C.ink2 }]}>{r.branch || "\u2014"}</Text>}
                 <Text style={[s.td, s.cStatus, { color: statusColor }]}>{statusTxt}</Text>
                 <Text style={[s.td, s.cScore, { fontFamily: "Helvetica-Bold" }]}>{r.absent ? "A" : r.score != null ? r.score : "\u2014"}</Text>
                 <Text style={[s.td, s.cResult, { fontFamily: "Helvetica-Bold", color: resultColor }]}>{resultTxt}</Text>
